@@ -1,0 +1,165 @@
+# AI 模拟面试与能力提升平台 - 配置文件
+# 配置文件版本: 2.0
+# 最后更新: 2026-03-21
+# 改造进行中 - 从防作弊系统改向AI面试系统
+
+# ====================================
+# 系统基本配置
+# ====================================
+system:
+  name: "AI 模拟面试与能力提升平台"
+  version: "2.0.0"
+  environment: "development"  # development, production, test
+  debug: true
+  timezone: "Asia/Shanghai"
+
+# ====================================
+# 服务器配置
+# ====================================
+server:
+  host: "0.0.0.0"
+  port: 5000
+  secret_key: "CHANGE-THIS-TO-RANDOM-STRING-IN-PRODUCTION"  # 生产环境请更改为随机字符串
+  cors_origins:
+    - "http://localhost:3000"
+    - "http://127.0.0.1:3000"
+    - "http://localhost:5000"
+    - "http://127.0.0.1:5000"
+  max_connections: 100
+  timeout: 30  # 秒
+  max_buffer_size: 10485760  # 10MB
+
+# ====================================
+# 数据库配置
+# ====================================
+database:
+  type: "sqlite"
+  path: "interview_system.db"
+  backup_enabled: true # 是否启用数据库备份
+  backup_interval: 86400  # 24小时（秒）
+  backup_dir: "backups" # 备份文件存储目录
+  max_backups: 7  # 保留最近7个备份
+
+# ====================================
+# 性能配置
+# ====================================
+performance:
+  enable_monitoring: true  # 启用性能监控
+  monitoring_interval: 10  # 监控输出间隔（秒）
+  
+  # 视频处理
+  video:
+    max_width: 640
+    max_height: 480
+    jpeg_quality: 85
+
+# ====================================
+# 日志配置
+# ====================================
+logging:
+  enabled: true
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  console_output: true  # 是否输出到控制台
+  
+  # 文件日志
+  file:
+    enabled: true
+    path: "logs/system.log"
+    max_size: 10485760  # 10MB（字节）
+    backup_count: 5  # 保留的日志文件数
+    encoding: "utf-8"
+  
+  # 日志格式
+  format:
+    standard: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    detailed: "%(asctime)s - %(name)s - [%(filename)s:%(lineno)d] - %(levelname)s - %(message)s"
+    simple: "%(levelname)s: %(message)s"
+  
+  # 按模块设置日志级别
+  modules:
+    utils: "INFO"
+    database: "INFO"
+    interview: "INFO"
+    llm: "INFO"
+
+# ====================================
+# 报告生成配置
+# ====================================
+report:
+  output_dir: "reports"
+  auto_save: true
+  include_screenshots: false
+  screenshot_interval: 30  # 秒
+  
+  # PDF设置
+  pdf:
+    page_size: "A4"
+    margin: 20  # 毫米
+    font_size: 12
+    include_charts: true
+  
+  # 报告内容
+  content:
+    include_assessment: true  # 包含综合评价
+    include_suggestions: true  # 包含建议
+    include_statistics: true  # 包含统计图表
+
+# ====================================
+# 安全配置
+# ====================================
+security:
+  enabled: true
+  jwt_secret: "change-this-secret-key"
+  jwt_expiration: 3600  # 秒
+
+# ====================================
+# LLM 配置
+# ====================================
+llm:
+  enabled: true  # 已启用
+  provider: "qwen"  # qwen
+  model: "qwen-max"  # 阿里通义 Qwen 模型（文本）
+  vision_model: "qwen-vl-max"  # 阿里通义视觉模型（用于简历识别等）
+  tts_model: "cosyvoice-v1"  # 阿里通义语音模型（TTS）
+  api_key: "${BAILIAN_API_KEY}"  # 从环境变量读取
+  api_base_url: ""
+  timeout: 30  # 秒
+  
+  # 面试官配置
+  interviewer:
+    initial_message: "你好，我是你的面试官。让我们开始今天的技术面试。"
+    difficulty_levels: ["easy", "medium", "hard"]
+    initial_difficulty: "medium"
+    max_questions_per_round: 3
+
+# ====================================
+# RAG 配置（后续添加）
+# ====================================
+rag:
+  enabled: false  # 将在改造中启用
+  vector_db: "faiss"
+  embedding_model: "text-embedding-3-small"
+  search_type: "similarity"
+  top_k: 5
+
+# ====================================
+# 岗位配置（后续扩展）
+# ====================================
+positions:
+  - id: "java_backend"
+    name: "Java后端工程师"
+    description: "后端服务开发工程师"
+    enabled: false  # 将在改造中启用
+  
+  - id: "frontend_engineer"
+    name: "前端工程师"
+    description: "前端应用开发工程师"
+    enabled: false  # 将在改造中启用
+
+# ====================================
+# 开发和调试
+# ====================================
+development:
+  mock_data: false
+  test_mode: false
+  verbose_errors: true
