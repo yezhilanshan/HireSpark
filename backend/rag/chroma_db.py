@@ -118,10 +118,13 @@ class KnowledgeStore:
 
     def add_questions_batch(self, questions: List[Dict[str, Any]]):
         """
-        批量添加问题
+        批量添加问题（支持新格式）
 
         Args:
-            questions: 问题列表，每项包含 id, question, answer, metadata
+            questions: 问题列表，每项包含 id, role, question, category, subcategory,
+                      difficulty, question_type, keywords, answer_summary, key_points,
+                      optional_points, common_mistakes, scoring_rubric, followups,
+                      retrieval_text, source_type, tags 等字段
         """
         ids = []
         embeddings = []
@@ -131,11 +134,44 @@ class KnowledgeStore:
         for q in questions:
             ids.append(q["id"])
             documents.append(q["question"])
-            metadatas.append(q.get("metadata", {}))
-            if q.get("answer"):
-                metadatas[-1]["answer"] = q["answer"]
 
-            embedding = self.embedder.encode(q["question"]) if self.embedder else None
+            # 构建完整的元数据（支持新格式字段）
+            meta = {
+                # 基础字段
+                "role": q.get("role", ""),
+                "category": q.get("category", ""),
+                "subcategory": q.get("subcategory", ""),
+                "difficulty": q.get("difficulty", ""),
+                "question_type": q.get("question_type", ""),
+                "keywords": q.get("keywords", []),
+
+                # 答案相关
+                "answer_summary": q.get("answer_summary", ""),
+                "key_points": q.get("key_points", []),
+                "optional_points": q.get("optional_points", []),
+                "common_mistakes": q.get("common_mistakes", []),
+
+                # 评分标准
+                "scoring_rubric": q.get("scoring_rubric", {}),
+
+                # 追问
+                "followups": q.get("followups", []),
+
+                # 检索文本和其他
+                "retrieval_text": q.get("retrieval_text", ""),
+                "source_type": q.get("source_type", ""),
+                "tags": q.get("tags", []),
+            }
+
+            # 兼容旧格式 answer 字段
+            if q.get("answer"):
+                meta["answer"] = q["answer"]
+
+            metadatas.append(meta)
+
+            # 使用 retrieval_text 或 answer_summary 进行向量化（如果有的话）
+            text_for_embedding = q.get("retrieval_text", "") or q.get("answer_summary", "") or q["question"]
+            embedding = self.embedder.encode(text_for_embedding) if self.embedder else None
             embeddings.append(embedding.tolist() if embedding is not None else None)
 
         if self.collection is not None:
@@ -190,15 +226,15 @@ class KnowledgeStore:
             return self._fallback_search(query, query_embedding, top_k)
 
     def _fallback_search(self, query: str, query_embedding, top_k: int) -> List[Dict[str, Any]]:
-        """本地存储的搜索实现"""
+        """本地存储的搜索实现（支持关键词匹配作为备选）"""
         import numpy as np
 
         if not self._fallback_data["ids"]:
             return []
 
+        # 如果没有 embedding，使用关键词匹配
         if query_embedding is None:
-            # 没有 embedding，返回空
-            return []
+            return self._keyword_search(query, top_k)
 
         # 计算余弦相似度
         similarities = []
@@ -221,6 +257,78 @@ class KnowledgeStore:
                 "question": self._fallback_data["documents"][i],
                 "metadata": self._fallback_data["metadatas"][i],
                 "similarity": float(sim)
+            })
+
+        return items
+
+    def _keyword_search(self, query: str, top_k: int) -> List[Dict[str, Any]]:
+        """
+        基于关键词的搜索（当没有 embedding 模型时的备选方案）
+
+        Args:
+            query: 查询文本
+            top_k: 返回结果数量
+
+        Returns:
+            匹配的问题列表
+        """
+        query_lower = query.lower()
+        query_keywords = set(query_lower.split())
+
+        scored_items = []
+
+        for i, doc in enumerate(self._fallback_data["documents"]):
+            doc_lower = doc.lower()
+            metadata = self._fallback_data["metadatas"][i]
+
+            score = 0.0
+
+            # 1. 完全匹配得分最高
+            if query_lower in doc_lower:
+                score += 10.0
+
+            # 2. 关键词匹配
+            doc_words = set(doc_lower.split())
+            common_words = query_keywords & doc_words
+            if query_keywords:
+                score += len(common_words) / len(query_keywords) * 5.0
+
+            # 3. 元数据关键词匹配
+            keywords = metadata.get("keywords", [])
+            for kw in keywords:
+                if kw.lower() in query_lower or query_lower in kw.lower():
+                    score += 3.0
+
+            # 4. 标签匹配
+            tags = metadata.get("tags", [])
+            for tag in tags:
+                if tag.lower() in query_lower or query_lower in tag.lower():
+                    score += 2.0
+
+            # 5. 分类匹配
+            category = metadata.get("category", "").lower()
+            subcategory = metadata.get("subcategory", "").lower()
+            if category in query_lower or query_lower in category:
+                score += 2.0
+            if subcategory in query_lower or query_lower in subcategory:
+                score += 1.5
+
+            if score > 0:
+                scored_items.append((i, score))
+
+        # 按得分排序
+        scored_items.sort(key=lambda x: x[1], reverse=True)
+
+        # 返回 top_k
+        items = []
+        for i, score in scored_items[:top_k]:
+            # 归一化相似度到 0-1 范围
+            normalized_sim = min(score / 10.0, 1.0)
+            items.append({
+                "id": self._fallback_data["ids"][i],
+                "question": self._fallback_data["documents"][i],
+                "metadata": self._fallback_data["metadatas"][i],
+                "similarity": normalized_sim
             })
 
         return items

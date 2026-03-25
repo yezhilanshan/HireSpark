@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import SocketClient from '@/lib/socket'
+import { useFacePhysRppg } from '@/lib/facephys/useFacePhysRppg'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts'
 import { AlertTriangle, Home, FileText, Mic, Radar } from 'lucide-react'
 
@@ -73,6 +74,7 @@ export default function InterviewPage() {
     const ttsChunkReceivedRef = useRef(false)
     const ttsSafetyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
     const firstQuestionReadyRef = useRef(false)
+    const rppgMetrics = useFacePhysRppg(videoRef, cameraReady && interviewStarted)
 
     const clearLlmTimeout = () => {
         if (llmTimeoutRef.current) {
@@ -763,6 +765,31 @@ export default function InterviewPage() {
         return '#ef4444'
     }
 
+    const getRppgStatusLabel = () => {
+        if (rppgMetrics.status === 'loading') return '心率模型加载中'
+        if (rppgMetrics.status === 'tracking') return '采集中'
+        if (rppgMetrics.status === 'unstable') return '信号不稳定'
+        if (rppgMetrics.status === 'no_face') return '未检测到人脸'
+        if (rppgMetrics.status === 'error') return '心率初始化失败'
+        return '等待开始'
+    }
+
+    const getRppgStatusClass = () => {
+        if (rppgMetrics.status === 'tracking') return 'bg-emerald-500/20 text-emerald-200 border-emerald-400/40'
+        if (rppgMetrics.status === 'unstable') return 'bg-amber-500/20 text-amber-100 border-amber-300/40'
+        if (rppgMetrics.status === 'error') return 'bg-red-500/20 text-red-100 border-red-300/40'
+        return 'bg-slate-800/70 text-slate-100 border-white/15'
+    }
+
+    const hrDisplay = rppgMetrics.isReliable && rppgMetrics.hr !== null
+        ? rppgMetrics.hr.toFixed(1)
+        : '--'
+    const sqiDisplay = rppgMetrics.sqi !== null ? rppgMetrics.sqi.toFixed(2) : '--'
+    const rppgHint = rppgMetrics.error
+        || (rppgMetrics.fps !== null && rppgMetrics.latencyMs !== null
+            ? `${rppgMetrics.fps.toFixed(1)} FPS · ${rppgMetrics.latencyMs.toFixed(1)} ms`
+            : '本地设备实时计算，不上传视频或心率数据')
+
     return (
         <div className="min-h-screen bg-gray-50 dark:bg-gray-900 p-4 transition-colors">
             {/* High Risk Alert */}
@@ -866,6 +893,37 @@ export default function InterviewPage() {
                                 {/* Corner Indicators */}
                                 {interviewStarted && (
                                     <>
+                                        <div className="absolute top-4 right-4 w-[280px] rounded-2xl border border-white/10 bg-slate-950/72 p-4 text-white shadow-2xl backdrop-blur-md pointer-events-none">
+                                            <div className="flex items-center justify-between gap-3">
+                                                <div>
+                                                    <p className="text-[11px] uppercase tracking-[0.22em] text-cyan-200/70">FacePhys rPPG</p>
+                                                    <h3 className="mt-1 text-sm font-semibold">本地心率监测</h3>
+                                                </div>
+                                                <span className={`rounded-full border px-3 py-1 text-[11px] font-semibold ${getRppgStatusClass()}`}>
+                                                    {getRppgStatusLabel()}
+                                                </span>
+                                            </div>
+
+                                            <div className="mt-4 grid grid-cols-2 gap-3">
+                                                <div className="rounded-xl border border-white/10 bg-white/5 px-3 py-3">
+                                                    <p className="text-[11px] uppercase tracking-[0.18em] text-slate-300">心率 BPM</p>
+                                                    <p className="mt-2 text-3xl font-black text-white">{hrDisplay}</p>
+                                                </div>
+                                                <div className="rounded-xl border border-white/10 bg-white/5 px-3 py-3">
+                                                    <p className="text-[11px] uppercase tracking-[0.18em] text-slate-300">SQI</p>
+                                                    <p className="mt-2 text-3xl font-black text-white">{sqiDisplay}</p>
+                                                </div>
+                                            </div>
+
+                                            <div className="mt-3 rounded-xl border border-white/10 bg-white/5 px-3 py-3">
+                                                <p className="text-[11px] uppercase tracking-[0.18em] text-slate-300">信号状态</p>
+                                                <p className="mt-2 text-sm font-medium text-slate-100">
+                                                    {rppgMetrics.hasFace ? '人脸跟踪中' : '等待稳定人脸进入画面'}
+                                                </p>
+                                                <p className="mt-2 text-xs leading-5 text-slate-300">{rppgHint}</p>
+                                            </div>
+                                        </div>
+
                                         <div className="absolute top-2 left-2 w-6 h-6 border-t-2 border-l-2 border-blue-400 rounded-tl-lg"></div>
                                         <div className="absolute top-2 right-2 w-6 h-6 border-t-2 border-r-2 border-blue-400 rounded-tr-lg"></div>
                                         <div className="absolute bottom-2 left-2 w-6 h-6 border-b-2 border-l-2 border-blue-400 rounded-bl-lg"></div>

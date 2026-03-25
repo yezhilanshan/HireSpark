@@ -80,8 +80,10 @@ logger.info("Socket.IO 初始化完成")
 
 if llm_manager is None:
     logger.error(f"LLM 初始化失败，相关功能不可用：{llm_import_error}")
-else:
+elif getattr(llm_manager, 'enabled', False):
     logger.info("LLM 模块初始化成功")
+else:
+    logger.warning("LLM 模块已加载，但当前未启用")
 
 # 初始化工具类
 logger.info("初始化工具模块...")
@@ -336,7 +338,10 @@ def _process_asr_text_with_llm(client_id: str, text: str):
 # 初始化简历解析器
 try:
     from utils.resume_parser import resume_parser
-    logger.info("简历解析器初始化成功")
+    if getattr(resume_parser, 'enabled', False):
+        logger.info("简历解析器初始化成功")
+    else:
+        logger.warning("简历解析器已加载，但当前未启用")
 except Exception as e:
     resume_parser = None
     logger.error(f"简历解析器初始化失败：{e}")
@@ -344,14 +349,18 @@ except Exception as e:
 # 初始化 ASR 管理器
 if asr_manager is None:
     logger.error(f"ASR 初始化失败，相关功能不可用：{asr_import_error}")
-else:
+elif getattr(asr_manager, 'enabled', False):
     logger.info("ASR 模块初始化成功")
+else:
+    logger.warning("ASR 模块已加载，但当前未启用")
 
 # 初始化 TTS 管理器
 if tts_manager is None:
     logger.error(f"TTS 初始化失败，相关功能不可用：{tts_import_error}")
-else:
+elif getattr(tts_manager, 'enabled', False):
     logger.info("TTS 模块初始化成功")
+else:
+    logger.warning("TTS 模块已加载，但当前未启用")
 
 logger.info("工具模块初始化完成")
 
@@ -543,7 +552,8 @@ def handle_start_interview(data=None):
         logger.error(f"启动面试错误：{e}", exc_info=True)
         emit('error', {
             'error': 'Failed to start interview',
-            'code': 'START_ERROR'
+            'code': 'START_ERROR',
+            'details': str(e)
         })
 
 

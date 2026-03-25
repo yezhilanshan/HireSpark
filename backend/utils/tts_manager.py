@@ -157,7 +157,3 @@ class TTSManager:
 
 # 创建全局 TTS 管理器实例
 tts_manager = TTSManager()
-
-
-# 创建全局 TTS 管理器实例
-tts_manager = TTSManager()

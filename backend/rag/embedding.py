@@ -70,10 +70,28 @@ class TextEmbedder:
             return [self._mock_encode(t) for t in texts]
 
     def _mock_encode(self, text):
-        """模拟 embedding（用于测试）"""
-        # 使用简单的 hash 模拟，相同文本返回相同向量
-        np.random.seed(hash(text) % (2**32))
-        return np.random.randn(768).astype(np.float32)
+        """模拟 embedding（用于测试）- 基于关键词的稀疏向量"""
+        # 创建一个基于关键词的稀疏向量，使相似文本有相似的向量
+        import re
+
+        # 提取关键词（简单的中文和英文分词）
+        words = set(re.findall(r'[\u4e00-\u9fa5]{2,}|[a-zA-Z]+', text.lower()))
+
+        # 创建稀疏向量表示（使用 hash 将词映射到向量位置）
+        vector = np.zeros(768, dtype=np.float32)
+        for word in words:
+            # 使用词的 hash 值确定向量位置
+            hash_val = hash(word) % 768
+            # 使用词的长度作为权重的一个因素
+            weight = min(len(word) * 0.1, 1.0)
+            vector[hash_val] = weight
+
+        # 归一化
+        norm = np.linalg.norm(vector)
+        if norm > 0:
+            vector = vector / norm
+
+        return vector
 
     def get_dimension(self):
         """获取向量维度"""
