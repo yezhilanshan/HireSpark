@@ -1,0 +1,174 @@
+{
+  "llm_interview_questions": [
+    {
+      "id": "llm_001",
+      "question": "Attention 机制的计算公式是什么？为什么要除以 dk？",
+      "category": "Transformer 基础",
+      "difficulty": "中等",
+      "keywords": ["Attention", "Transformer", "缩放点积"],
+      "answer": "Attention(Q,K,V) = softmax(QK^T/√dk)V\n\n除以√dk 的原因：\n1. 防止点积结果过大，导致 softmax 进入梯度消失区\n2. 当 dk 较大时，QK^T 的方差会变大，softmax 梯度变小\n3. 缩放后使梯度更稳定，训练更容易收敛",
+      "followups": [
+        "如果 dk 很小，不除以√dk 会怎样？",
+        "softmax 梯度消失的原理是什么？"
+      ]
+    },
+    {
+      "id": "llm_002",
+      "question": "请解释 PPO、DPO、DAPO、GRPO、GSPO 的区别",
+      "category": "RLHF 对齐",
+      "difficulty": "困难",
+      "keywords": ["PPO", "DPO", "强化学习", "人类对齐"],
+      "answer": "PPO (Proximal Policy Optimization):\n- 基于强化学习的策略优化方法\n- 使用 clip 限制策略更新幅度\n- 需要训练价值模型和奖励模型\n\nDPO (Direct Preference Optimization):\n- 直接用偏好数据优化策略，无需强化学习\n- 简化了 RLHF 流程，不需要价值模型\n- 数学上等价于隐式奖励建模\n\nDAPO/GRPO/GSPO:\n- PPO 的变体，针对不同场景优化\n- GRPO 使用组内相对优势\n- GSPO 使用组间策略优化",
+      "followups": [
+        "PPO 的 loss 函数各部分含义？",
+        "DPO 为什么不需要价值模型？",
+        "advantage 怎么计算？"
+      ]
+    },
+    {
+      "id": "llm_003",
+      "question": "PPO 损失函数是什么？ratio 和 advantage 怎么理解？",
+      "category": "RLHF 对齐",
+      "difficulty": "困难",
+      "keywords": ["PPO", "损失函数", "强化学习"],
+      "answer": "PPO 损失函数：\nL = E[min(r_t·A_t, clip(r_t, 1-ε, 1+ε)·A_t)]\n\nratio (r_t): π_new(a|s) / π_old(a|s)\n- 表示新旧策略的概率比\n- 控制策略更新幅度\n\nadvantage (A_t):\n- 优势函数，表示当前动作比平均好多少\n- A(s,a) = Q(s,a) - V(s)\n- 大模型中通常用 GAE 估计",
+      "followups": [
+        "clip 的作用是什么？",
+        "GAE 怎么计算 advantage？"
+      ]
+    },
+    {
+      "id": "llm_004",
+      "question": "Adam 优化器的原理是什么？",
+      "category": "深度学习基础",
+      "difficulty": "中等",
+      "keywords": ["Adam", "优化器", "梯度下降"],
+      "answer": "Adam (Adaptive Moment Estimation):\n\n1. 结合动量法和 RMSProp\n2. 维护一阶矩 m（梯度均值）和二阶矩 v（梯度平方均值）\n3. 更新公式：\n   m_t = β1·m_{t-1} + (1-β1)·g_t\n   v_t = β2·v_{t-1} + (1-β2)·g_t²\n   θ_t = θ_{t-1} - α·m̂_t / (√v̂_t + ε)\n\n优点：自适应学习率、收敛快、适合稀疏梯度",
+      "followups": [
+        "Adam 和 SGD 的区别？",
+        "为什么需要偏置校正？"
+      ]
+    },
+    {
+      "id": "llm_005",
+      "question": "MHA、MQA、GQA、MLA 有什么区别？",
+      "category": "Attention 变体",
+      "difficulty": "中等",
+      "keywords": ["MHA", "MQA", "GQA", "注意力机制"],
+      "answer": "MHA (Multi-Head Attention):\n- 每个头有独立的 Q、K、V 投影\n- 参数量大，效果好\n\nMQA (Multi-Query Attention):\n- 多个头共享一组 K、V\n- 减少 KV cache，加速推理\n- 效果略有下降\n\nGQA (Grouped-Query Attention):\n- 介于 MHA 和 MQA 之间\n- 头分组，组内共享 K、V\n- 平衡效果和速度\n\nMLA (Multi-Latent Attention):\n- DeepSeek 提出的变体\n- 使用低秩 KV 投影",
+      "followups": [
+        "KV cache 的原理？",
+        "GQA 在哪些模型中使用？"
+      ]
+    },
+    {
+      "id": "llm_006",
+      "question": "手撕交叉熵损失函数",
+      "category": "深度学习基础",
+      "difficulty": "简单",
+      "keywords": ["交叉熵", "损失函数", "手写代码"],
+      "answer": "```python\ndef cross_entropy_loss(y_pred, y_true):\n    # y_pred: 预测概率 (经过 softmax)\n    # y_true: 真实标签 (one-hot)\n    epsilon = 1e-10\n    loss = -torch.sum(y_true * torch.log(y_pred + epsilon))\n    return loss / y_true.size(0)\n```\n\n或者使用 PyTorch 内置（包含 softmax）：\n```python\nloss_fn = nn.CrossEntropyLoss()\nloss = loss_fn(logits, labels)  # labels 是类别索引\n```",
+      "followups": [
+        "为什么要加 epsilon？",
+        "交叉熵和 MSE 的区别？"
+      ]
+    },
+    {
+      "id": "llm_007",
+      "question": "位置编码有哪些？RoPE 的原理是什么？",
+      "category": "Transformer 基础",
+      "difficulty": "中等",
+      "keywords": ["位置编码", "RoPE", "相对位置"],
+      "answer": "位置编码类型：\n\n1. 绝对位置编码 (Transformer 原始)\n   - 使用正弦/余弦函数或可学习参数\n\n2. 相对位置编码 (RoPE、ALiBi)\n   - RoPE (Rotary Position Embedding):\n     * 通过旋转矩阵编码相对位置\n     * q_rot = q·cos(θ) + k·sin(θ)\n     * 保持相对位置不变性\n   - ALiBi: 注意力矩阵加线性偏置\n\n3. 2D 位置编码 (ViT)\n   - 可学习的行/列位置编码\n\nRoPE 优点：外推性好、相对位置敏感、计算高效",
+      "followups": [
+        "RoPE 为什么外推性好？",
+        "ALiBi 的原理是什么？"
+      ]
+    },
+    {
+      "id": "llm_008",
+      "question": "MSE 损失和 GAE 损失是什么？大模型中怎么计算？",
+      "category": "强化学习",
+      "difficulty": "困难",
+      "keywords": ["MSE", "GAE", "强化学习"],
+      "answer": "MSE (Mean Squared Error):\n- 价值模型的损失\n- L = E[(V(s) - target)²]\n- 用于训练价值函数\n\nGAE (Generalized Advantage Estimation):\n- 优势函数的估计方法\n- A_t^GAE = Σ(γ·λ)^(k-1)·δ_{t+k}\n- δ_t = r_t + γV(s_{t+1}) - V(s_t)\n\n大模型中的 GAE：\n- 用于 PPO 的 advantage 计算\n- 平衡偏差和方差\n- λ控制偏差/方差权衡",
+      "followups": [
+        "GAE 中λ和γ的作用？",
+        "为什么 GAE 比 TD 好？"
+      ]
+    },
+    {
+      "id": "llm_009",
+      "question": "大模型中 PPO 的 returns 是什么？",
+      "category": "RLHF 对齐",
+      "difficulty": "困难",
+      "keywords": ["PPO", "returns", "强化学习"],
+      "answer": "Returns (累积回报)：\n\nR_t = r_t + γ·r_{t+1} + γ²·r_{t+2} + ...\n\n在大模型 PPO 中：\n- 每个 token 是一个时间步\n- reward 来自奖励模型（对完整回答打分）\n- returns 用于计算价值损失和 advantage\n\n计算方式：\n1. 用奖励模型对生成的回答打分\n2. 将 reward 分配到每个 token\n3. 用折扣因子γ计算 returns",
+      "followups": [
+        "token 级别的 reward 怎么分配？",
+        "稀疏 reward 怎么处理？"
+      ]
+    },
+    {
+      "id": "llm_010",
+      "question": "ViT 的位置编码有哪些？二维位置编码、相对位置编码、多模态位置编码分别是什么？",
+      "category": "视觉 Transformer",
+      "difficulty": "中等",
+      "keywords": ["ViT", "位置编码", "多模态"],
+      "answer": "ViT 位置编码：\n\n1. 一维位置编码\n   - 将图像展平为序列\n   - 使用标准 Transformer 位置编码\n\n2. 二维位置编码\n   - 分别编码行和列位置\n   - pos_embed = row_embed + col_embed\n   - 保持空间结构信息\n\n3. 相对位置编码\n   - 编码 patch 之间的相对位置\n   - 更适合局部注意力\n\n4. 多模态位置编码\n   - 图像 + 文本的位置编码\n   - 使用不同的位置嵌入\n   - 在 cross-attention 中对齐",
+      "followups": [
+        "2D 位置编码怎么实现？",
+        "多模态位置编码怎么对齐？"
+      ]
+    },
+    {
+      "id": "code_001",
+      "question": "力扣：最长有效括号（LeetCode 32）",
+      "category": "算法题",
+      "difficulty": "困难",
+      "keywords": ["栈", "动态规划", "括号匹配"],
+      "answer": "解法 1：栈\n```python\ndef longestValidParentheses(s: str) -> int:\n    stack = [-1]\n    max_len = 0\n    for i, c in enumerate(s):\n        if c == '(':\n            stack.append(i)\n        else:\n            stack.pop()\n            if not stack:\n                stack.append(i)\n            else:\n                max_len = max(max_len, i - stack[-1])\n    return max_len\n```\n\n解法 2：动态规划\n```python\ndef longestValidParentheses(s: str) -> int:\n    n = len(s)\n    dp = [0] * n\n    for i in range(1, n):\n        if s[i] == ')':\n            if s[i-1] == '(':\n                dp[i] = dp[i-2] + 2 if i >= 2 else 2\n            elif i-dp[i-1]-1 >= 0 and s[i-dp[i-1]-1] == '(':\n                dp[i] = dp[i-1] + 2 + (dp[i-dp[i-1]-2] if i-dp[i-1]-2 >= 0 else 0)\n    return max(dp) if dp else 0\n```",
+      "followups": [
+        "栈解法的时间复杂度？",
+        "DP 状态怎么定义？"
+      ]
+    },
+    {
+      "id": "code_002",
+      "question": "力扣：搜索旋转排序数组（LeetCode 33）",
+      "category": "算法题",
+      "difficulty": "中等",
+      "keywords": ["二分查找", "旋转数组"],
+      "answer": "二分查找变体：\n```python\ndef search(nums: List[int], target: int) -> int:\n    left, right = 0, len(nums) - 1\n    while left <= right:\n        mid = (left + right) // 2\n        if nums[mid] == target:\n            return mid\n        # 左半部分有序\n        if nums[left] <= nums[mid]:\n            if nums[left] <= target < nums[mid]:\n                right = mid - 1\n            else:\n                left = mid + 1\n        # 右半部分有序\n        else:\n            if nums[mid] < target <= nums[right]:\n                left = mid + 1\n            else:\n                right = mid - 1\n    return -1\n```\n时间复杂度：O(log n)",
+      "followups": [
+        "为什么能判断哪边有序？",
+        "有重复元素怎么办？"
+      ]
+    },
+    {
+      "id": "proj_001",
+      "question": "介绍一下你做的大模型相关项目",
+      "category": "项目深挖",
+      "difficulty": "中等",
+      "keywords": ["项目", "大模型", "自我介绍"],
+      "answer": "回答框架：\n\n1. 项目背景：要解决什么问题\n2. 技术方案：使用了什么模型/方法\n3. 你的贡献：具体做了什么\n4. 效果指标：量化成果\n5. 难点与解决：遇到的挑战和解决方案\n\n示例：\n\"我做过一个基于 RAG 的问答系统。我们使用 LLaMA 作为基座模型，结合向量检索增强生成。我主要负责知识库构建和检索模块，使用 ChromaDB 存储向量，text2vec 做 embedding。最终问答准确率提升了 30%...\"",
+      "followups": [
+        "项目中最大的挑战是什么？",
+        "为什么选择这个方案？",
+        "如果重新做会怎么改进？"
+      ]
+    },
+    {
+      "id": "base_001",
+      "question": "大模型常见的位置编码方式有哪些？各有什么优缺点？",
+      "category": "Transformer 基础",
+      "difficulty": "中等",
+      "keywords": ["位置编码", "RoPE", "ALiBi", "Transformer"],
+      "answer": "主要位置编码方式：\n\n1. 绝对位置编码 (Sinusoidal/Learned)\n   - 优点：简单直接\n   - 缺点：外推性差，长度固定\n\n2. RoPE (Rotary Position Embedding)\n   - 优点：外推性好，相对位置敏感\n   - 缺点：实现稍复杂\n   - 使用：LLaMA、PaLM 等\n\n3. ALiBi (Attention with Linear Biases)\n   - 优点：无需修改即可外推\n   - 缺点：训练时需要较长序列\n   - 使用：MPT 等\n\n4. 可学习位置编码\n   - 优点：灵活\n   - 缺点：长度固定，参数量大",
+      "followups": [
+        "RoPE 如何实现外推？",
+        "位置编码长度不够怎么办？"
+      ]
+    }
+  ]
+}
