@@ -2,6 +2,7 @@
 # Python
 # ====================================
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 *.so
@@ -80,3 +81,41 @@ tmp/
 temp/
 *.tmp
 *.temp
+
+# ====================================
+# 用户上传文件
+# ====================================
+uploads/
+
+# ====================================
+# 备份文件
+# ====================================
+*.bak
+*.backup
+
+# ====================================
+# Chroma向量数据库
+# ====================================
+.chroma/
+chroma_db/
+
+
+# Claude / local config
+.claude/
+*.local.json
+
+# env examples if you also don't want them tracked
+.env.example
+
+# uploaded resume files
+backend/uploads/
+
+# external demo folder
+backend/FacePhys-Demo-main/
+
+# TypeScript build cache
+*.tsbuildinfo
+
+# backup
+*.bak
+*.backup
