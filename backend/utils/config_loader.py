@@ -5,6 +5,15 @@ import yaml
 import os
 from pathlib import Path
 from typing import Any, Dict, Optional
+from dotenv import load_dotenv
+
+# 先加载 .env。优先项目根目录，其次兼容 backend 目录内的 .env。
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+
+for dotenv_path in (PROJECT_ROOT / '.env', BACKEND_ROOT / '.env'):
+    if dotenv_path.exists():
+        load_dotenv(dotenv_path=dotenv_path, override=False)
 
 
 class ConfigLoader:

@@ -120,6 +120,8 @@ class LLMManager:
         self.model = config.get('llm.model', 'qwen-max')
         self.api_key = self._resolve_api_key(config.get('llm.api_key'))
         self.timeout = config.get('llm.timeout', 30)
+        self.current_round = 'technical'
+        self.resume_data: Optional[Dict] = None
         
         # 初始化 API Key
         if self.api_key:
@@ -385,8 +387,8 @@ class LLMManager:
         if round_type in INTERVIEW_ROUNDS:
             self.current_round = round_type
             self.system_prompt = INTERVIEW_ROUNDS[round_type]['system_prompt']
-            if resume_data:
-                self.resume_data = resume_data
+            self.resume_data = resume_data if isinstance(resume_data, dict) else None
+            if self.resume_data:
                 resume_context = self._build_resume_context(resume_data)
                 self.system_prompt += "\n\n" + resume_context
             logger.info(f"设置面试轮次：{round_type}")
@@ -439,14 +441,15 @@ class LLMManager:
         """根据面试轮次生成问题"""
         if not self.check_enabled():
             return ""
-        self.set_interview_round(round_type, self.resume_data)
+        resume_data = self.resume_data if isinstance(self.resume_data, dict) else None
+        self.set_interview_round(round_type, resume_data)
         difficulty_map = {"easy": "基础", "medium": "中等", "hard": "高级"}
         round_info = INTERVIEW_ROUNDS.get(round_type, INTERVIEW_ROUNDS['technical'])
         prompt = f"请为【{position}】职位生成一个【{difficulty_map.get(difficulty, '中等')}】难度的{round_info['name']}问题。"
         if context:
             prompt += f"\n背景信息：{context}"
-        if round_type == 'project' and self.resume_data:
-            projects = self.resume_data.get('projects', [])
+        if round_type == 'project' and resume_data:
+            projects = resume_data.get('projects', [])
             if projects:
                 prompt += f"\n候选人项目：{projects[0].get('name', '')}"
         prompt += "\n请直接给出问题，不要多余的解释。"
@@ -468,7 +471,8 @@ class LLMManager:
         """处理用户回答，根据轮次生成追问"""
         if not self.check_enabled():
             return ""
-        self.set_interview_round(round_type, self.resume_data)
+        resume_data = self.resume_data if isinstance(self.resume_data, dict) else None
+        self.set_interview_round(round_type, resume_data)
         messages = [{"role": "system", "content": self.system_prompt}]
         if chat_history:
             for item in chat_history[-4:]:
