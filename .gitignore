@@ -1,0 +1,121 @@
+# ====================================
+# Python
+# ====================================
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 虚拟环境
+venv/
+env/
+ENV/
+
+# ====================================
+# 环境变量和敏感配置
+# ====================================
+.env
+.env.local
+.env.production
+*.local
+
+# ====================================
+# Node.js / Next.js
+# ====================================
+node_modules/
+.next/
+out/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ====================================
+# 日志文件
+# ====================================
+logs/
+*.log
+
+# ====================================
+# 数据库和备份
+# ====================================
+*.db
+*.sqlite
+*.sqlite3
+backups/
+data.db
+
+# ====================================
+# 报告生成
+# ====================================
+reports/
+
+# ====================================
+# IDE
+# ====================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ====================================
+# OS
+# ====================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ====================================
+# 临时文件
+# ====================================
+tmp/
+temp/
+*.tmp
+*.temp
+
+# ====================================
+# 用户上传文件
+# ====================================
+uploads/
+
+# ====================================
+# 备份文件
+# ====================================
+*.bak
+*.backup
+
+# ====================================
+# Chroma向量数据库
+# ====================================
+.chroma/
+chroma_db/
+
+
+# Claude / local config
+.claude/
+*.local.json
+
+# env examples if you also don't want them tracked
+.env.example
+
+# uploaded resume files
+backend/uploads/
+
+# external demo folder
+backend/FacePhys-Demo-main/
+
+# TypeScript build cache
+*.tsbuildinfo
+
+# backup
+*.bak
+*.backup

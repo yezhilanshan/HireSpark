@@ -1,0 +1,1299 @@
+"""
+RAG service - configuration, indexing and retrieval entrypoint.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from .embedding import TextEmbedder
+from .chroma_db import KnowledgeStore
+from .retriever import KnowledgeRetriever, QuestionRetriever, RubricRetriever
+from .state import InterviewState
+
+try:
+    from utils.config_loader import config
+    from utils.logger import get_logger
+except ImportError:  # pragma: no cover - compatibility for root-level scripts
+    from backend.utils.config_loader import config
+    from backend.utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+DEFAULT_EMBEDDING_MODEL = "shibing624/text2vec-base-chinese"
+OPENAI_EMBEDDING_MODELS = {
+    "text-embedding-3-small",
+    "text-embedding-3-large",
+}
+
+
+class RAGService:
+    """Shared RAG service used by scripts and runtime handlers."""
+
+    def __init__(self):
+        self.backend_root = Path(__file__).resolve().parents[1]
+        self.enabled = bool(config.get("rag.enabled", False))
+        self.requested_store_type = str(
+            config.get("rag.store", config.get("rag.vector_db", "chroma"))
+        ).lower()
+        self.store_type = self._normalize_store_type(self.requested_store_type)
+        self.embedding_model = self._normalize_embedding_model(
+            config.get("rag.embedding_model", DEFAULT_EMBEDDING_MODEL)
+        )
+        self.collection_name = config.get("rag.collection_name", "interview_questions")
+        self.persist_dir = self._resolve_backend_path(
+            config.get("rag.persist_dir", "rag_data")
+        )
+        self.knowledge_path = self._resolve_backend_path(
+            config.get("rag.knowledge_path", "knowledge/llm_questions.json")
+        )
+        self.top_k = int(config.get("rag.top_k", 5))
+        self.min_similarity = float(config.get("rag.min_similarity", 0.55))
+        self.max_context_results = int(config.get("rag.max_context_results", 2))
+        self.max_similarity_gap = float(config.get("rag.max_similarity_gap", 0.08))
+        self.min_lexical_score = float(config.get("rag.min_lexical_score", 0.10))
+        self.auto_build = bool(config.get("rag.auto_build_on_start", False))
+
+        self.embedder: Optional[TextEmbedder] = None
+        self.store: Optional[KnowledgeStore] = None
+        self.retriever: Optional[KnowledgeRetriever] = None
+        self.question_retriever: Optional[QuestionRetriever] = None
+        self.rubric_retriever: Optional[RubricRetriever] = None
+        self._initialized = False
+        self._build_attempted = False
+
+        if self.enabled and self.auto_build:
+            self.ensure_ready()
+
+    def _resolve_backend_path(self, value: Optional[str]) -> str:
+        if not value:
+            return str(self.backend_root)
+
+        path = Path(value)
+        if path.is_absolute():
+            return str(path)
+        return str((self.backend_root / path).resolve())
+
+    def _normalize_store_type(self, value: str) -> str:
+        normalized = (value or "chroma").strip().lower()
+        if normalized == "faiss":
+            logger.warning("当前仅实现 ChromaDB 存储，配置中的 faiss 将回退为 chroma")
+            return "chroma"
+        if normalized not in {"chroma", "local"}:
+            logger.warning(f"未知的 RAG 存储类型：{value}，将回退为 chroma")
+            return "chroma"
+        return normalized
+
+    def _normalize_embedding_model(self, value: Optional[str]) -> str:
+        model_name = (value or DEFAULT_EMBEDDING_MODEL).strip()
+        if model_name in OPENAI_EMBEDDING_MODELS:
+            logger.warning(
+                "当前 RAG 实现使用本地 sentence-transformers，"
+                f"配置中的 {model_name} 将回退为 {DEFAULT_EMBEDDING_MODEL}"
+            )
+            return DEFAULT_EMBEDDING_MODEL
+        return model_name
+
+    def _init_runtime(self):
+        if self._initialized:
+            return
+
+        if not self.enabled:
+            logger.info("RAG 当前未启用，跳过初始化")
+            self._initialized = True
+            return
+
+        self.embedder = TextEmbedder(model_name=self.embedding_model)
+        persist_dir = None if self.store_type == "local" else self.persist_dir
+        self.store = KnowledgeStore(
+            collection_name=self.collection_name,
+            persist_dir=persist_dir,
+            embedder=self.embedder
+        )
+        self.question_retriever = QuestionRetriever(self.store, self.embedder)
+        self.rubric_retriever = RubricRetriever(self.store, self.embedder)
+        self.retriever = KnowledgeRetriever(self.store, self.embedder)
+        self._initialized = True
+
+    def ensure_ready(self) -> bool:
+        if not self.enabled:
+            return False
+
+        self._init_runtime()
+
+        if (
+            self.store is None
+            or self.retriever is None
+            or self.question_retriever is None
+            or self.rubric_retriever is None
+        ):
+            return False
+
+        if self.store.count() > 0:
+            if self._has_dual_view_index():
+                return True
+            if not self._build_attempted:
+                logger.info("检测到旧版单索引 RAG，开始自动重建为双视图索引")
+                self.build_index(rebuild=True)
+            return self._has_dual_view_index()
+
+        if not self._build_attempted:
+            self.build_index()
+
+        return self._has_dual_view_index()
+
+    def _has_dual_view_index(self) -> bool:
+        if self.store is None:
+            return False
+        try:
+            return (
+                self.store.count({"view_type": "question"}) > 0
+                and self.store.count({"view_type": "rubric"}) > 0
+            )
+        except Exception:
+            return False
+
+    def _load_records(self, source_path: Optional[str] = None) -> List[Dict[str, Any]]:
+        path = Path(source_path or self.knowledge_path)
+        if not path.exists():
+            fallback_candidates = [
+                path.with_name("llm_questions_v2.json"),
+                path.with_name("llm_questions.json"),
+                path.with_suffix(".jsonl"),
+            ]
+            for candidate in fallback_candidates:
+                if candidate.exists():
+                    logger.warning(f"知识库文件 {path} 不存在，回退使用 {candidate}")
+                    path = candidate
+                    break
+            else:
+                raise FileNotFoundError(
+                    f"知识库文件不存在: {path}。可用候选: "
+                    + ", ".join(str(candidate) for candidate in fallback_candidates)
+                )
+
+        if path.suffix.lower() == ".jsonl":
+            records: List[Dict[str, Any]] = []
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    records.append(json.loads(line))
+            return records
+
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            for key in ("llm_interview_questions", "questions", "items", "records"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    return value
+        raise ValueError(f"无法识别的知识库数据格式: {path}")
+
+    def _normalize_record(self, raw: Dict[str, Any], index: int) -> Dict[str, Any]:
+        record_id = str(raw.get("id") or f"rag_{index:04d}")
+        role_or_position = str(raw.get("position") or raw.get("role") or "").strip()
+        question = str(
+            raw.get("question")
+            or raw.get("title")
+            or raw.get("content")
+            or ""
+        ).strip()
+        if not question:
+            raise ValueError(f"记录缺少 question/title/content 字段: {record_id}")
+
+        answer = str(
+            raw.get("answer")
+            or raw.get("answer_summary")
+            or raw.get("content")
+            or ""
+        ).strip()
+        keywords = self._ensure_list(raw.get("keywords"))
+        tags = self._ensure_list(raw.get("tags"))
+        competency = self._ensure_list(raw.get("competency"))
+        expected_answer_signals = self._ensure_list(
+            raw.get("expected_answer_signals")
+        ) or keywords[:]
+        return {
+            "id": record_id,
+            "role": role_or_position,
+            "position": role_or_position,
+            "question": question,
+            "category": raw.get("category", ""),
+            "subcategory": raw.get("subcategory") or raw.get("title", ""),
+            "competency": competency,
+            "difficulty": raw.get("difficulty", ""),
+            "question_type": raw.get("question_type") or raw.get("doc_type", ""),
+            "round_type": raw.get("round_type", "technical"),
+            "question_intent": raw.get("question_intent", "screening"),
+            "keywords": keywords,
+            "answer_summary": answer,
+            "key_points": raw.get("key_points", []),
+            "optional_points": raw.get("optional_points", []),
+            "expected_answer_signals": expected_answer_signals,
+            "common_mistakes": raw.get("common_mistakes", []),
+            "scoring_rubric": raw.get("scoring_rubric", {}),
+            "followups": self._normalize_followups(raw.get("followups", []), keywords),
+            "retrieval_text": raw.get("retrieval_text", "") or answer or question,
+            "source": raw.get("source", ""),
+            "source_type": raw.get("source_type", ""),
+            "chunk_id": raw.get("chunk_id", ""),
+            "doc_type": raw.get("doc_type", ""),
+            "tags": tags,
+            "answer": answer,
+        }
+
+    @staticmethod
+    def _ensure_list(value: Any) -> List[Any]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        return [value]
+
+    @staticmethod
+    def _normalize_followups(
+        followups: Any,
+        keywords: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        normalized = []
+        default_signals = [
+            str(keyword).strip()
+            for keyword in (keywords or [])
+            if str(keyword).strip()
+        ][:3]
+
+        for entry in RAGService._ensure_list(followups):
+            if isinstance(entry, dict):
+                question = str(entry.get("question", "")).strip()
+                if not question:
+                    continue
+                trigger_signals = [
+                    str(signal).strip()
+                    for signal in RAGService._ensure_list(
+                        entry.get("trigger_signals")
+                    )
+                    if str(signal).strip()
+                ]
+                normalized.append({
+                    "question": question,
+                    "trigger_type": str(
+                        entry.get("trigger_type") or "missing_detail"
+                    ).strip() or "missing_detail",
+                    "trigger_signals": trigger_signals or default_signals
+                })
+                continue
+
+            question = str(entry).strip()
+            if not question:
+                continue
+            normalized.append({
+                "question": question,
+                "trigger_type": "missing_detail",
+                "trigger_signals": default_signals
+            })
+
+        return normalized
+
+    def build_index(self, source_path: Optional[str] = None, rebuild: bool = False) -> int:
+        if not self.enabled:
+            logger.info("RAG 未启用，跳过建库")
+            return 0
+
+        self._init_runtime()
+        self._build_attempted = True
+
+        if self.store is None:
+            return 0
+
+        raw_records = self._load_records(source_path=source_path)
+        items = [
+            self._normalize_record(record, idx)
+            for idx, record in enumerate(raw_records, start=1)
+        ]
+
+        if rebuild:
+            self.store.reset()
+        elif self.store.count() > 0:
+            if not self._has_dual_view_index():
+                logger.info("检测到旧版单索引，重建为 question/rubric 双视图索引")
+                self.store.reset()
+            else:
+                logger.info(f"RAG 索引已存在，共 {self.store.count()} 条，跳过重复建库")
+                return self.store.count()
+
+        self.store.add_questions_batch(items)
+        self.store.save()
+        logger.info(f"RAG 建库完成，共 {self.store.count()} 条")
+        return self.store.count()
+
+    def build_indexes(self, source_path: Optional[str] = None, rebuild: bool = False) -> int:
+        """构建双视图索引的兼容入口。"""
+        return self.build_index(source_path=source_path, rebuild=rebuild)
+
+    def create_interview_state(
+        self,
+        role: str,
+        round_type: str = "technical",
+        difficulty: str = "medium",
+        session_id: str = "",
+    ) -> Dict[str, Any]:
+        state = InterviewState(
+            session_id=session_id,
+            role=role,
+            target_round_type=round_type or "technical",
+            target_difficulty=difficulty or "medium",
+        )
+        return state.to_dict()
+
+    def _coerce_interview_state(
+        self,
+        session_state: Optional[Any],
+        role: Optional[str] = None,
+        round_type: Optional[str] = None,
+        difficulty: Optional[str] = None,
+    ) -> InterviewState:
+        if isinstance(session_state, InterviewState):
+            state = session_state
+        elif isinstance(session_state, dict):
+            state = InterviewState.from_dict(session_state)
+        else:
+            state = InterviewState()
+
+        if role and not state.role:
+            state.role = role
+        if round_type:
+            state.target_round_type = round_type
+        if difficulty:
+            state.target_difficulty = difficulty
+        return state
+
+    def _build_question_query(
+        self,
+        state: InterviewState,
+        context: Optional[str] = None,
+    ) -> str:
+        query_parts: List[str] = [
+            state.role,
+            state.target_round_type,
+            state.target_difficulty,
+        ]
+        if state.current_topic:
+            query_parts.append(state.current_topic)
+        query_parts.extend(state.weak_competencies[:3])
+        if context:
+            query_parts.append(context)
+        return " ".join(part for part in query_parts if part)
+
+    def _score_question_for_state(
+        self,
+        item: Dict[str, Any],
+        state: InterviewState,
+    ) -> float:
+        metadata = item.get("metadata", {}) or {}
+        competencies = [
+            str(entry).strip()
+            for entry in metadata.get("competency", []) or []
+            if str(entry).strip()
+        ]
+        covered = set(state.covered_competencies)
+        weak = set(state.weak_competencies)
+
+        score = float(item.get("rerank_score", item.get("similarity", 0.0)))
+        uncovered_gain = sum(1 for entry in competencies if entry not in covered)
+        weak_gain = sum(1 for entry in competencies if entry in weak)
+        score += min(uncovered_gain * 0.08, 0.24)
+        score += min(weak_gain * 0.05, 0.15)
+
+        current_topic = (state.current_topic or "").strip()
+        item_topic = str(metadata.get("subcategory") or metadata.get("category") or "").strip()
+        if current_topic and item_topic and current_topic == item_topic:
+            score += 0.04
+
+        return round(score, 4)
+
+    def get_next_question(
+        self,
+        session_state: Optional[Any],
+        context: Optional[str] = None,
+        top_k: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        state = self._coerce_interview_state(session_state)
+        if not state.role:
+            return {
+                "target_competency": [],
+                "round_type": state.target_round_type,
+                "difficulty_target": state.target_difficulty,
+                "candidate_questions": [],
+                "selection_reason": "缺少岗位信息，无法规划下一题",
+            }
+
+        query = self._build_question_query(state, context=context)
+        candidate_limit = max((top_k or self.max_context_results) * 3, self.top_k)
+        items = self.retrieve_questions(
+            query=query,
+            position=state.role,
+            top_k=candidate_limit,
+            metadata_filters={"round_type": state.target_round_type},
+        )
+
+        asked_ids = set(state.asked_question_ids)
+        candidate_questions = []
+        for item in items:
+            metadata = item.get("metadata", {}) or {}
+            source_id = str(metadata.get("source_id") or item.get("id") or "").split("#")[0]
+            if not source_id or source_id in asked_ids:
+                continue
+
+            competencies = [
+                str(entry).strip()
+                for entry in metadata.get("competency", []) or []
+                if str(entry).strip()
+            ]
+            candidate_questions.append({
+                "id": source_id,
+                "question": item.get("question", ""),
+                "category": metadata.get("category", ""),
+                "subcategory": metadata.get("subcategory", ""),
+                "competency": competencies,
+                "difficulty": metadata.get("difficulty", ""),
+                "question_type": metadata.get("question_type", ""),
+                "round_type": metadata.get("round_type", ""),
+                "score": self._score_question_for_state(item, state),
+            })
+
+        candidate_questions.sort(key=lambda entry: float(entry.get("score", 0)), reverse=True)
+        candidate_questions = candidate_questions[: top_k or self.max_context_results]
+
+        target_competency = []
+        if candidate_questions:
+            top_question = candidate_questions[0]
+            target_competency = [
+                entry for entry in top_question.get("competency", [])
+                if entry not in state.covered_competencies
+            ] or top_question.get("competency", [])
+
+        if candidate_questions:
+            reason = "优先补齐未覆盖能力，并避开本轮已问题目"
+            if state.current_topic:
+                reason += f"，当前主题延续为 {state.current_topic}"
+        else:
+            reason = "未找到满足条件的新题目候选"
+
+        return {
+            "target_competency": target_competency[:2],
+            "round_type": state.target_round_type,
+            "difficulty_target": state.target_difficulty,
+            "candidate_questions": candidate_questions,
+            "selection_reason": reason,
+        }
+
+    def format_question_plan(self, question_plan: Optional[Dict[str, Any]]) -> str:
+        if not question_plan:
+            return ""
+
+        candidates = question_plan.get("candidate_questions", []) or []
+        if not candidates:
+            return ""
+
+        parts = []
+        target_competency = question_plan.get("target_competency") or []
+        if target_competency:
+            parts.append(f"目标能力：{', '.join(str(item) for item in target_competency)}")
+        selection_reason = str(question_plan.get("selection_reason", "")).strip()
+        if selection_reason:
+            parts.append(f"选择依据：{selection_reason}")
+
+        for index, item in enumerate(candidates, start=1):
+            lines = [f"{index}. 候选题：{item.get('question', '')}"]
+            category = str(item.get("category", "")).strip()
+            subcategory = str(item.get("subcategory", "")).strip()
+            if category or subcategory:
+                lines.append(f"分类：{category} / {subcategory}".strip(" /"))
+            competency = item.get("competency") or []
+            if competency:
+                lines.append(f"能力点：{', '.join(str(entry) for entry in competency[:3])}")
+            difficulty = str(item.get("difficulty", "")).strip()
+            if difficulty:
+                lines.append(f"难度：{difficulty}")
+            lines.append(f"规划分数：{item.get('score', 0)}")
+            parts.append("\n".join(lines))
+
+        return "\n\n".join(parts)
+
+    def mark_question_asked(
+        self,
+        session_state: Optional[Any],
+        question_plan: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        state = self._coerce_interview_state(session_state)
+        candidates = (question_plan or {}).get("candidate_questions", []) or []
+        if not candidates:
+            return state.to_dict()
+
+        selected = candidates[0]
+        source_id = str(selected.get("id", "")).strip()
+        if source_id and source_id not in state.asked_question_ids:
+            state.asked_question_ids.append(source_id)
+
+        topic = str(selected.get("subcategory") or selected.get("category") or "").strip()
+        if topic:
+            state.current_topic = topic
+
+        state.followup_depth = 0
+        question_count = max(len(state.asked_question_ids), 1)
+        state.round_goal_progress = round(min(question_count / 3.0, 1.0), 4)
+        return state.to_dict()
+
+    def retrieve(
+        self,
+        query: str,
+        position: Optional[str] = None,
+        top_k: Optional[int] = None,
+        min_similarity: Optional[float] = None,
+        view_type: Optional[str] = None,
+        metadata_filters: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        if not query or not query.strip():
+            return []
+        if not self.ensure_ready():
+            return []
+
+        combined_filters = dict(metadata_filters or {})
+        if view_type:
+            combined_filters["view_type"] = view_type
+
+        retriever = self._get_retriever_for_view(view_type)
+        if retriever is None:
+            return []
+
+        results = retriever.retrieve(
+            query=query,
+            top_k=top_k or self.top_k,
+            min_similarity=min_similarity if min_similarity is not None else self.min_similarity,
+            strong_filter=True,
+            max_similarity_gap=self.max_similarity_gap,
+            min_lexical_score=self.min_lexical_score,
+            metadata_filters=combined_filters or None
+        )
+
+        if not position:
+            return results
+
+        position = self._normalize_position(position)
+        filtered = []
+        for item in results:
+            item_position = self._normalize_position(
+                str(item.get("metadata", {}).get("position", ""))
+            )
+            if not item_position or item_position == position:
+                filtered.append(item)
+        return filtered
+
+    def _get_retriever_for_view(
+        self,
+        view_type: Optional[str]
+    ) -> Optional[Any]:
+        if view_type == "rubric":
+            return self.rubric_retriever
+        if view_type == "question":
+            return self.question_retriever
+        return self.retriever
+
+    def retrieve_questions(
+        self,
+        query: str,
+        position: Optional[str] = None,
+        top_k: Optional[int] = None,
+        min_similarity: Optional[float] = None,
+        metadata_filters: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        return self.retrieve(
+            query=query,
+            position=position,
+            top_k=top_k,
+            min_similarity=min_similarity,
+            view_type="question",
+            metadata_filters=metadata_filters,
+        )
+
+    def retrieve_rubrics(
+        self,
+        query: str,
+        position: Optional[str] = None,
+        top_k: Optional[int] = None,
+        min_similarity: Optional[float] = None,
+        metadata_filters: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        return self.retrieve(
+            query=query,
+            position=position,
+            top_k=top_k,
+            min_similarity=min_similarity,
+            view_type="rubric",
+            metadata_filters=metadata_filters,
+        )
+
+    @staticmethod
+    def _normalize_position(position: str) -> str:
+        return "".join((position or "").strip().lower().split())
+
+    def _format_context(self, items: List[Dict[str, Any]]) -> str:
+        parts = []
+        for index, item in enumerate(items, start=1):
+            metadata = item.get("metadata", {})
+            answer = metadata.get("answer", "") or metadata.get("answer_summary", "")
+            if not answer:
+                answer = ""
+            followups = metadata.get("followups") or []
+            if isinstance(followups, list):
+                normalized_followups = []
+                for entry in followups:
+                    if isinstance(entry, dict):
+                        question = str(entry.get("question", "")).strip()
+                        if question:
+                            normalized_followups.append(question)
+                    else:
+                        text = str(entry).strip()
+                        if text:
+                            normalized_followups.append(text)
+                followups = normalized_followups
+            else:
+                followups = []
+
+            part_lines = [f"{index}. 问题：{item.get('question', '')}"]
+            category = str(metadata.get("category", "")).strip()
+            if category:
+                part_lines.append(f"分类：{category}")
+            difficulty = str(metadata.get("difficulty", "")).strip()
+            if difficulty:
+                part_lines.append(f"难度：{difficulty}")
+            source = str(metadata.get("source", "")).strip()
+            if source:
+                part_lines.append(f"来源：{source}")
+            if answer:
+                part_lines.append(f"参考答案：{answer}")
+            if followups:
+                part_lines.append(f"可追问：{'；'.join(followups[:2])}")
+
+            parts.append("\n".join(part_lines))
+
+        return "\n\n".join(parts)
+
+    def build_question_context(
+        self,
+        position: str,
+        difficulty: str = "medium",
+        round_type: Optional[str] = None,
+        context: Optional[str] = None,
+        interview_state: Optional[Any] = None,
+    ) -> str:
+        if interview_state is not None:
+            state = self._coerce_interview_state(
+                interview_state,
+                role=position,
+                round_type=round_type,
+                difficulty=difficulty,
+            )
+            return self.format_question_plan(
+                self.get_next_question(state, context=context, top_k=self.max_context_results)
+            )
+
+        query_parts = [position, difficulty]
+        if round_type:
+            query_parts.append(round_type)
+        if context:
+            query_parts.append(context)
+
+        items = self.retrieve_questions(
+            " ".join(part for part in query_parts if part),
+            position=position,
+            top_k=self.max_context_results,
+            metadata_filters={"round_type": round_type} if round_type else None
+        )
+        return self._format_context(items)
+
+    def build_answer_context(
+        self,
+        position: str,
+        current_question: str,
+        user_answer: Optional[str] = None,
+        round_type: Optional[str] = None,
+    ) -> str:
+        query_parts = [position, current_question]
+        if round_type:
+            query_parts.append(round_type)
+        if user_answer:
+            query_parts.append(user_answer)
+
+        items = self.retrieve_rubrics(
+            " ".join(part for part in query_parts if part),
+            position=position,
+            top_k=self.max_context_results,
+            metadata_filters={"round_type": round_type} if round_type else None
+        )
+        return self._format_context(items)
+
+    @staticmethod
+    def _normalize_analysis_text(text: Any) -> str:
+        return re.sub(r"\s+", "", str(text or "").lower())
+
+    @classmethod
+    def _extract_analysis_terms(cls, text: Any) -> List[str]:
+        normalized = cls._normalize_analysis_text(text)
+        if not normalized:
+            return []
+        terms = re.findall(r"[a-zA-Z][a-zA-Z0-9_\-./+]*|[\u4e00-\u9fff]{2,}", normalized)
+        return list(dict.fromkeys(term for term in terms if term))
+
+    @classmethod
+    def _matches_answer_entry(cls, answer: str, entry: Any) -> bool:
+        normalized_answer = cls._normalize_analysis_text(answer)
+        normalized_entry = cls._normalize_analysis_text(entry)
+        if not normalized_answer or not normalized_entry:
+            return False
+        if normalized_entry in normalized_answer:
+            return True
+
+        answer_terms = set(cls._extract_analysis_terms(answer))
+        entry_terms = set(cls._extract_analysis_terms(entry))
+        if not answer_terms or not entry_terms:
+            return False
+
+        overlap = answer_terms & entry_terms
+        overlap_ratio = len(overlap) / max(len(entry_terms), 1)
+        return len(overlap) >= 2 or overlap_ratio >= 0.6
+
+    @classmethod
+    def _collect_matched_entries(
+        cls,
+        answer: str,
+        entries: Optional[List[Any]],
+        limit: Optional[int] = None,
+    ) -> List[str]:
+        matched = []
+        for entry in entries or []:
+            text = str(entry).strip()
+            if not text:
+                continue
+            if cls._matches_answer_entry(answer, text):
+                matched.append(text)
+            if limit is not None and len(matched) >= limit:
+                break
+        return matched
+
+    @classmethod
+    def _compute_match_ratio(cls, answer: str, entries: Optional[List[Any]]) -> float:
+        normalized_entries = [
+            str(entry).strip()
+            for entry in entries or []
+            if str(entry).strip()
+        ]
+        if not normalized_entries:
+            return 0.0
+        matched = cls._collect_matched_entries(answer, normalized_entries)
+        return round(len(matched) / len(normalized_entries), 4)
+
+    def _resolve_rubric_profile(
+        self,
+        question_id: Optional[str] = None,
+        current_question: Optional[str] = None,
+        candidate_answer: Optional[str] = None,
+        position: Optional[str] = None,
+        round_type: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if question_id:
+            rubric = self.get_rubric(question_id)
+            if rubric:
+                return rubric
+
+        query_parts = [position, current_question, candidate_answer, round_type]
+        items = self.retrieve_rubrics(
+            query=" ".join(str(part).strip() for part in query_parts if str(part).strip()),
+            position=position,
+            top_k=1,
+            metadata_filters={"round_type": round_type} if round_type else None,
+        )
+        if not items:
+            return None
+
+        item = items[0]
+        metadata = item.get("metadata", {}) or {}
+        return {
+            "id": item.get("id"),
+            "source_id": metadata.get("source_id"),
+            "question": item.get("question", ""),
+            **metadata,
+        }
+
+    def analyze_answer(
+        self,
+        question_id: Optional[str],
+        candidate_answer: str,
+        session_state: Optional[Any] = None,
+        current_question: Optional[str] = None,
+        position: Optional[str] = None,
+        round_type: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        answer_text = str(candidate_answer or "").strip()
+        state = self._coerce_interview_state(
+            session_state,
+            role=position,
+            round_type=round_type,
+        )
+        rubric = self._resolve_rubric_profile(
+            question_id=question_id,
+            current_question=current_question,
+            candidate_answer=answer_text,
+            position=position or state.role,
+            round_type=round_type or state.target_round_type,
+        )
+        if not rubric:
+            return {
+                "question_id": question_id or "",
+                "matched_rubric_id": "",
+                "coverage": {"basic": 0.0, "good": 0.0, "excellent": 0.0},
+                "correctness": 0.0,
+                "depth": 0.0,
+                "confidence": 0.0,
+                "covered_points": [],
+                "missed_points": [],
+                "hit_signals": [],
+                "red_flags": [],
+                "suggested_followup_type": "switch_question",
+                "recommended_followup_ids": [],
+                "competency": [],
+                "followups": [],
+            }
+
+        key_points = [
+            str(entry).strip()
+            for entry in rubric.get("key_points", []) or []
+            if str(entry).strip()
+        ]
+        optional_points = [
+            str(entry).strip()
+            for entry in rubric.get("optional_points", []) or []
+            if str(entry).strip()
+        ]
+        expected_signals = [
+            str(entry).strip()
+            for entry in rubric.get("expected_answer_signals", []) or []
+            if str(entry).strip()
+        ]
+        common_mistakes = [
+            str(entry).strip()
+            for entry in rubric.get("common_mistakes", []) or []
+            if str(entry).strip()
+        ]
+        scoring_rubric = rubric.get("scoring_rubric", {}) or {}
+        followups = self._normalize_followups(rubric.get("followups"))
+        competencies = [
+            str(entry).strip()
+            for entry in rubric.get("competency", []) or []
+            if str(entry).strip()
+        ]
+
+        covered_points = self._collect_matched_entries(answer_text, key_points, limit=6)
+        optional_hits = self._collect_matched_entries(answer_text, optional_points, limit=4)
+        hit_signals = self._collect_matched_entries(answer_text, expected_signals, limit=6)
+        red_flags = self._collect_matched_entries(answer_text, common_mistakes, limit=4)
+
+        coverage = {
+            "basic": self._compute_match_ratio(answer_text, scoring_rubric.get("basic", []) or key_points[:2]),
+            "good": self._compute_match_ratio(answer_text, scoring_rubric.get("good", []) or key_points),
+            "excellent": self._compute_match_ratio(
+                answer_text,
+                scoring_rubric.get("excellent", []) or optional_points,
+            ),
+        }
+
+        key_point_ratio = self._compute_match_ratio(answer_text, key_points)
+        optional_ratio = self._compute_match_ratio(answer_text, optional_points)
+        signal_ratio = self._compute_match_ratio(answer_text, expected_signals)
+        mistake_ratio = self._compute_match_ratio(answer_text, common_mistakes)
+
+        correctness = max(
+            0.0,
+            min(
+                1.0,
+                0.35
+                + coverage["basic"] * 0.35
+                + coverage["good"] * 0.20
+                + signal_ratio * 0.15
+                - mistake_ratio * 0.30,
+            ),
+        )
+        depth = max(
+            0.0,
+            min(
+                1.0,
+                0.15
+                + coverage["good"] * 0.35
+                + coverage["excellent"] * 0.35
+                + optional_ratio * 0.15,
+            ),
+        )
+        confidence = max(
+            0.0,
+            min(
+                1.0,
+                0.25
+                + key_point_ratio * 0.30
+                + signal_ratio * 0.20
+                + max(len(answer_text), 20) / 400.0
+                - mistake_ratio * 0.15,
+            ),
+        )
+
+        missed_points = [
+            point for point in key_points
+            if point not in covered_points
+        ][:4]
+
+        suggested_followup_type = "switch_question"
+        if red_flags:
+            suggested_followup_type = "correct_mistake"
+        elif missed_points:
+            suggested_followup_type = "missing_explanation"
+        elif depth < 0.55:
+            suggested_followup_type = "deepen_topic"
+
+        recommended_followup_ids = []
+        normalized_answer = self._normalize_analysis_text(answer_text)
+        normalized_missed = self._normalize_analysis_text(" ".join(missed_points))
+        for index, followup in enumerate(followups, start=1):
+            trigger_type = str(followup.get("trigger_type", "")).strip()
+            trigger_signals = [
+                self._normalize_analysis_text(signal)
+                for signal in followup.get("trigger_signals", []) or []
+                if self._normalize_analysis_text(signal)
+            ]
+
+            matched = False
+            if trigger_type and trigger_type == suggested_followup_type:
+                matched = True
+            elif trigger_signals and any(
+                signal in normalized_missed or signal in normalized_answer
+                for signal in trigger_signals
+            ):
+                matched = True
+
+            if matched:
+                recommended_followup_ids.append(index)
+
+        return {
+            "question_id": str(rubric.get("source_id") or question_id or "").strip(),
+            "matched_rubric_id": str(rubric.get("id") or "").strip(),
+            "coverage": {
+                "basic": round(coverage["basic"], 4),
+                "good": round(coverage["good"], 4),
+                "excellent": round(coverage["excellent"], 4),
+            },
+            "correctness": round(correctness, 4),
+            "depth": round(depth, 4),
+            "confidence": round(confidence, 4),
+            "covered_points": covered_points[:4],
+            "missed_points": missed_points,
+            "hit_signals": hit_signals[:5],
+            "red_flags": red_flags[:3],
+            "suggested_followup_type": suggested_followup_type,
+            "recommended_followup_ids": recommended_followup_ids[:2],
+            "competency": competencies,
+            "followups": followups,
+        }
+
+    def format_analysis_result(self, analysis_result: Optional[Dict[str, Any]]) -> str:
+        if not analysis_result:
+            return ""
+
+        parts = [
+            "以下是当前回答的结构化分析，请优先依据这些判断生成反馈或追问。",
+        ]
+        coverage = analysis_result.get("coverage", {}) or {}
+        parts.append(
+            "覆盖度："
+            f"basic={coverage.get('basic', 0)}, "
+            f"good={coverage.get('good', 0)}, "
+            f"excellent={coverage.get('excellent', 0)}"
+        )
+        parts.append(
+            "质量评分："
+            f"correctness={analysis_result.get('correctness', 0)}, "
+            f"depth={analysis_result.get('depth', 0)}, "
+            f"confidence={analysis_result.get('confidence', 0)}"
+        )
+
+        competency = analysis_result.get("competency") or []
+        if competency:
+            parts.append(f"当前能力点：{', '.join(str(entry) for entry in competency[:3])}")
+        covered_points = analysis_result.get("covered_points") or []
+        if covered_points:
+            parts.append(f"已覆盖要点：{'；'.join(str(entry) for entry in covered_points[:4])}")
+        missed_points = analysis_result.get("missed_points") or []
+        if missed_points:
+            parts.append(f"遗漏要点：{'；'.join(str(entry) for entry in missed_points[:4])}")
+        red_flags = analysis_result.get("red_flags") or []
+        if red_flags:
+            parts.append(f"潜在错误：{'；'.join(str(entry) for entry in red_flags[:3])}")
+
+        suggested_followup_type = str(
+            analysis_result.get("suggested_followup_type", "")
+        ).strip()
+        if suggested_followup_type:
+            parts.append(f"建议动作：{suggested_followup_type}")
+
+        followups = analysis_result.get("followups") or []
+        recommended_ids = set(analysis_result.get("recommended_followup_ids") or [])
+        recommended_questions = [
+            str(item.get("question", "")).strip()
+            for index, item in enumerate(followups, start=1)
+            if index in recommended_ids and str(item.get("question", "")).strip()
+        ]
+        if recommended_questions:
+            parts.append(f"优先追问：{'；'.join(recommended_questions[:2])}")
+
+        return "\n".join(parts)
+
+    def update_interview_state_from_analysis(
+        self,
+        session_state: Optional[Any],
+        analysis_result: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        state = self._coerce_interview_state(session_state)
+        if not analysis_result:
+            return state.to_dict()
+
+        competency = [
+            str(entry).strip()
+            for entry in analysis_result.get("competency", []) or []
+            if str(entry).strip()
+        ]
+        coverage = analysis_result.get("coverage", {}) or {}
+        correctness = float(analysis_result.get("correctness", 0.0) or 0.0)
+        missed_points = analysis_result.get("missed_points", []) or []
+        recommended_followup_ids = analysis_result.get("recommended_followup_ids", []) or []
+
+        if correctness >= 0.7 and float(coverage.get("basic", 0.0) or 0.0) >= 0.6:
+            for item in competency:
+                if item not in state.covered_competencies:
+                    state.covered_competencies.append(item)
+
+        if correctness < 0.6 or missed_points:
+            for item in competency:
+                if item not in state.weak_competencies:
+                    state.weak_competencies.append(item)
+
+        if correctness >= 0.7:
+            state.weak_competencies = [
+                item for item in state.weak_competencies
+                if item not in set(state.covered_competencies)
+            ]
+
+        state.followup_depth = min(
+            state.followup_depth + (1 if recommended_followup_ids else 0),
+            3,
+        )
+        if not recommended_followup_ids:
+            state.followup_depth = 0
+
+        return state.to_dict()
+
+    @staticmethod
+    def _raise_difficulty_target(current_difficulty: str) -> str:
+        difficulty_order = ["easy", "medium", "hard"]
+        normalized = str(current_difficulty or "medium").strip().lower()
+        if normalized not in difficulty_order:
+            return "hard"
+        current_index = difficulty_order.index(normalized)
+        return difficulty_order[min(current_index + 1, len(difficulty_order) - 1)]
+
+    def decide_followup(
+        self,
+        question_id: Optional[str],
+        analysis_result: Optional[Dict[str, Any]],
+        session_state: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        state = self._coerce_interview_state(session_state)
+        if not analysis_result:
+            return {
+                "question_id": question_id or "",
+                "next_action": "switch_question",
+                "followup_type": "",
+                "followup_question": "",
+                "recommended_followup_ids": [],
+                "difficulty_target": state.target_difficulty,
+                "reason": "缺少结构化分析结果，切换到下一题更稳妥",
+            }
+
+        correctness = float(analysis_result.get("correctness", 0.0) or 0.0)
+        depth = float(analysis_result.get("depth", 0.0) or 0.0)
+        coverage = analysis_result.get("coverage", {}) or {}
+        followup_type = str(analysis_result.get("suggested_followup_type", "")).strip()
+        followups = analysis_result.get("followups", []) or []
+        recommended_ids = [
+            int(item)
+            for item in analysis_result.get("recommended_followup_ids", []) or []
+            if str(item).strip().isdigit()
+        ]
+        followup_depth = int(state.followup_depth or 0)
+
+        followup_question = ""
+        for index in recommended_ids:
+            if 1 <= index <= len(followups):
+                candidate = str(followups[index - 1].get("question", "")).strip()
+                if candidate:
+                    followup_question = candidate
+                    break
+
+        if (
+            followup_question
+            and followup_depth < 2
+            and correctness < 0.82
+        ):
+            return {
+                "question_id": analysis_result.get("question_id", question_id or ""),
+                "next_action": "ask_followup",
+                "followup_type": followup_type or "targeted_followup",
+                "followup_question": followup_question,
+                "recommended_followup_ids": recommended_ids[:2],
+                "difficulty_target": state.target_difficulty,
+                "reason": "当前回答仍有明显遗漏点，优先沿当前题继续追问",
+            }
+
+        if (
+            correctness >= 0.82
+            and depth >= 0.68
+            and float(coverage.get("good", 0.0) or 0.0) >= 0.6
+        ):
+            next_difficulty = self._raise_difficulty_target(state.target_difficulty)
+            return {
+                "question_id": analysis_result.get("question_id", question_id or ""),
+                "next_action": "raise_difficulty",
+                "followup_type": "advance_topic",
+                "followup_question": "",
+                "recommended_followup_ids": [],
+                "difficulty_target": next_difficulty,
+                "reason": "当前回答覆盖较完整，可以提升难度进入下一题",
+            }
+
+        if followup_depth >= 2 or correctness < 0.45:
+            return {
+                "question_id": analysis_result.get("question_id", question_id or ""),
+                "next_action": "switch_question",
+                "followup_type": followup_type or "switch_topic",
+                "followup_question": "",
+                "recommended_followup_ids": recommended_ids[:2],
+                "difficulty_target": state.target_difficulty,
+                "reason": "当前题继续深挖收益有限，切换题目更合适",
+            }
+
+        if followup_question:
+            return {
+                "question_id": analysis_result.get("question_id", question_id or ""),
+                "next_action": "ask_followup",
+                "followup_type": followup_type or "targeted_followup",
+                "followup_question": followup_question,
+                "recommended_followup_ids": recommended_ids[:2],
+                "difficulty_target": state.target_difficulty,
+                "reason": "存在可执行的结构化追问，继续验证当前能力点",
+            }
+
+        return {
+            "question_id": analysis_result.get("question_id", question_id or ""),
+            "next_action": "switch_question",
+            "followup_type": followup_type or "switch_topic",
+            "followup_question": "",
+            "recommended_followup_ids": [],
+            "difficulty_target": state.target_difficulty,
+            "reason": "未命中合适追问，进入下一题",
+        }
+
+    def format_followup_decision(self, decision: Optional[Dict[str, Any]]) -> str:
+        if not decision:
+            return ""
+
+        next_action = str(decision.get("next_action", "")).strip()
+        if not next_action:
+            return ""
+
+        parts = [f"策略决策：{next_action}"]
+        followup_type = str(decision.get("followup_type", "")).strip()
+        if followup_type:
+            parts.append(f"追问类型：{followup_type}")
+        followup_question = str(decision.get("followup_question", "")).strip()
+        if followup_question:
+            parts.append(f"优先问题：{followup_question}")
+        difficulty_target = str(decision.get("difficulty_target", "")).strip()
+        if difficulty_target:
+            parts.append(f"目标难度：{difficulty_target}")
+        reason = str(decision.get("reason", "")).strip()
+        if reason:
+            parts.append(f"原因：{reason}")
+
+        if next_action == "ask_followup":
+            parts.append("请基于当前题继续追问，不要切到新题。")
+        elif next_action in {"switch_question", "raise_difficulty"}:
+            parts.append("请进入下一题，不要继续围绕当前题展开。")
+
+        return "\n".join(parts)
+
+    def get_rubric(self, question_id: str) -> Optional[Dict[str, Any]]:
+        if not question_id or not self.ensure_ready() or self.store is None:
+            return None
+
+        items = self.store.get_by_metadata(
+            {"view_type": "rubric", "source_id": question_id},
+            limit=1
+        )
+        if not items:
+            return None
+        item = items[0]
+        return {
+            "id": item.get("id"),
+            "source_id": item.get("metadata", {}).get("source_id"),
+            "question": item.get("question", ""),
+            **(item.get("metadata", {}) or {}),
+        }
+
+    def status(self) -> Dict[str, Any]:
+        count = 0
+        question_count = 0
+        rubric_count = 0
+        if self.store is not None:
+            try:
+                count = self.store.count()
+                question_count = self.store.count({"view_type": "question"})
+                rubric_count = self.store.count({"view_type": "rubric"})
+            except Exception:
+                count = 0
+                question_count = 0
+                rubric_count = 0
+
+        return {
+            "enabled": self.enabled,
+            "requested_store_type": self.requested_store_type,
+            "store_type": self.store_type,
+            "embedding_model": self.embedding_model,
+            "knowledge_path": self.knowledge_path,
+            "persist_dir": self.persist_dir,
+            "count": count,
+            "question_count": question_count,
+            "rubric_count": rubric_count,
+            "dual_index_ready": bool(question_count and rubric_count),
+            "top_k": self.top_k,
+            "min_similarity": self.min_similarity,
+            "max_context_results": self.max_context_results,
+            "max_similarity_gap": self.max_similarity_gap,
+            "min_lexical_score": self.min_lexical_score,
+        }
+
+
+rag_service = RAGService()

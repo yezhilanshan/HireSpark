@@ -1,0 +1,199 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Noto+Sans+SC:wght@400;500;700;900&display=swap');
+
+:root {
+    --bg-0: #f4f8fb;
+    --bg-1: #e8f1f9;
+    --bg-2: #fff4e8;
+    --surface: rgba(255, 255, 255, 0.82);
+    --surface-border: rgba(12, 74, 110, 0.16);
+    --foreground: #0f172a;
+    --muted: #475569;
+    --accent: #0f766e;
+    --accent-2: #ea580c;
+}
+
+.dark {
+    --bg-0: #0b1324;
+    --bg-1: #101a2f;
+    --bg-2: #1f2937;
+    --surface: rgba(15, 23, 42, 0.72);
+    --surface-border: rgba(148, 163, 184, 0.24);
+    --foreground: #e2e8f0;
+    --muted: #94a3b8;
+    --accent: #2dd4bf;
+    --accent-2: #fb923c;
+}
+
+body {
+    color: var(--foreground);
+    background:
+        radial-gradient(circle at 15% 20%, rgba(14, 165, 233, 0.2), transparent 32%),
+        radial-gradient(circle at 85% 8%, rgba(249, 115, 22, 0.18), transparent 28%),
+        linear-gradient(135deg, var(--bg-0) 0%, var(--bg-1) 52%, var(--bg-2) 100%);
+    background-attachment: fixed;
+    font-family: 'Manrope', 'Noto Sans SC', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    min-height: 100vh;
+}
+
+h1,
+h2,
+h3,
+h4 {
+    font-family: 'Noto Sans SC', 'Manrope', sans-serif;
+    letter-spacing: -0.01em;
+}
+
+.glass-panel {
+    background: var(--surface);
+    border: 1px solid var(--surface-border);
+    backdrop-filter: blur(14px);
+}
+
+.text-muted {
+    color: var(--muted);
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+}
+
+::-webkit-scrollbar-track {
+    background: rgba(148, 163, 184, 0.18);
+}
+
+.dark ::-webkit-scrollbar-track {
+    background: rgba(30, 41, 59, 0.5);
+}
+
+::-webkit-scrollbar-thumb {
+    background: rgba(15, 118, 110, 0.45);
+    border-radius: 9999px;
+}
+
+.dark ::-webkit-scrollbar-thumb {
+    background: rgba(45, 212, 191, 0.35);
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: rgba(15, 118, 110, 0.66);
+}
+
+.dark ::-webkit-scrollbar-thumb:hover {
+    background: rgba(45, 212, 191, 0.5);
+}
+
+/* Smooth transitions for theme switching */
+html {
+    transition: background-color 0.3s ease, color 0.3s ease, border-color 0.3s ease;
+}
+
+/* Animation utilities */
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+    }
+
+    to {
+        opacity: 1;
+    }
+}
+
+@keyframes slideUp {
+    from {
+        transform: translateY(20px);
+        opacity: 0;
+    }
+
+    to {
+        transform: translateY(0);
+        opacity: 1;
+    }
+}
+
+@keyframes pulse-slow {
+
+    0%,
+    100% {
+        opacity: 1;
+    }
+
+    50% {
+        opacity: 0.5;
+    }
+}
+
+@keyframes shake {
+
+    0%,
+    100% {
+        transform: translateX(0);
+    }
+
+    25% {
+        transform: translateX(-5px);
+    }
+
+    75% {
+        transform: translateX(5px);
+    }
+}
+
+@keyframes scaleUp {
+    from {
+        transform: scale(0.9);
+        opacity: 0;
+    }
+
+    to {
+        transform: scale(1);
+        opacity: 1;
+    }
+}
+
+@keyframes bounceSlow {
+
+    0%,
+    100% {
+        transform: translateY(0);
+    }
+
+    50% {
+        transform: translateY(-10px);
+    }
+}
+
+.animate-fade-in {
+    animation: fadeIn 0.5s ease-in;
+}
+
+.animate-scale-up {
+    animation: scaleUp 0.3s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.animate-bounce-slow {
+    animation: bounceSlow 2s ease-in-out infinite;
+}
+
+.animate-slide-up {
+    animation: slideUp 0.5s ease-out;
+}
+
+.animate-pulse-slow {
+    animation: pulse-slow 2s ease-in-out infinite;
+}
+
+.animate-shake {
+    animation: shake 0.5s ease-in-out;
+}
+
+@layer utilities {
+    .text-balance {
+        text-wrap: balance;
+    }
+}

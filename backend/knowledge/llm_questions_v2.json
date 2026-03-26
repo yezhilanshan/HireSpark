@@ -1,0 +1,2042 @@
+{
+  "llm_interview_questions": [
+    {
+      "id": "llm_001",
+      "role": "大模型算法工程师",
+      "question": "Attention 机制的计算公式是什么？为什么要除以 dk？",
+      "category": "Transformer 基础",
+      "subcategory": "注意力机制",
+      "competency": [
+        "attention_mechanism",
+        "transformer_fundamentals",
+        "technical_fundamentals"
+      ],
+      "difficulty": "中等",
+      "question_type": "技术基础",
+      "round_type": "technical",
+      "question_intent": "screening",
+      "keywords": [
+        "Attention",
+        "Transformer",
+        "缩放点积",
+        "dk",
+        "softmax"
+      ],
+      "tags": [
+        "Transformer",
+        "注意力机制",
+        "高频面试题",
+        "基础概念"
+      ],
+      "answer_summary": "Attention 机制的核心计算公式为 Attention(Q,K,V) = softmax(QK^T/√dk)V。除以√dk 的主要目的是防止点积结果过大导致 softmax 进入梯度消失区，同时保持梯度稳定，使训练更容易收敛。",
+      "key_points": [
+        "Attention 计算公式：Attention(Q,K,V) = softmax(QK^T/√dk)V",
+        "Q、K、V 分别代表查询、键、值矩阵",
+        "除以√dk 是为了缩放点积结果",
+        "防止 softmax 进入梯度极小的饱和区",
+        "当 dk 较大时，QK^T 的方差会变大",
+        "缩放后使梯度更稳定，训练更容易收敛"
+      ],
+      "optional_points": [
+        "dk 是键向量的维度",
+        "Self-Attention 中 Q、K、V 来自同一输入的不同线性变换",
+        "softmax 函数在输入值较大时梯度会变小"
+      ],
+      "expected_answer_signals": [
+        "Attention",
+        "Transformer",
+        "缩放点积",
+        "dk",
+        "softmax",
+        "Attention 计算公式",
+        "Attention(Q"
+      ],
+      "common_mistakes": [
+        "只写出公式但没有解释除以√dk 的原因",
+        "混淆 dk 与模型隐藏层维度 hidden_size 的概念",
+        "没有说明 softmax 梯度消失的具体原理",
+        "误认为除以√dk 是为了数值稳定性而忽略梯度问题"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "能写出 Attention 的基本计算公式",
+          "知道需要除以√dk"
+        ],
+        "good": [
+          "能解释除以√dk 是为了防止点积过大",
+          "能说明 softmax 梯度消失问题"
+        ],
+        "excellent": [
+          "能解释 dk 较大时方差变大的数学原理",
+          "能说明缩放如何保证梯度稳定性"
+        ]
+      },
+      "followups": [
+        {
+          "question": "你能从公式、原理和适用场景三个角度再完整说明一次吗？",
+          "trigger_type": "missing_explanation",
+          "trigger_signals": [
+            "Attention",
+            "Transformer",
+            "缩放点积"
+          ]
+        },
+        {
+          "question": "如果把这个概念放到真实训练或业务场景里，会遇到什么问题？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "Attention",
+            "Transformer",
+            "缩放点积"
+          ]
+        }
+      ],
+      "retrieval_text": "Attention 机制通过计算 Query 和 Key 的点积来衡量相似度，然后通过 softmax 得到注意力权重，最后与 Value 相乘得到输出。除以√dk 是为了缩放点积结果，防止当 dk 较大时，点积值过大导致 softmax 进入梯度极小的饱和区域，从而保证梯度稳定。",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "llm_002",
+      "role": "大模型算法工程师",
+      "question": "请解释 PPO、DPO、DAPO、GRPO、GSPO 的区别",
+      "category": "RLHF 对齐",
+      "subcategory": "强化学习对齐方法",
+      "competency": [
+        "preference_optimization",
+        "rlhf_alignment",
+        "technical_comparison"
+      ],
+      "difficulty": "困难",
+      "question_type": "技术对比",
+      "round_type": "technical",
+      "question_intent": "deep_dive",
+      "keywords": [
+        "PPO",
+        "DPO",
+        "DAPO",
+        "GRPO",
+        "GSPO",
+        "强化学习",
+        "人类对齐",
+        "RLHF"
+      ],
+      "tags": [
+        "RLHF",
+        "强化学习",
+        "对齐",
+        "高频面试题",
+        "进阶概念"
+      ],
+      "answer_summary": "PPO 是基于强化学习的策略优化方法，使用 clip 限制策略更新幅度，需要训练价值模型和奖励模型；DPO 直接用偏好数据优化策略，无需强化学习，简化了 RLHF 流程；DAPO、GRPO、GSPO 是 PPO 的变体，分别针对不同场景优化，GRPO 使用组内相对优势，GSPO 使用组间策略优化。",
+      "key_points": [
+        "PPO 需要训练价值模型和奖励模型，计算成本较高",
+        "DPO 直接用偏好数据优化，不需要强化学习",
+        "DPO 数学上等价于隐式奖励建模",
+        "GRPO 使用组内相对优势估计，减少方差",
+        "GSPO 使用组间策略优化，适合多任务场景",
+        "DAPO 针对特定应用场景的 PPO 变体"
+      ],
+      "optional_points": [
+        "PPO 的 clip 机制防止策略更新过大",
+        "DPO 的损失函数基于 Bradley-Terry 模型",
+        "GRPO 在 LLaMA 等模型训练中有应用"
+      ],
+      "expected_answer_signals": [
+        "PPO",
+        "DPO",
+        "DAPO",
+        "GRPO",
+        "GSPO",
+        "强化学习",
+        "人类对齐"
+      ],
+      "common_mistakes": [
+        "只说 PPO 是强化学习方法，没有说明需要价值模型",
+        "混淆 DPO 和 PPO 的核心区别",
+        "没有说明 DPO 为什么不需要价值模型",
+        "把各种变体混为一谈，没有区分各自适用场景"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "知道 PPO 是强化学习方法",
+          "知道 DPO 不需要强化学习"
+        ],
+        "good": [
+          "能区分 PPO 和 DPO 的核心差异",
+          "能说出 GRPO/GSPO 的基本特点"
+        ],
+        "excellent": [
+          "能解释 DPO 的数学原理和隐式奖励建模",
+          "能说明各变体的适用场景和优缺点"
+        ]
+      },
+      "followups": [
+        {
+          "question": "这些方案分别适用于什么场景？核心 trade-off 是什么？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "PPO",
+            "DPO",
+            "DAPO"
+          ]
+        },
+        {
+          "question": "如果让你在实际项目里做选型，你会基于哪些指标决策？",
+          "trigger_type": "missing_explanation",
+          "trigger_signals": [
+            "PPO",
+            "DPO",
+            "DAPO"
+          ]
+        }
+      ],
+      "retrieval_text": "PPO 是 Proximal Policy Optimization 的缩写，是一种基于强化学习的策略优化方法，通过 clip 机制限制策略更新幅度。DPO 是 Direct Preference Optimization，直接用人类偏好数据优化策略，无需训练价值模型，简化了 RLHF 流程。GRPO 和 GSPO 是 PPO 的变体，分别使用组内相对优势和组间策略优化来改进训练效果。",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "llm_003",
+      "role": "大模型算法工程师",
+      "question": "PPO 损失函数是什么？ratio 和 advantage 怎么理解？",
+      "category": "RLHF 对齐",
+      "subcategory": "PPO 原理",
+      "competency": [
+        "ppo_mechanics",
+        "rlhf_alignment",
+        "technical_fundamentals"
+      ],
+      "difficulty": "困难",
+      "question_type": "技术基础",
+      "round_type": "technical",
+      "question_intent": "deep_dive",
+      "keywords": [
+        "PPO",
+        "损失函数",
+        "ratio",
+        "advantage",
+        "强化学习",
+        "clip"
+      ],
+      "tags": [
+        "RLHF",
+        "PPO",
+        "强化学习",
+        "高频面试题",
+        "进阶概念"
+      ],
+      "answer_summary": "PPO 损失函数为 L = E[min(r_t·A_t, clip(r_t, 1-ε, 1+ε)·A_t)]。ratio (r_t) 表示新旧策略的概率比 π_new(a|s) / π_old(a|s)，控制策略更新幅度；advantage (A_t) 是优势函数，表示当前动作比平均好多少，计算公式为 A(s,a) = Q(s,a) - V(s)，在大模型中通常用 GAE 估计。",
+      "key_points": [
+        "PPO 损失函数：L = E[min(r_t·A_t, clip(r_t, 1-ε, 1+ε)·A_t)]",
+        "ratio r_t = π_new(a|s) / π_old(a|s) 表示新旧策略概率比",
+        "ratio 控制策略更新幅度，防止更新过大",
+        "advantage A_t 表示当前动作比平均好多少",
+        "advantage 计算公式：A(s,a) = Q(s,a) - V(s)",
+        "大模型中通常用 GAE 估计 advantage"
+      ],
+      "optional_points": [
+        "clip 函数限制 ratio 在 [1-ε, 1+ε] 范围内",
+        "min 操作取裁剪前后较小值，形成 pessimistic bound",
+        "ε 通常取 0.1 或 0.2"
+      ],
+      "expected_answer_signals": [
+        "PPO",
+        "损失函数",
+        "ratio",
+        "advantage",
+        "强化学习",
+        "clip",
+        "PPO 损失函数"
+      ],
+      "common_mistakes": [
+        "只写出公式但没有解释 ratio 和 advantage 的含义",
+        "混淆 ratio 和概率的概念",
+        "没有说明 advantage 的直观意义",
+        "没有解释 clip 和 min 的作用"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "能写出 PPO 损失函数",
+          "知道 ratio 是概率比"
+        ],
+        "good": [
+          "能解释 ratio 控制策略更新幅度的作用",
+          "能说明 advantage 的直观含义"
+        ],
+        "excellent": [
+          "能解释 clip 和 min 的数学意义",
+          "能说明 GAE 估计 advantage 的原理"
+        ]
+      },
+      "followups": [
+        {
+          "question": "你能从公式、原理和适用场景三个角度再完整说明一次吗？",
+          "trigger_type": "missing_explanation",
+          "trigger_signals": [
+            "PPO",
+            "损失函数",
+            "ratio"
+          ]
+        },
+        {
+          "question": "如果把这个概念放到真实训练或业务场景里，会遇到什么问题？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "PPO",
+            "损失函数",
+            "ratio"
+          ]
+        }
+      ],
+      "retrieval_text": "PPO 损失函数使用 min 操作和 clip 机制来限制策略更新幅度。ratio 表示新策略与旧策略的概率比值，advantage 表示当前动作相对于平均动作的优势。通过 clip 将 ratio 限制在一定范围内，防止策略更新过大导致训练不稳定。",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "llm_004",
+      "role": "大模型算法工程师",
+      "question": "Adam 优化器的原理是什么？",
+      "category": "深度学习基础",
+      "subcategory": "优化器",
+      "competency": [
+        "optimizer_selection",
+        "deep_learning_fundamentals",
+        "technical_fundamentals"
+      ],
+      "difficulty": "中等",
+      "question_type": "技术基础",
+      "round_type": "technical",
+      "question_intent": "screening",
+      "keywords": [
+        "Adam",
+        "优化器",
+        "梯度下降",
+        "动量",
+        "RMSProp",
+        "自适应学习率"
+      ],
+      "tags": [
+        "优化器",
+        "深度学习基础",
+        "高频面试题",
+        "基础概念"
+      ],
+      "answer_summary": "Adam (Adaptive Moment Estimation) 结合了动量法和 RMSProp 的优点，维护一阶矩 m（梯度均值）和二阶矩 v（梯度平方均值）。更新公式为：m_t = β1·m_{t-1} + (1-β1)·g_t，v_t = β2·v_{t-1} + (1-β2)·g_t²，θ_t = θ_{t-1} - α·m̂_t / (√v̂_t + ε)。优点是自适应学习率、收敛快、适合稀疏梯度。",
+      "key_points": [
+        "Adam 结合动量法和 RMSProp 的优点",
+        "维护一阶矩 m（梯度均值）和二阶矩 v（梯度平方均值）",
+        "m_t = β1·m_{t-1} + (1-β1)·g_t",
+        "v_t = β2·v_{t-1} + (1-β2)·g_t²",
+        "θ_t = θ_{t-1} - α·m̂_t / (√v̂_t + ε)",
+        "自适应学习率，适合稀疏梯度"
+      ],
+      "optional_points": [
+        "m̂_t 和 v̂_t 是偏差校正后的一阶矩和二阶矩",
+        "β1 通常取 0.9，β2 通常取 0.999",
+        "ε 是为了数值稳定性，通常取 1e-8"
+      ],
+      "expected_answer_signals": [
+        "Adam",
+        "优化器",
+        "梯度下降",
+        "动量",
+        "RMSProp",
+        "自适应学习率",
+        "Adam 结合动量法和 RMSProp 的优点"
+      ],
+      "common_mistakes": [
+        "只说出 Adam 是自适应学习率优化器，没有说明具体公式",
+        "混淆一阶矩和二阶矩的含义",
+        "没有解释偏差校正的必要性",
+        "没有说明 Adam 相比 SGD 的优势"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "知道 Adam 是自适应学习率优化器",
+          "能说出结合动量法和 RMSProp"
+        ],
+        "good": [
+          "能写出 Adam 的更新公式",
+          "能解释一阶矩和二阶矩的作用"
+        ],
+        "excellent": [
+          "能解释偏差校正的原理",
+          "能比较 Adam 和 SGD 的适用场景"
+        ]
+      },
+      "followups": [
+        {
+          "question": "你能从公式、原理和适用场景三个角度再完整说明一次吗？",
+          "trigger_type": "missing_explanation",
+          "trigger_signals": [
+            "Adam",
+            "优化器",
+            "梯度下降"
+          ]
+        },
+        {
+          "question": "如果把这个概念放到真实训练或业务场景里，会遇到什么问题？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "Adam",
+            "优化器",
+            "梯度下降"
+          ]
+        }
+      ],
+      "retrieval_text": "Adam 优化器结合了动量法和 RMSProp 的优点，通过维护梯度的一阶矩（均值）和二阶矩（平方均值）来实现自适应学习率。一阶矩提供动量加速，二阶矩调整各参数的学习率，使得在稀疏梯度场景下也能高效收敛。",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "llm_005",
+      "role": "大模型算法工程师",
+      "question": "MHA、MQA、GQA、MLA 有什么区别？",
+      "category": "Attention 变体",
+      "subcategory": "注意力优化",
+      "competency": [
+        "attention_optimization",
+        "attention_variants",
+        "technical_comparison"
+      ],
+      "difficulty": "中等",
+      "question_type": "技术对比",
+      "round_type": "technical",
+      "question_intent": "deep_dive",
+      "keywords": [
+        "MHA",
+        "MQA",
+        "GQA",
+        "MLA",
+        "注意力机制",
+        "KV Cache",
+        "多头注意力"
+      ],
+      "tags": [
+        "注意力机制",
+        "推理优化",
+        "高频面试题",
+        "进阶概念"
+      ],
+      "answer_summary": "MHA (Multi-Head Attention) 每个头有独立的 Q、K、V 投影，参数量大但效果好；MQA (Multi-Query Attention) 多个头共享一组 K、V，减少 KV Cache 加速推理但效果略有下降；GQA (Grouped-Query Attention) 介于 MHA 和 MQA 之间，头分组后组内共享 K、V，平衡效果和速度；MLA (Multi-Latent Attention) 是 DeepSeek 提出的变体，使用低秩 KV 投影进一步压缩。",
+      "key_points": [
+        "MHA：每个头独立 Q、K、V，参数量大，效果最好",
+        "MQA：多头共享 K、V，减少 KV Cache，加速推理",
+        "GQA：头分组，组内共享 K、V，平衡效果和速度",
+        "MLA：使用低秩 KV 投影，DeepSeek 提出",
+        "MQA 和 GQA 主要优化推理阶段的内存和速度",
+        "KV Cache 大小与 K、V 的头数成正比"
+      ],
+      "optional_points": [
+        "GQA 的组数可以灵活配置，是 MHA 和 MQA 的泛化",
+        "LLaMA 2/3 使用了 GQA",
+        "MLA 通过低秩分解显著减少 KV Cache"
+      ],
+      "expected_answer_signals": [
+        "MHA",
+        "MQA",
+        "GQA",
+        "MLA",
+        "注意力机制",
+        "KV Cache",
+        "多头注意力"
+      ],
+      "common_mistakes": [
+        "只说 MQA 共享 K、V 但没有说明是多头共享",
+        "混淆 GQA 和 MQA 的区别",
+        "没有说明这些变体的主要优化目标是推理效率",
+        "没有提到 MLA 是 DeepSeek 提出的"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "知道 MHA 每个头独立",
+          "知道 MQA 共享 K、V"
+        ],
+        "good": [
+          "能区分 MHA、MQA、GQA 的区别",
+          "能说明这些变体优化的是推理效率"
+        ],
+        "excellent": [
+          "能解释 KV Cache 与头数的关系",
+          "能说明 MLA 的低秩投影原理"
+        ]
+      },
+      "followups": [
+        {
+          "question": "这些方案分别适用于什么场景？核心 trade-off 是什么？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "MHA",
+            "MQA",
+            "GQA"
+          ]
+        },
+        {
+          "question": "如果让你在实际项目里做选型，你会基于哪些指标决策？",
+          "trigger_type": "missing_explanation",
+          "trigger_signals": [
+            "MHA",
+            "MQA",
+            "GQA"
+          ]
+        }
+      ],
+      "retrieval_text": "MHA、MQA、GQA、MLA 是注意力机制的不同变体，主要区别在于如何处理多头的 K、V 投影。MHA 每个头独立计算 K、V，效果最好但 KV Cache 最大；MQA 所有头共享 K、V，最小化 Cache 但效果下降；GQA 折中方案，组内共享；MLA 使用低秩投影进一步压缩 KV Cache。",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "llm_006",
+      "role": "大模型算法工程师",
+      "question": "手撕交叉熵损失函数",
+      "category": "深度学习基础",
+      "subcategory": "损失函数",
+      "competency": [
+        "loss_function_design",
+        "deep_learning_fundamentals",
+        "coding_implementation"
+      ],
+      "difficulty": "简单",
+      "question_type": "代码实现",
+      "round_type": "technical",
+      "question_intent": "coding",
+      "keywords": [
+        "交叉熵",
+        "损失函数",
+        "手写代码",
+        "softmax",
+        "CrossEntropy"
+      ],
+      "tags": [
+        "损失函数",
+        "代码实现",
+        "基础概念",
+        "高频面试题"
+      ],
+      "answer_summary": "交叉熵损失函数衡量预测概率分布与真实分布之间的差异。实现方式为：loss = -Σ(y_true * log(y_pred))，需要添加 epsilon 防止 log(0)。PyTorch 中可以使用 nn.CrossEntropyLoss()，它内部包含 softmax 操作。",
+      "key_points": [
+        "交叉熵公式：loss = -Σ(y_true * log(y_pred))",
+        "y_pred 需要经过 softmax 得到概率",
+        "需要添加 epsilon 防止 log(0)",
+        "PyTorch 的 CrossEntropyLoss 包含 softmax",
+        "输入 logits 时直接使用 CrossEntropyLoss",
+        "输入概率时需要先取 log 再用 NLLLoss"
+      ],
+      "optional_points": [
+        "交叉熵等价于负对数似然",
+        "二分类时是二元交叉熵 BCE",
+        "多分类时标签通常用 one-hot 编码"
+      ],
+      "expected_answer_signals": [
+        "交叉熵",
+        "损失函数",
+        "手写代码",
+        "softmax",
+        "CrossEntropy",
+        "交叉熵公式",
+        "loss"
+      ],
+      "common_mistakes": [
+        "对已经 softmax 的输出再用 CrossEntropyLoss",
+        "忘记加 epsilon 导致数值不稳定",
+        "混淆交叉熵和 MSE 的使用场景",
+        "代码实现中没有处理 batch 维度"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "能写出交叉熵的基本公式",
+          "知道需要取 log"
+        ],
+        "good": [
+          "能正确实现交叉熵损失函数",
+          "知道需要加 epsilon"
+        ],
+        "excellent": [
+          "能区分手动实现和 PyTorch 内置函数的区别",
+          "能处理 batch 维度的计算"
+        ]
+      },
+      "followups": [
+        {
+          "question": "你能补充一下时间复杂度、空间复杂度和边界条件吗？",
+          "trigger_type": "missing_detail",
+          "trigger_signals": [
+            "交叉熵",
+            "损失函数",
+            "手写代码"
+          ]
+        },
+        {
+          "question": "如果数据规模进一步变大，这个实现还成立吗？你会怎么优化？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "交叉熵",
+            "损失函数",
+            "手写代码"
+          ]
+        }
+      ],
+      "retrieval_text": "交叉熵损失函数用于分类任务，衡量模型预测的概率分布与真实标签之间的差异。公式为 loss = -Σ(y_true * log(y_pred))，其中 y_pred 是 softmax 后的概率。实现时需要注意数值稳定性，添加 epsilon 防止对 0 取对数。",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "llm_007",
+      "role": "大模型算法工程师",
+      "question": "位置编码有哪些？RoPE 的原理是什么？",
+      "category": "Transformer 基础",
+      "subcategory": "位置编码",
+      "competency": [
+        "positional_encoding",
+        "transformer_fundamentals",
+        "technical_fundamentals"
+      ],
+      "difficulty": "中等",
+      "question_type": "技术基础",
+      "round_type": "technical",
+      "question_intent": "screening",
+      "keywords": [
+        "位置编码",
+        "RoPE",
+        "相对位置",
+        "绝对位置编码",
+        "ALiBi",
+        "Transformer"
+      ],
+      "tags": [
+        "Transformer",
+        "位置编码",
+        "高频面试题",
+        "基础概念"
+      ],
+      "answer_summary": "位置编码类型包括：1) 绝对位置编码（Transformer 原始）：使用正弦/余弦函数或可学习参数；2) 相对位置编码（RoPE、ALiBi）：RoPE 通过旋转矩阵编码相对位置，保持相对位置不变性；3) 2D 位置编码（ViT）：可学习的行/列位置编码。RoPE 优点包括外推性好、相对位置敏感、计算高效，被 LLaMA、PaLM 等模型采用。",
+      "key_points": [
+        "绝对位置编码：正弦/余弦函数或可学习参数",
+        "RoPE 通过旋转矩阵编码相对位置",
+        "RoPE 公式：q_rot = q·cos(θ) + k·sin(θ)",
+        "RoPE 保持相对位置不变性",
+        "ALiBi 在注意力矩阵加线性偏置",
+        "RoPE 外推性好，被 LLaMA、PaLM 采用"
+      ],
+      "optional_points": [
+        "RoPE 的旋转角度与位置索引成正比",
+        "不同维度使用不同的旋转频率",
+        "2D 位置编码用于视觉 Transformer"
+      ],
+      "expected_answer_signals": [
+        "位置编码",
+        "RoPE",
+        "相对位置",
+        "绝对位置编码",
+        "ALiBi",
+        "Transformer",
+        "RoPE 通过旋转矩阵编码相对位置"
+      ],
+      "common_mistakes": [
+        "只列举位置编码类型但没有解释 RoPE 原理",
+        "混淆绝对位置编码和相对位置编码的区别",
+        "没有说明 RoPE 为什么外推性好",
+        "没有提到 RoPE 在实际模型中的应用"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "能列举几种位置编码类型",
+          "知道 RoPE 是相对位置编码"
+        ],
+        "good": [
+          "能解释 RoPE 的旋转矩阵原理",
+          "能区分绝对和相对位置编码"
+        ],
+        "excellent": [
+          "能解释 RoPE 外推性好的原因",
+          "能说明 ALiBi 的线性偏置机制"
+        ]
+      },
+      "followups": [
+        {
+          "question": "你能从公式、原理和适用场景三个角度再完整说明一次吗？",
+          "trigger_type": "missing_explanation",
+          "trigger_signals": [
+            "位置编码",
+            "RoPE",
+            "相对位置"
+          ]
+        },
+        {
+          "question": "如果把这个概念放到真实训练或业务场景里，会遇到什么问题？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "位置编码",
+            "RoPE",
+            "相对位置"
+          ]
+        }
+      ],
+      "retrieval_text": "位置编码用于为 Transformer 提供位置信息，主要分为绝对位置编码和相对位置编码。RoPE (Rotary Position Embedding) 通过旋转矩阵将位置信息编码到查询和键向量中，具有外推性好、保持相对位置不变性的优点。ALiBi 则是通过在注意力分数上添加线性偏置来实现位置感知。",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "llm_008",
+      "role": "大模型算法工程师",
+      "question": "MSE 损失和 GAE 损失是什么？大模型中怎么计算？",
+      "category": "强化学习",
+      "subcategory": "价值估计",
+      "competency": [
+        "value_estimation",
+        "reinforcement_learning",
+        "technical_fundamentals"
+      ],
+      "difficulty": "困难",
+      "question_type": "技术基础",
+      "round_type": "technical",
+      "question_intent": "deep_dive",
+      "keywords": [
+        "MSE",
+        "GAE",
+        "强化学习",
+        "价值函数",
+        "优势函数",
+        "PPO"
+      ],
+      "tags": [
+        "强化学习",
+        "PPO",
+        "价值估计",
+        "进阶概念"
+      ],
+      "answer_summary": "MSE (Mean Squared Error) 是价值模型的损失，公式为 L = E[(V(s) - target)²]，用于训练价值函数。GAE (Generalized Advantage Estimation) 是优势函数的估计方法，公式为 A_t^GAE = Σ(γ·λ)^(k-1)·δ_{t+k}，其中 δ_t = r_t + γV(s_{t+1}) - V(s_t)。在大模型 PPO 中，GAE 用于计算 advantage，平衡偏差和方差。",
+      "key_points": [
+        "MSE 用于价值模型的损失计算",
+        "MSE 公式：L = E[(V(s) - target)²]",
+        "GAE 用于估计优势函数",
+        "GAE 公式：A_t^GAE = Σ(γ·λ)^(k-1)·δ_{t+k}",
+        "δ_t = r_t + γV(s_{t+1}) - V(s_t) 是 TD 误差",
+        "λ 控制偏差/方差权衡"
+      ],
+      "optional_points": [
+        "target 通常是回报 returns 或 n-step 回报",
+        "γ 是折扣因子，通常取 0.99",
+        "λ=0 时 GAE 退化为单步 TD，λ=1 时为蒙特卡洛"
+      ],
+      "expected_answer_signals": [
+        "MSE",
+        "GAE",
+        "强化学习",
+        "价值函数",
+        "优势函数",
+        "PPO",
+        "MSE 用于价值模型的损失计算"
+      ],
+      "common_mistakes": [
+        "混淆 MSE 和 GAE 的用途",
+        "没有说明 GAE 中 λ 和 γ 的作用",
+        "没有解释 GAE 相比 TD 的优势",
+        "没有说明在大模型 PPO 中的具体应用"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "知道 MSE 用于价值模型",
+          "知道 GAE 用于估计 advantage"
+        ],
+        "good": [
+          "能写出 MSE 和 GAE 的公式",
+          "能解释 GAE 中 δ_t 的含义"
+        ],
+        "excellent": [
+          "能解释 λ 和 γ 的作用",
+          "能说明 GAE 相比单步 TD 的优势"
+        ]
+      },
+      "followups": [
+        {
+          "question": "你能从公式、原理和适用场景三个角度再完整说明一次吗？",
+          "trigger_type": "missing_explanation",
+          "trigger_signals": [
+            "MSE",
+            "GAE",
+            "强化学习"
+          ]
+        },
+        {
+          "question": "如果把这个概念放到真实训练或业务场景里，会遇到什么问题？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "MSE",
+            "GAE",
+            "强化学习"
+          ]
+        }
+      ],
+      "retrieval_text": "MSE 损失用于训练价值函数，衡量预测价值与目标价值之间的差异。GAE 是一种广义优势估计方法，通过加权多步 TD 误差来估计优势函数，在偏差和方差之间取得平衡。在大模型 PPO 训练中，GAE 用于计算 advantage，指导策略更新。",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "llm_009",
+      "role": "大模型算法工程师",
+      "question": "大模型中 PPO 的 returns 是什么？",
+      "category": "RLHF 对齐",
+      "subcategory": "PPO 训练",
+      "competency": [
+        "ppo_training",
+        "rlhf_alignment",
+        "technical_fundamentals"
+      ],
+      "difficulty": "困难",
+      "question_type": "技术基础",
+      "round_type": "technical",
+      "question_intent": "deep_dive",
+      "keywords": [
+        "PPO",
+        "returns",
+        "强化学习",
+        "reward",
+        "折扣回报",
+        "token 级别"
+      ],
+      "tags": [
+        "RLHF",
+        "PPO",
+        "强化学习",
+        "进阶概念"
+      ],
+      "answer_summary": "Returns (累积回报) 是从当前时刻开始未来所有奖励的折扣和，公式为 R_t = r_t + γ·r_{t+1} + γ²·r_{t+2} + ...。在大模型 PPO 中，每个 token 是一个时间步，reward 来自奖励模型对完整回答的打分。计算方式：1) 用奖励模型对生成的回答打分；2) 将 reward 分配到每个 token；3) 用折扣因子 γ 计算 returns，用于计算价值损失和 advantage。",
+      "key_points": [
+        "Returns 是累积折扣回报",
+        "公式：R_t = Σ γ^k · r_{t+k}",
+        "大模型中每个 token 是一个时间步",
+        "reward 来自奖励模型对完整回答打分",
+        "需要将 reward 分配到每个 token",
+        "returns 用于计算价值损失和 advantage"
+      ],
+      "optional_points": [
+        "最后一个 token 的 returns 等于该 token 的 reward",
+        "倒序计算 returns 更高效",
+        "有时使用蒙特卡洛 returns"
+      ],
+      "expected_answer_signals": [
+        "PPO",
+        "returns",
+        "强化学习",
+        "reward",
+        "折扣回报",
+        "token 级别",
+        "Returns 是累积折扣回报"
+      ],
+      "common_mistakes": [
+        "只说 returns 是累积奖励，没有说明在大模型中的特殊性",
+        "没有说明 reward 是如何分配的",
+        "没有提到 reward 来自奖励模型",
+        "混淆 returns 和 reward 的概念"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "知道 returns 是累积回报",
+          "能写出 returns 的基本公式"
+        ],
+        "good": [
+          "能说明大模型中 token 是时间步",
+          "能解释 reward 的来源"
+        ],
+        "excellent": [
+          "能说明 token 级别 reward 的分配方式",
+          "能解释 returns 在 PPO 中的作用"
+        ]
+      },
+      "followups": [
+        {
+          "question": "你能从公式、原理和适用场景三个角度再完整说明一次吗？",
+          "trigger_type": "missing_explanation",
+          "trigger_signals": [
+            "PPO",
+            "returns",
+            "强化学习"
+          ]
+        },
+        {
+          "question": "如果把这个概念放到真实训练或业务场景里，会遇到什么问题？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "PPO",
+            "returns",
+            "强化学习"
+          ]
+        }
+      ],
+      "retrieval_text": "在大模型 PPO 训练中，returns 表示从当前 token 开始的累积折扣回报。由于奖励模型只对完整回答打分，需要将 reward 分配到每个 token。returns 用于训练价值函数和计算 advantage，是 PPO 算法的核心组成部分。",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "llm_010",
+      "role": "多模态算法工程师",
+      "question": "ViT 的位置编码有哪些？二维位置编码、相对位置编码、多模态位置编码分别是什么？",
+      "category": "视觉 Transformer",
+      "subcategory": "位置编码",
+      "competency": [
+        "positional_encoding",
+        "vision_transformer",
+        "technical_fundamentals"
+      ],
+      "difficulty": "中等",
+      "question_type": "技术基础",
+      "round_type": "technical",
+      "question_intent": "screening",
+      "keywords": [
+        "ViT",
+        "位置编码",
+        "二维位置编码",
+        "相对位置编码",
+        "多模态位置编码"
+      ],
+      "tags": [
+        "视觉",
+        "Transformer",
+        "多模态",
+        "高频面试题"
+      ],
+      "answer_summary": "ViT 中常见的位置编码包括绝对位置编码、二维位置编码、相对位置编码以及多模态场景下的模态相关位置编码。二维位置编码通过显式建模行列信息保留空间结构；相对位置编码强调 token 之间的相对距离关系，更适合局部建模或可变长度输入；多模态位置编码则在图像与文本联合建模时，同时区分模态类型和各自内部位置，以支持跨模态对齐。",
+      "key_points": [
+        "ViT 需要位置编码是因为自注意力本身不感知顺序和空间位置",
+        "二维位置编码通过分别表示行和列位置来保留图像空间结构",
+        "相对位置编码表示 token 之间的相对位置信息，而不是绝对坐标",
+        "相对位置编码更适合局部注意力、窗口注意力或分辨率变化场景",
+        "多模态位置编码需要同时区分模态类型和模态内位置",
+        "图像和文本对齐通常还会引入模态类型嵌入或跨模态注意力机制"
+      ],
+      "optional_points": [
+        "绝对位置编码可以是可学习的，也可以是固定的正余弦形式",
+        "二维位置编码可实现为 row embedding 与 column embedding 相加或拼接",
+        "相对位置编码常见于 Swin Transformer、DeiT 的变体或多种视觉 Transformer 扩展中"
+      ],
+      "expected_answer_signals": [
+        "ViT",
+        "位置编码",
+        "二维位置编码",
+        "相对位置编码",
+        "多模态位置编码",
+        "相对位置编码表示 token 之间的相对位置信息",
+        "token"
+      ],
+      "common_mistakes": [
+        "把二维位置编码和一维绝对位置编码混为一谈",
+        "只说相对位置编码表示距离近远，没有解释其建模对象是 token 间相对关系",
+        "把多模态位置编码简单理解为图像和文本各自编号，没有说明模态区分和对齐问题"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "知道 ViT 需要位置编码",
+          "能说出二维位置编码和相对位置编码的基本含义"
+        ],
+        "good": [
+          "能区分二维位置编码、相对位置编码、多模态位置编码",
+          "能解释它们各自适用场景"
+        ],
+        "excellent": [
+          "能进一步说明实现方式、优缺点和跨模态对齐方式"
+        ]
+      },
+      "followups": [
+        {
+          "question": "你能从公式、原理和适用场景三个角度再完整说明一次吗？",
+          "trigger_type": "missing_explanation",
+          "trigger_signals": [
+            "ViT",
+            "位置编码",
+            "二维位置编码"
+          ]
+        },
+        {
+          "question": "如果把这个概念放到真实训练或业务场景里，会遇到什么问题？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "ViT",
+            "位置编码",
+            "二维位置编码"
+          ]
+        }
+      ],
+      "retrieval_text": "ViT 中的位置编码用于补充自注意力缺失的位置信息。二维位置编码通过分别编码 patch 的行和列位置来保留空间结构；相对位置编码描述 token 间相对距离关系，适合局部建模和分辨率变化场景；多模态位置编码通常不仅包含模态内部的位置，还要加入模态类型信息，帮助图像 token 与文本 token 在联合建模中完成区分与对齐。",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "code_001",
+      "role": "算法工程师",
+      "question": "力扣：最长有效括号（LeetCode 32）",
+      "category": "算法题",
+      "subcategory": "括号匹配",
+      "competency": [
+        "parentheses_matching",
+        "algorithm_problem_solving",
+        "coding_implementation"
+      ],
+      "difficulty": "困难",
+      "question_type": "代码实现",
+      "round_type": "technical",
+      "question_intent": "coding",
+      "keywords": [
+        "栈",
+        "动态规划",
+        "括号匹配",
+        "LeetCode",
+        "字符串"
+      ],
+      "tags": [
+        "算法题",
+        "栈",
+        "动态规划",
+        "LeetCode",
+        "困难"
+      ],
+      "answer_summary": "最长有效括号问题可以使用栈或动态规划解决。栈解法：使用栈存储索引，遇到 '(' 入栈，遇到 ')' 出栈，计算有效长度。动态规划解法：dp[i] 表示以第 i 个字符结尾的最长有效括号长度，根据 s[i] 和 s[i-1] 的情况更新 dp 数组。",
+      "key_points": [
+        "栈解法：用栈存储索引，初始压入 -1",
+        "遇到 '(' 入栈，遇到 ')' 出栈",
+        "出栈后栈为空则压入当前索引",
+        "有效长度 = 当前索引 - 栈顶索引",
+        "DP 解法：dp[i] 表示以 i 结尾的最长有效括号",
+        "根据 s[i] 和 s[i-1] 的关系更新 dp"
+      ],
+      "optional_points": [
+        "栈解法时间复杂度 O(n)，空间复杂度 O(n)",
+        "DP 解法时间复杂度 O(n)，空间复杂度 O(n)",
+        "还可以使用双指针法，空间复杂度 O(1)"
+      ],
+      "expected_answer_signals": [
+        "栈",
+        "动态规划",
+        "括号匹配",
+        "LeetCode",
+        "字符串",
+        "栈解法",
+        "遇到 '"
+      ],
+      "common_mistakes": [
+        "栈解法没有初始化压入 -1",
+        "DP 状态定义不清晰",
+        "没有处理 '()' 和 '(...)' 两种情况",
+        "边界条件处理不当"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "能说出使用栈或 DP 的思路",
+          "能写出基本框架"
+        ],
+        "good": [
+          "能正确实现栈解法或 DP 解法",
+          "能处理各种边界情况"
+        ],
+        "excellent": [
+          "能提供两种解法并比较优缺点",
+          "能说出双指针 O(1) 空间解法"
+        ]
+      },
+      "followups": [
+        {
+          "question": "你能补充一下时间复杂度、空间复杂度和边界条件吗？",
+          "trigger_type": "missing_detail",
+          "trigger_signals": [
+            "栈",
+            "动态规划",
+            "括号匹配"
+          ]
+        },
+        {
+          "question": "如果数据规模进一步变大，这个实现还成立吗？你会怎么优化？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "栈",
+            "动态规划",
+            "括号匹配"
+          ]
+        }
+      ],
+      "retrieval_text": "最长有效括号是经典的括号匹配问题，可以使用栈或动态规划解决。栈解法通过维护索引栈来计算有效长度，动态规划通过 dp 数组记录以每个位置结尾的最长有效括号长度。两种方法时间复杂度都是 O(n)。",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "code_002",
+      "role": "算法工程师",
+      "question": "力扣：搜索旋转排序数组（LeetCode 33）",
+      "category": "算法题",
+      "subcategory": "二分查找",
+      "competency": [
+        "binary_search",
+        "algorithm_problem_solving",
+        "coding_implementation"
+      ],
+      "difficulty": "中等",
+      "question_type": "代码实现",
+      "round_type": "technical",
+      "question_intent": "coding",
+      "keywords": [
+        "二分查找",
+        "旋转数组",
+        "LeetCode",
+        "数组"
+      ],
+      "tags": [
+        "算法题",
+        "二分查找",
+        "LeetCode",
+        "中等"
+      ],
+      "answer_summary": "搜索旋转排序数组是二分查找的变体。关键思路是：通过比较 nums[left] 和 nums[mid] 判断哪一半是有序的，然后在有序的一半中判断 target 是否在该范围内，从而决定搜索方向。时间复杂度 O(log n)。",
+      "key_points": [
+        "判断左半部分有序：nums[left] <= nums[mid]",
+        "左半有序时，判断 target 是否在 [left, mid) 范围内",
+        "右半有序时，判断 target 是否在 (mid, right] 范围内",
+        "根据判断结果调整 left 或 right",
+        "时间复杂度 O(log n)",
+        "空间复杂度 O(1)"
+      ],
+      "optional_points": [
+        "旋转数组有一个断点，断点两边分别有序",
+        "可以通过找到断点将问题转化为普通二分",
+        "有重复元素时需要额外处理"
+      ],
+      "expected_answer_signals": [
+        "二分查找",
+        "旋转数组",
+        "LeetCode",
+        "数组",
+        "判断左半部分有序",
+        "nums",
+        "left"
+      ],
+      "common_mistakes": [
+        "边界条件判断错误",
+        "没有正确处理 nums[left] == nums[mid] 的情况",
+        "判断 target 范围时边界包含关系错误",
+        "循环条件使用错误"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "能说出使用二分查找",
+          "知道需要判断哪一半有序"
+        ],
+        "good": [
+          "能正确实现二分查找变体",
+          "能正确处理边界条件"
+        ],
+        "excellent": [
+          "能清晰解释判断逻辑",
+          "能处理有重复元素的情况"
+        ]
+      },
+      "followups": [
+        {
+          "question": "你能补充一下时间复杂度、空间复杂度和边界条件吗？",
+          "trigger_type": "missing_detail",
+          "trigger_signals": [
+            "二分查找",
+            "旋转数组",
+            "LeetCode"
+          ]
+        },
+        {
+          "question": "如果数据规模进一步变大，这个实现还成立吗？你会怎么优化？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "二分查找",
+            "旋转数组",
+            "LeetCode"
+          ]
+        }
+      ],
+      "retrieval_text": "搜索旋转排序数组是二分查找的经典变体。旋转数组有一个断点，断点两边分别有序。通过比较中间元素和边界元素，可以判断哪一半是有序的，然后决定 target 是否在该范围内，从而继续二分搜索。",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "proj_001",
+      "role": "大模型算法工程师",
+      "question": "介绍一下你做的大模型相关项目",
+      "category": "项目深挖",
+      "subcategory": "项目介绍",
+      "competency": [
+        "project_introduction",
+        "project_deep_dive",
+        "open_ended_reasoning"
+      ],
+      "difficulty": "中等",
+      "question_type": "开放问题",
+      "round_type": "project",
+      "question_intent": "deep_dive",
+      "keywords": [
+        "项目",
+        "大模型",
+        "自我介绍",
+        "RAG",
+        "微调",
+        "业务落地"
+      ],
+      "tags": [
+        "项目深挖",
+        "开放问题",
+        "面试技巧",
+        "高频面试题"
+      ],
+      "answer_summary": "回答框架：1) 项目背景：要解决什么问题；2) 技术方案：使用了什么模型/方法；3) 你的贡献：具体做了什么；4) 效果指标：量化成果；5) 难点与解决：遇到的挑战和解决方案。示例：基于 RAG 的问答系统，使用 LLaMA 作为基座模型，结合向量检索增强生成，负责知识库构建和检索模块，最终问答准确率提升 30%。",
+      "key_points": [
+        "项目背景：清晰说明要解决的问题和业务价值",
+        "技术方案：具体使用的模型、框架、方法",
+        "个人贡献：明确说明自己负责的部分",
+        "效果指标：用数据量化成果",
+        "难点与解决：展示问题解决能力",
+        "技术选型理由：为什么选择这个方案"
+      ],
+      "optional_points": [
+        "可以提及团队协作和沟通",
+        "说明项目的迭代过程",
+        "提及后续的优化方向"
+      ],
+      "expected_answer_signals": [
+        "项目",
+        "大模型",
+        "自我介绍",
+        "RAG",
+        "微调",
+        "业务落地",
+        "项目背景"
+      ],
+      "common_mistakes": [
+        "只说做了什么，没有说明解决了什么问题",
+        "技术细节描述不清，过于笼统",
+        "没有量化成果，缺乏说服力",
+        "只说团队成果，没有突出个人贡献"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "能说出项目的基本情况",
+          "能说明使用的技术栈"
+        ],
+        "good": [
+          "能清晰描述项目背景和技术方案",
+          "能说明个人贡献和量化成果"
+        ],
+        "excellent": [
+          "能深入分析技术选型的原因",
+          "能详细说明遇到的挑战和解决方案"
+        ]
+      },
+      "followups": [
+        {
+          "question": "这个项目里最核心的技术挑战是什么？你当时是怎么权衡的？",
+          "trigger_type": "missing_detail",
+          "trigger_signals": [
+            "项目",
+            "大模型",
+            "自我介绍"
+          ]
+        },
+        {
+          "question": "如果线上效果不达预期，你会怎么定位问题并继续优化？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "项目",
+            "大模型",
+            "自我介绍"
+          ]
+        }
+      ],
+      "retrieval_text": "项目介绍是面试中的重要环节，需要按照背景、方案、贡献、成果、难点的框架来组织回答。要突出个人贡献，用数据量化成果，展示问题解决能力。同时要对技术选型有清晰的思考，能够回答为什么选择这个方案。",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "base_001",
+      "role": "大模型算法工程师",
+      "question": "大模型常见的位置编码方式有哪些？各有什么优缺点？",
+      "category": "Transformer 基础",
+      "subcategory": "位置编码",
+      "competency": [
+        "positional_encoding",
+        "transformer_fundamentals",
+        "technical_comparison"
+      ],
+      "difficulty": "中等",
+      "question_type": "技术对比",
+      "round_type": "technical",
+      "question_intent": "deep_dive",
+      "keywords": [
+        "位置编码",
+        "RoPE",
+        "ALiBi",
+        "Transformer",
+        "绝对位置编码",
+        "相对位置编码"
+      ],
+      "tags": [
+        "Transformer",
+        "位置编码",
+        "高频面试题",
+        "基础概念"
+      ],
+      "answer_summary": "主要位置编码方式：1) 绝对位置编码（Sinusoidal/Learned）：简单直接，但外推性差，长度固定；2) RoPE (Rotary Position Embedding)：外推性好，相对位置敏感，被 LLaMA、PaLM 采用，但实现稍复杂；3) ALiBi (Attention with Linear Biases)：无需修改即可外推，但训练时需要较长序列，被 MPT 采用；4) 可学习位置编码：灵活但长度固定，参数量大。",
+      "key_points": [
+        "绝对位置编码：简单直接，外推性差",
+        "RoPE：外推性好，相对位置敏感，实现稍复杂",
+        "ALiBi：无需修改即可外推，训练需要长序列",
+        "可学习位置编码：灵活但参数量大",
+        "RoPE 被 LLaMA、PaLM 等模型采用",
+        "ALiBi 被 MPT 等模型采用"
+      ],
+      "optional_points": [
+        "RoPE 通过旋转矩阵实现位置编码",
+        "ALiBi 在注意力分数上加线性偏置",
+        "位置编码长度不够时可以外推或插值"
+      ],
+      "expected_answer_signals": [
+        "位置编码",
+        "RoPE",
+        "ALiBi",
+        "Transformer",
+        "绝对位置编码",
+        "相对位置编码",
+        "可学习位置编码"
+      ],
+      "common_mistakes": [
+        "只列举类型但没有比较优缺点",
+        "没有说明各种编码的实际应用模型",
+        "混淆不同位置编码的适用场景",
+        "没有说明外推性的重要性"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "能列举几种位置编码",
+          "知道 RoPE 和 ALiBi"
+        ],
+        "good": [
+          "能比较不同位置编码的优缺点",
+          "能说明实际应用模型"
+        ],
+        "excellent": [
+          "能深入解释 RoPE 和 ALiBi 的原理",
+          "能说明外推性的实现方式"
+        ]
+      },
+      "followups": [
+        {
+          "question": "这些方案分别适用于什么场景？核心 trade-off 是什么？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "位置编码",
+            "RoPE",
+            "ALiBi"
+          ]
+        },
+        {
+          "question": "如果让你在实际项目里做选型，你会基于哪些指标决策？",
+          "trigger_type": "missing_explanation",
+          "trigger_signals": [
+            "位置编码",
+            "RoPE",
+            "ALiBi"
+          ]
+        }
+      ],
+      "retrieval_text": "大模型中常见的位置编码包括绝对位置编码、RoPE 和 ALiBi。绝对位置编码简单但外推性差；RoPE 通过旋转矩阵编码相对位置，外推性好，被 LLaMA、PaLM 采用；ALiBi 通过线性偏置实现位置感知，无需修改即可外推，被 MPT 采用。",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "Java_001",
+      "role": "Java后端开发工程师",
+      "question": "示例问题1",
+      "category": "通用分类",
+      "subcategory": "子类",
+      "competency": [
+        "general_questioning",
+        "java_backend_general",
+        "mixed_interview_basics"
+      ],
+      "difficulty": "简单",
+      "question_type": "技术/项目/行为",
+      "round_type": "technical",
+      "question_intent": "screening",
+      "keywords": [
+        "关键字1",
+        "关键字2"
+      ],
+      "tags": [
+        "标签"
+      ],
+      "answer_summary": "示例答案总结",
+      "key_points": [
+        "要点1",
+        "要点2"
+      ],
+      "optional_points": [
+        "扩展点"
+      ],
+      "expected_answer_signals": [
+        "关键字1",
+        "关键字2",
+        "要点1",
+        "要点2"
+      ],
+      "common_mistakes": [
+        "常见错误"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "基础要求"
+        ],
+        "good": [
+          "良好要求"
+        ],
+        "excellent": [
+          "优秀要求"
+        ]
+      },
+      "followups": [
+        {
+          "question": "你能从公式、原理和适用场景三个角度再完整说明一次吗？",
+          "trigger_type": "missing_explanation",
+          "trigger_signals": [
+            "关键字1",
+            "关键字2"
+          ]
+        },
+        {
+          "question": "如果把这个概念放到真实训练或业务场景里，会遇到什么问题？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "关键字1",
+            "关键字2"
+          ]
+        }
+      ],
+      "retrieval_text": "检索摘要",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "Java_002",
+      "role": "Java后端开发工程师",
+      "question": "示例问题2",
+      "category": "通用分类",
+      "subcategory": "子类",
+      "competency": [
+        "general_questioning",
+        "java_backend_general",
+        "mixed_interview_basics"
+      ],
+      "difficulty": "简单",
+      "question_type": "技术/项目/行为",
+      "round_type": "technical",
+      "question_intent": "screening",
+      "keywords": [
+        "关键字1",
+        "关键字2"
+      ],
+      "tags": [
+        "标签"
+      ],
+      "answer_summary": "示例答案总结",
+      "key_points": [
+        "要点1",
+        "要点2"
+      ],
+      "optional_points": [
+        "扩展点"
+      ],
+      "expected_answer_signals": [
+        "关键字1",
+        "关键字2",
+        "要点1",
+        "要点2"
+      ],
+      "common_mistakes": [
+        "常见错误"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "基础要求"
+        ],
+        "good": [
+          "良好要求"
+        ],
+        "excellent": [
+          "优秀要求"
+        ]
+      },
+      "followups": [
+        {
+          "question": "你能从公式、原理和适用场景三个角度再完整说明一次吗？",
+          "trigger_type": "missing_explanation",
+          "trigger_signals": [
+            "关键字1",
+            "关键字2"
+          ]
+        },
+        {
+          "question": "如果把这个概念放到真实训练或业务场景里，会遇到什么问题？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "关键字1",
+            "关键字2"
+          ]
+        }
+      ],
+      "retrieval_text": "检索摘要",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "Java_003",
+      "role": "Java后端开发工程师",
+      "question": "示例问题3",
+      "category": "通用分类",
+      "subcategory": "子类",
+      "competency": [
+        "general_questioning",
+        "java_backend_general",
+        "mixed_interview_basics"
+      ],
+      "difficulty": "简单",
+      "question_type": "技术/项目/行为",
+      "round_type": "technical",
+      "question_intent": "screening",
+      "keywords": [
+        "关键字1",
+        "关键字2"
+      ],
+      "tags": [
+        "标签"
+      ],
+      "answer_summary": "示例答案总结",
+      "key_points": [
+        "要点1",
+        "要点2"
+      ],
+      "optional_points": [
+        "扩展点"
+      ],
+      "expected_answer_signals": [
+        "关键字1",
+        "关键字2",
+        "要点1",
+        "要点2"
+      ],
+      "common_mistakes": [
+        "常见错误"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "基础要求"
+        ],
+        "good": [
+          "良好要求"
+        ],
+        "excellent": [
+          "优秀要求"
+        ]
+      },
+      "followups": [
+        {
+          "question": "你能从公式、原理和适用场景三个角度再完整说明一次吗？",
+          "trigger_type": "missing_explanation",
+          "trigger_signals": [
+            "关键字1",
+            "关键字2"
+          ]
+        },
+        {
+          "question": "如果把这个概念放到真实训练或业务场景里，会遇到什么问题？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "关键字1",
+            "关键字2"
+          ]
+        }
+      ],
+      "retrieval_text": "检索摘要",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "Java_004",
+      "role": "Java后端开发工程师",
+      "question": "示例问题4",
+      "category": "通用分类",
+      "subcategory": "子类",
+      "competency": [
+        "general_questioning",
+        "java_backend_general",
+        "mixed_interview_basics"
+      ],
+      "difficulty": "简单",
+      "question_type": "技术/项目/行为",
+      "round_type": "technical",
+      "question_intent": "screening",
+      "keywords": [
+        "关键字1",
+        "关键字2"
+      ],
+      "tags": [
+        "标签"
+      ],
+      "answer_summary": "示例答案总结",
+      "key_points": [
+        "要点1",
+        "要点2"
+      ],
+      "optional_points": [
+        "扩展点"
+      ],
+      "expected_answer_signals": [
+        "关键字1",
+        "关键字2",
+        "要点1",
+        "要点2"
+      ],
+      "common_mistakes": [
+        "常见错误"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "基础要求"
+        ],
+        "good": [
+          "良好要求"
+        ],
+        "excellent": [
+          "优秀要求"
+        ]
+      },
+      "followups": [
+        {
+          "question": "你能从公式、原理和适用场景三个角度再完整说明一次吗？",
+          "trigger_type": "missing_explanation",
+          "trigger_signals": [
+            "关键字1",
+            "关键字2"
+          ]
+        },
+        {
+          "question": "如果把这个概念放到真实训练或业务场景里，会遇到什么问题？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "关键字1",
+            "关键字2"
+          ]
+        }
+      ],
+      "retrieval_text": "检索摘要",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "Java_005",
+      "role": "Java后端开发工程师",
+      "question": "示例问题5",
+      "category": "通用分类",
+      "subcategory": "子类",
+      "competency": [
+        "general_questioning",
+        "java_backend_general",
+        "mixed_interview_basics"
+      ],
+      "difficulty": "简单",
+      "question_type": "技术/项目/行为",
+      "round_type": "technical",
+      "question_intent": "screening",
+      "keywords": [
+        "关键字1",
+        "关键字2"
+      ],
+      "tags": [
+        "标签"
+      ],
+      "answer_summary": "示例答案总结",
+      "key_points": [
+        "要点1",
+        "要点2"
+      ],
+      "optional_points": [
+        "扩展点"
+      ],
+      "expected_answer_signals": [
+        "关键字1",
+        "关键字2",
+        "要点1",
+        "要点2"
+      ],
+      "common_mistakes": [
+        "常见错误"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "基础要求"
+        ],
+        "good": [
+          "良好要求"
+        ],
+        "excellent": [
+          "优秀要求"
+        ]
+      },
+      "followups": [
+        {
+          "question": "你能从公式、原理和适用场景三个角度再完整说明一次吗？",
+          "trigger_type": "missing_explanation",
+          "trigger_signals": [
+            "关键字1",
+            "关键字2"
+          ]
+        },
+        {
+          "question": "如果把这个概念放到真实训练或业务场景里，会遇到什么问题？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "关键字1",
+            "关键字2"
+          ]
+        }
+      ],
+      "retrieval_text": "检索摘要",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "Java_006",
+      "role": "Java后端开发工程师",
+      "question": "示例问题6",
+      "category": "通用分类",
+      "subcategory": "子类",
+      "competency": [
+        "general_questioning",
+        "java_backend_general",
+        "mixed_interview_basics"
+      ],
+      "difficulty": "简单",
+      "question_type": "技术/项目/行为",
+      "round_type": "technical",
+      "question_intent": "screening",
+      "keywords": [
+        "关键字1",
+        "关键字2"
+      ],
+      "tags": [
+        "标签"
+      ],
+      "answer_summary": "示例答案总结",
+      "key_points": [
+        "要点1",
+        "要点2"
+      ],
+      "optional_points": [
+        "扩展点"
+      ],
+      "expected_answer_signals": [
+        "关键字1",
+        "关键字2",
+        "要点1",
+        "要点2"
+      ],
+      "common_mistakes": [
+        "常见错误"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "基础要求"
+        ],
+        "good": [
+          "良好要求"
+        ],
+        "excellent": [
+          "优秀要求"
+        ]
+      },
+      "followups": [
+        {
+          "question": "你能从公式、原理和适用场景三个角度再完整说明一次吗？",
+          "trigger_type": "missing_explanation",
+          "trigger_signals": [
+            "关键字1",
+            "关键字2"
+          ]
+        },
+        {
+          "question": "如果把这个概念放到真实训练或业务场景里，会遇到什么问题？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "关键字1",
+            "关键字2"
+          ]
+        }
+      ],
+      "retrieval_text": "检索摘要",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "Java_007",
+      "role": "Java后端开发工程师",
+      "question": "示例问题7",
+      "category": "通用分类",
+      "subcategory": "子类",
+      "competency": [
+        "general_questioning",
+        "java_backend_general",
+        "mixed_interview_basics"
+      ],
+      "difficulty": "简单",
+      "question_type": "技术/项目/行为",
+      "round_type": "technical",
+      "question_intent": "screening",
+      "keywords": [
+        "关键字1",
+        "关键字2"
+      ],
+      "tags": [
+        "标签"
+      ],
+      "answer_summary": "示例答案总结",
+      "key_points": [
+        "要点1",
+        "要点2"
+      ],
+      "optional_points": [
+        "扩展点"
+      ],
+      "expected_answer_signals": [
+        "关键字1",
+        "关键字2",
+        "要点1",
+        "要点2"
+      ],
+      "common_mistakes": [
+        "常见错误"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "基础要求"
+        ],
+        "good": [
+          "良好要求"
+        ],
+        "excellent": [
+          "优秀要求"
+        ]
+      },
+      "followups": [
+        {
+          "question": "你能从公式、原理和适用场景三个角度再完整说明一次吗？",
+          "trigger_type": "missing_explanation",
+          "trigger_signals": [
+            "关键字1",
+            "关键字2"
+          ]
+        },
+        {
+          "question": "如果把这个概念放到真实训练或业务场景里，会遇到什么问题？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "关键字1",
+            "关键字2"
+          ]
+        }
+      ],
+      "retrieval_text": "检索摘要",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "Java_008",
+      "role": "Java后端开发工程师",
+      "question": "示例问题8",
+      "category": "通用分类",
+      "subcategory": "子类",
+      "competency": [
+        "general_questioning",
+        "java_backend_general",
+        "mixed_interview_basics"
+      ],
+      "difficulty": "简单",
+      "question_type": "技术/项目/行为",
+      "round_type": "technical",
+      "question_intent": "screening",
+      "keywords": [
+        "关键字1",
+        "关键字2"
+      ],
+      "tags": [
+        "标签"
+      ],
+      "answer_summary": "示例答案总结",
+      "key_points": [
+        "要点1",
+        "要点2"
+      ],
+      "optional_points": [
+        "扩展点"
+      ],
+      "expected_answer_signals": [
+        "关键字1",
+        "关键字2",
+        "要点1",
+        "要点2"
+      ],
+      "common_mistakes": [
+        "常见错误"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "基础要求"
+        ],
+        "good": [
+          "良好要求"
+        ],
+        "excellent": [
+          "优秀要求"
+        ]
+      },
+      "followups": [
+        {
+          "question": "你能从公式、原理和适用场景三个角度再完整说明一次吗？",
+          "trigger_type": "missing_explanation",
+          "trigger_signals": [
+            "关键字1",
+            "关键字2"
+          ]
+        },
+        {
+          "question": "如果把这个概念放到真实训练或业务场景里，会遇到什么问题？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "关键字1",
+            "关键字2"
+          ]
+        }
+      ],
+      "retrieval_text": "检索摘要",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "Java_009",
+      "role": "Java后端开发工程师",
+      "question": "示例问题9",
+      "category": "通用分类",
+      "subcategory": "子类",
+      "competency": [
+        "general_questioning",
+        "java_backend_general",
+        "mixed_interview_basics"
+      ],
+      "difficulty": "简单",
+      "question_type": "技术/项目/行为",
+      "round_type": "technical",
+      "question_intent": "screening",
+      "keywords": [
+        "关键字1",
+        "关键字2"
+      ],
+      "tags": [
+        "标签"
+      ],
+      "answer_summary": "示例答案总结",
+      "key_points": [
+        "要点1",
+        "要点2"
+      ],
+      "optional_points": [
+        "扩展点"
+      ],
+      "expected_answer_signals": [
+        "关键字1",
+        "关键字2",
+        "要点1",
+        "要点2"
+      ],
+      "common_mistakes": [
+        "常见错误"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "基础要求"
+        ],
+        "good": [
+          "良好要求"
+        ],
+        "excellent": [
+          "优秀要求"
+        ]
+      },
+      "followups": [
+        {
+          "question": "你能从公式、原理和适用场景三个角度再完整说明一次吗？",
+          "trigger_type": "missing_explanation",
+          "trigger_signals": [
+            "关键字1",
+            "关键字2"
+          ]
+        },
+        {
+          "question": "如果把这个概念放到真实训练或业务场景里，会遇到什么问题？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "关键字1",
+            "关键字2"
+          ]
+        }
+      ],
+      "retrieval_text": "检索摘要",
+      "source_type": "人工整理"
+    },
+    {
+      "id": "Java_010",
+      "role": "Java后端开发工程师",
+      "question": "示例问题10",
+      "category": "通用分类",
+      "subcategory": "子类",
+      "competency": [
+        "general_questioning",
+        "java_backend_general",
+        "mixed_interview_basics"
+      ],
+      "difficulty": "简单",
+      "question_type": "技术/项目/行为",
+      "round_type": "technical",
+      "question_intent": "screening",
+      "keywords": [
+        "关键字1",
+        "关键字2"
+      ],
+      "tags": [
+        "标签"
+      ],
+      "answer_summary": "示例答案总结",
+      "key_points": [
+        "要点1",
+        "要点2"
+      ],
+      "optional_points": [
+        "扩展点"
+      ],
+      "expected_answer_signals": [
+        "关键字1",
+        "关键字2",
+        "要点1",
+        "要点2"
+      ],
+      "common_mistakes": [
+        "常见错误"
+      ],
+      "scoring_rubric": {
+        "basic": [
+          "基础要求"
+        ],
+        "good": [
+          "良好要求"
+        ],
+        "excellent": [
+          "优秀要求"
+        ]
+      },
+      "followups": [
+        {
+          "question": "你能从公式、原理和适用场景三个角度再完整说明一次吗？",
+          "trigger_type": "missing_explanation",
+          "trigger_signals": [
+            "关键字1",
+            "关键字2"
+          ]
+        },
+        {
+          "question": "如果把这个概念放到真实训练或业务场景里，会遇到什么问题？",
+          "trigger_type": "missing_analysis",
+          "trigger_signals": [
+            "关键字1",
+            "关键字2"
+          ]
+        }
+      ],
+      "retrieval_text": "检索摘要",
+      "source_type": "人工整理"
+    }
+  ]
+}
