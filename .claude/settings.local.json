@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc:*)",
+      "Bash(pip show:*)",
+      "Bash(C:anacondaScriptsconda.exe run:*)",
+      "Bash(cmd /c \"C:\\\\anaconda\\\\Scripts\\\\conda.exe\" run -n asr pip show dashscope)"
+    ]
+  }
+}
