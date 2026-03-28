@@ -13,6 +13,26 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+VOICE_SAFE_OUTPUT_RULES = """
+
+语音播报约束：
+- 输出必须是适合语音播报的自然中文纯文本
+- 不要使用 Markdown、反引号、代码块、项目符号、链接、表格或特殊格式
+- 提到类名、方法名或英文术语时，不要包裹特殊符号
+"""
+
+INTERVIEWER_STRUGGLE_RESPONSE_RULES = """
+
+当候选人回答明显不完整、偏弱、卡住或答不上来时，遵守以下反应规则：
+- 不要立刻否定、下结论或表现出不耐烦，更不要使用羞辱、讽刺、阴阳怪气的表达
+- 先判断是没听清、太紧张，还是确实不会；必要时可以重述问题、换一种更清楚的说法，或把问题拆小一点
+- 先给很小的引导，不要直接给标准答案，例如让候选人先说大致思路、先说一个可行方案、先结合项目经验分析
+- 如果对方仍然回答不好，优先降一级继续评估基础能力，而不是持续在同一点上施压
+- 重点观察候选人的逻辑、真实性、应变和情绪稳定性；允许候选人承认“不确定”，不要逼迫其乱答
+- 如果当前题继续深挖价值不大，应自然切换到相关但更容易发挥的问题
+- 整体语气保持尊重、专业、克制，既有面试官判断力，也给候选人基本体面
+"""
+
 # 面试轮次配置
 INTERVIEW_ROUNDS = {
     'technical': {
@@ -135,7 +155,7 @@ class LLMManager:
             self.enabled = False
         
         # 面试官系统提示词
-        self.system_prompt = """你是一位专业的互联网大厂的技术面试官，具有多年招聘经验。
+        self.system_prompt = self._compose_system_prompt("""你是一位专业的互联网大厂的技术面试官，具有多年招聘经验。
 
 你的职责：
 1. 根据候选人的回答提出相关问题或追问
@@ -147,7 +167,7 @@ class LLMManager:
 - 每次只提一个问题，问题要清晰具体
 - 字数控制在 100 字以内
 - 语言专业但不生硬，要体现面试官的专业性
-- 如果候选人回答不理想，可以提出改进建议或追问更深层的知识点"""
+- 如果候选人回答不理想，可以提出改进建议或追问更深层的知识点""")
 
     @staticmethod
     def _resolve_api_key(config_value: Optional[str]) -> Optional[str]:
@@ -166,6 +186,16 @@ class LLMManager:
                 return value
 
         return None
+
+    def _compose_system_prompt(self, base_prompt: str, resume_data: Optional[Dict] = None) -> str:
+        prompt = (
+            f"{base_prompt.rstrip()}"
+            f"{INTERVIEWER_STRUGGLE_RESPONSE_RULES}"
+            f"{VOICE_SAFE_OUTPUT_RULES}"
+        )
+        if resume_data:
+            prompt += "\n\n" + self._build_resume_context(resume_data)
+        return prompt
     
     def check_enabled(self) -> bool:
         """检查 LLM 是否启用"""
@@ -391,11 +421,11 @@ class LLMManager:
         """设置面试轮次"""
         if round_type in INTERVIEW_ROUNDS:
             self.current_round = round_type
-            self.system_prompt = INTERVIEW_ROUNDS[round_type]['system_prompt']
             self.resume_data = resume_data if isinstance(resume_data, dict) else None
-            if self.resume_data:
-                resume_context = self._build_resume_context(resume_data)
-                self.system_prompt += "\n\n" + resume_context
+            self.system_prompt = self._compose_system_prompt(
+                INTERVIEW_ROUNDS[round_type]['system_prompt'],
+                self.resume_data
+            )
             logger.info(f"设置面试轮次：{round_type}")
             return True
         return False

@@ -28,6 +28,7 @@ mic = None
 stream = None
 recognition = None
 interview_session_id = None
+current_turn_id = None
 current_question = None
 chat_history = []
 is_tts_playing = False
@@ -142,10 +143,8 @@ def stop_tts():
 @sio.event
 def connect():
     """连接到后端成功"""
-    global interview_session_id
     print('✅ 已连接到后端服务器')
     print(f'   连接 ID: {sio.sid}')
-    interview_session_id = sio.sid
 
 
 @sio.event
@@ -154,32 +153,35 @@ def disconnect():
     print('❌ 已断开连接')
 
 
-@sio.on('llm_response')
-def on_llm_response(data):
-    """接收 LLM 的追问回应"""
-    if data.get('success'):
-        feedback = data.get('feedback', '')
-        print(f'\n👤 面试官反馈: {feedback}')
-        speak_interviewer_text(feedback)
-        print('\n🎤 请继续回答或等待下一个问题...\n')
-    else:
-        print(f'❌ 错误: {data.get("error")}')
+@sio.on('orchestrator_state')
+def on_orchestrator_state(data):
+    """接收后端会话状态"""
+    global interview_session_id, current_turn_id
+    if data.get('session_id'):
+        interview_session_id = data.get('session_id')
+    if data.get('turn_id'):
+        current_turn_id = data.get('turn_id')
+    mode = data.get('mode', 'idle')
+    print(f'ℹ️  状态: {mode} session={interview_session_id} turn={current_turn_id}')
 
 
-@sio.on('llm_question')
-def on_llm_question(data):
-    """接收 LLM 生成的新问题"""
-    global current_question
-    if data.get('success'):
-        current_question = data.get('question')
-        position = data.get('position', '')
-        difficulty = data.get('difficulty', '')
-        print(f'\n📝 【{difficulty} 难度】{position}')
+@sio.on('dialog_reply')
+def on_dialog_reply(data):
+    """接收面试官问题或追问"""
+    global current_question, current_turn_id
+    if not data:
+        return
+    if interview_session_id and data.get('session_id') != interview_session_id:
+        return
+
+    current_turn_id = data.get('turn_id', current_turn_id)
+    current_question = data.get('display_text') or data.get('spoken_text') or ''
+    source = data.get('source', 'reply')
+    if current_question:
+        print(f'\n📝 [{source}] turn={current_turn_id}')
         print(f'❓ {current_question}')
-        speak_interviewer_text(current_question)
+        speak_interviewer_text(data.get('spoken_text') or current_question)
         print('🎤 请开始回答...\n')
-    else:
-        print(f'❌ 错误: {data.get("error")}')
 
 
 @sio.on('llm_evaluation')
@@ -196,11 +198,11 @@ def on_llm_evaluation(data):
         print(f'❌ 错误: {data.get("error")}')
 
 
-@sio.on('interview_started')
-def on_interview_started(data):
-    """面试开始"""
-    print('✅ 面试会话已启动')
-    print('🎤 请开始讲话...\n')
+@sio.on('session_control_notice')
+def on_session_control_notice(data):
+    text = data.get('display_text') or data.get('spoken_text') or ''
+    if text:
+        print(f'\n⚠️  会话提醒: {text}\n')
 
 
 @sio.on('error')
@@ -208,6 +210,14 @@ def on_error(data):
     """错误处理"""
     error_msg = data.get('error', 'Unknown error')
     print(f'\n❌ 服务器错误: {error_msg}')
+    if 'details' in data:
+        print(f'   详情: {data["details"]}')
+
+
+@sio.on('pipeline_error')
+def on_pipeline_error(data):
+    error_msg = data.get('error', 'Unknown pipeline error')
+    print(f'\n❌ 流水线错误: {error_msg}')
     if 'details' in data:
         print(f'   详情: {data["details"]}')
 
@@ -260,7 +270,7 @@ class AsrCallback(RecognitionCallback):
 
     def on_event(self, result: RecognitionResult) -> None:
         """处理识别结果"""
-        global current_question, chat_history
+        global current_question, current_turn_id, chat_history
         
         sentence = result.get_sentence()
         if 'text' in sentence:
@@ -272,7 +282,7 @@ class AsrCallback(RecognitionCallback):
                 print(f'\n✅ 完整回答: {text}')
                 
                 # 如果连接到后端，则发送到 LLM 处理
-                if sio.connected and current_question:
+                if sio.connected and current_question and interview_session_id and current_turn_id:
                     print('📤 正在发送到后端...')
                     
                     # 保存到对话历史
@@ -281,18 +291,19 @@ class AsrCallback(RecognitionCallback):
                         'content': text
                     })
                     
-                    # 发送到后端处理
-                    sio.emit('llm_process_answer', {
-                        'user_answer': text,
-                        'current_question': current_question,
-                        'position': 'Java后端工程师',  # 可配置
-                        'chat_history': chat_history
+                    sio.emit('utterance_commit', {
+                        'session_id': interview_session_id,
+                        'turn_id': current_turn_id,
+                        'text': text,
+                        'source': 'manual'
                     })
                 else:
                     if not sio.connected:
                         print('⚠️  未连接到后端，请启动后端服务')
                     if not current_question:
                         print('⚠️  没有当前问题')
+                    if not interview_session_id or not current_turn_id:
+                        print('⚠️  会话尚未准备好')
             else:
                 # 实时部分识别结果
                 print(f'   {text}', end='\r')
@@ -309,6 +320,11 @@ def signal_handler(sig, frame):
     
     # 断开连接
     if sio.connected:
+        if interview_session_id:
+            try:
+                sio.emit('session_end', {'session_id': interview_session_id})
+            except Exception:
+                pass
         sio.disconnect()
 
     stop_tts()
@@ -333,20 +349,19 @@ def connect_to_backend():
 
 def start_interview(position='Java后端工程师', difficulty='medium'):
     """启动面试会话"""
-    global current_question
+    global current_question, interview_session_id, current_turn_id
     
     if sio.connected:
+        interview_session_id = uuid.uuid4().hex
+        current_turn_id = None
+        current_question = None
         print(f'📝 启动面试 - 职位: {position}, 难度: {difficulty}')
-        sio.emit('start_interview', {
+        sio.emit('session_start', {
+            'session_id': interview_session_id,
+            'round_type': 'technical',
             'position': position,
-            'difficulty': difficulty
-        })
-        
-        # 生成第一个问题
-        print('📤 请求生成问题...')
-        sio.emit('llm_generate_question', {
-            'position': position,
-            'difficulty': difficulty
+            'difficulty': difficulty,
+            'user_id': 'default'
         })
     else:
         print('⚠️  未连接到后端，无法启动面试')

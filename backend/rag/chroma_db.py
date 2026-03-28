@@ -116,6 +116,31 @@ class KnowledgeStore:
         return restored
 
     @staticmethod
+    def _build_chroma_where(
+        metadata_filters: Optional[Dict[str, Any]]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        将简单的 metadata 字典转成 Chroma 兼容的 where 结构。
+
+        新版 Chroma 在多字段过滤时要求显式逻辑操作符，如:
+        {"$and": [{"round_type": "technical"}, {"view_type": "question"}]}
+        """
+        if not metadata_filters:
+            return None
+
+        clauses = []
+        for key, value in metadata_filters.items():
+            if value is None:
+                continue
+            clauses.append({key: value})
+
+        if not clauses:
+            return None
+        if len(clauses) == 1:
+            return clauses[0]
+        return {"$and": clauses}
+
+    @staticmethod
     def _metadata_matches(
         metadata: Optional[Dict[str, Any]],
         filters: Optional[Dict[str, Any]]
@@ -340,7 +365,7 @@ class KnowledgeStore:
                 query_embeddings=[query_embedding.tolist() if query_embedding is not None else None],
                 n_results=top_k,
                 include=["documents", "metadatas", "distances"],
-                where=metadata_filters or None
+                where=self._build_chroma_where(metadata_filters)
             )
 
             # 格式化结果
@@ -500,7 +525,7 @@ class KnowledgeStore:
     ) -> List[Dict[str, Any]]:
         if self.collection is not None:
             result = self.collection.get(
-                where=metadata_filters,
+                where=self._build_chroma_where(metadata_filters),
                 limit=limit,
                 include=["documents", "metadatas"]
             )

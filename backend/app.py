@@ -5,16 +5,21 @@ AI 模拟面试与能力提升平台【改造进行中】
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit
 from flask_cors import CORS # 跨域资源共享中间件
+import base64
+import hashlib
 import time
 import os
 import json
 import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
 from collections import Counter
+from urllib.parse import urlparse
 
 # 导入自定义模块
 from utils import DataManager, ReportGenerator
+from utils.config_loader import config
 try:
     from utils.llm_manager import llm_manager
     llm_import_error = None
@@ -39,9 +44,11 @@ try:
 except Exception as e:
     tts_manager = None
     tts_import_error = str(e)
-from utils.config_loader import config
 from utils.logger import get_logger
 from utils.performance_monitor import performance_monitor, measure_time
+from utils.answer_session import AnswerSession, LONG_PAUSE_SECONDS, SHORT_PAUSE_SECONDS
+from utils.session_orchestrator import SessionRegistry, StateOrchestrator
+from utils.speech_normalizer import SpeechTextNormalizer
 from utils.security import (
     RateLimiter,
     rate_limit,
@@ -68,7 +75,46 @@ app.config['SECRET_KEY'] = SECRET_KEY
 FLASK_HOST = config.get('server.host', '0.0.0.0')# 监听地址
 FLASK_PORT = config.get('server.port', 5000)# 监听端口
 FLASK_DEBUG = config.get('system.debug', False)# 调试模式
-CORS_ORIGINS = config.get('server.cors_origins', ['*'])# 跨域配置
+
+
+def _parse_cors_origins():
+    configured = config.get('server.cors_origins', ['*'])
+    env_override = (
+        os.environ.get('SOCKETIO_CORS_ALLOWED_ORIGINS')
+        or os.environ.get('CORS_ALLOWED_ORIGINS')
+        or ''
+    ).strip()
+
+    if env_override:
+        if env_override == '*':
+            return '*'
+        configured = [item.strip() for item in env_override.split(',') if item.strip()]
+
+    origins = []
+    for item in configured if isinstance(configured, list) else [configured]:
+        value = str(item or '').strip()
+        if not value:
+            continue
+        if value == '*':
+            return '*'
+        origins.append(value.rstrip('/'))
+
+    if FLASK_DEBUG:
+        frontend_url = os.environ.get('NEXT_PUBLIC_BACKEND_URL', '').strip()
+        if frontend_url:
+            try:
+                parsed = urlparse(frontend_url)
+                if parsed.scheme and parsed.netloc:
+                    backend_origin = f"{parsed.scheme}://{parsed.netloc}".rstrip('/')
+                    if backend_origin not in origins:
+                        origins.append(backend_origin)
+            except Exception:
+                pass
+
+    return origins or '*'
+
+
+CORS_ORIGINS = _parse_cors_origins()# 跨域配置
 
 CORS(app, origins=CORS_ORIGINS)
 
@@ -103,23 +149,9 @@ logger.info("初始化工具模块...")
 data_manager = DataManager()
 report_generator = ReportGenerator()
 db_manager = DatabaseManager()
-
-# ASR 自动恢复状态（当前实现为单实例 ASR，按客户端缓存回调用于断线重启）
-asr_client_callbacks = {}
-asr_last_restart_attempt = {}
-ASR_RESTART_COOLDOWN_SECONDS = 3
-
-# ASR->LLM 防重入与冷却窗口，避免同一客户端在极短时间内重复触发追问
-asr_llm_state_lock = threading.Lock()
-asr_llm_processing_clients = set()
-asr_llm_last_feedback_ts = {}
-ASR_LLM_MIN_INTERVAL_SECONDS = 2.0
-
-# ASR 分句聚合：避免一句话被切成多段后连续触发多次 LLM/TTS
-asr_text_buffer_lock = threading.Lock()
-asr_text_buffers = {}
-asr_text_flush_timers = {}
-ASR_TEXT_DEBOUNCE_SECONDS = 2.2
+session_registry = SessionRegistry()
+state_orchestrator = StateOrchestrator(session_registry)
+speech_normalizer = SpeechTextNormalizer()
 
 
 def _build_question_rag_context(
@@ -214,6 +246,327 @@ def _merge_text_blocks(*parts: str) -> str:
     return "\n\n".join(str(part).strip() for part in parts if str(part).strip())
 
 
+def _get_last_interviewer_question(chat_history):
+    if not chat_history:
+        return ''
+    for item in reversed(chat_history):
+        if isinstance(item, dict) and item.get('role') == 'interviewer':
+            return item.get('content', '')
+    return ''
+
+
+def _is_noise_text(text: str) -> bool:
+    normalized = (text or '').strip()
+    if not normalized:
+        return True
+    if len(normalized) < 2:
+        return True
+    fillers = {'啊', '嗯', '呃', '哦', '哎', '额', '唉', '哈', '噢', '嘛', '呗', '咯'}
+    if normalized in fillers:
+        return True
+    noise_phrases = {'谢谢', '感谢', '好的', '好的呢', '然后', '还有', '那个', '这个', '就是'}
+    return normalized in noise_phrases
+
+
+def _current_question_id(runtime) -> str:
+    question_id = _extract_question_id_from_plan(runtime.last_question_plan)
+    return question_id or runtime.turn_id or f"question_{runtime.turn_index or 0}"
+
+
+def _cancel_answer_finalize_timer(runtime) -> None:
+    timer = getattr(runtime, 'pending_answer_finalize_timer', None)
+    if timer:
+        timer.cancel()
+        runtime.pending_answer_finalize_timer = None
+
+
+def _reset_answer_session(runtime) -> None:
+    _cancel_answer_finalize_timer(runtime)
+    runtime.current_answer_session = None
+
+
+def _ensure_answer_session(runtime) -> AnswerSession:
+    current = runtime.current_answer_session
+    if current and current.turn_id == runtime.turn_id and current.status != 'finalized':
+        return current
+
+    answer_session = AnswerSession(
+        question_id=_current_question_id(runtime),
+        turn_id=runtime.turn_id,
+        last_speech_epoch=runtime.speech_epoch,
+    )
+    runtime.current_answer_session = answer_session
+    return answer_session
+
+
+def _emit_answer_session_update(runtime, source: str = "") -> None:
+    answer_session = runtime.current_answer_session
+    if not answer_session:
+        return
+
+    payload = answer_session.to_payload()
+    payload.update({
+        'session_id': runtime.session_id,
+        'interrupt_epoch': runtime.interrupt_epoch,
+        'source': source,
+        'short_pause_ms': int(runtime.short_pause_threshold_seconds * 1000),
+        'long_pause_ms': int(runtime.long_pause_threshold_seconds * 1000),
+        'timestamp': time.time(),
+    })
+    socketio.emit('answer_session_update', payload, to=runtime.client_id)
+
+
+def _consume_runtime_segment_text(runtime, asr_generation: int = 0) -> str:
+    final_text = ' '.join(runtime.pending_asr_finals).strip()
+    partial_text = ' '.join(runtime.pending_asr_partials).strip()
+    runtime.pending_asr_partials.clear()
+    runtime.pending_asr_finals.clear()
+    if asr_generation and runtime.last_finalized_asr_generation == asr_generation:
+        runtime.last_finalized_asr_generation = 0
+        runtime.last_finalized_asr_speech_epoch = 0
+    return str(final_text or partial_text).strip()
+
+
+def _persist_answer_audio(runtime, answer_session: AnswerSession) -> str:
+    if not answer_session.audio_chunks:
+        return ""
+
+    output_dir = Path(__file__).resolve().parent / 'uploads' / 'answer_sessions'
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{runtime.session_id}_{answer_session.answer_session_id}.wav"
+
+    try:
+        import wave
+
+        with wave.open(str(output_path), 'wb') as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(16000)
+            wav_file.writeframes(b''.join(answer_session.audio_chunks))
+    except Exception as exc:
+        logger.warning(f"[ASR] 导出整题音频失败: {exc}")
+        return ""
+
+    return str(output_path)
+
+
+def _rewrite_answer_text(runtime, answer_session: AnswerSession, audio_path: str = "") -> str:
+    if not audio_path or asr_manager is None or not hasattr(asr_manager, 'transcribe_file'):
+        return answer_session.merged_text_draft
+
+    prompt_parts = [
+        "这是一次中文技术面试回答的音频转写，请尽量准确保留技术术语、英文缩写、数字和项目名称。",
+        "只输出转写后的正文，不要补充解释，不要改写成总结。",
+    ]
+    if runtime.current_question:
+        prompt_parts.append(f"当前题目：{runtime.current_question}")
+    if answer_session.merged_text_draft:
+        prompt_parts.append(f"实时草稿：{answer_session.merged_text_draft}")
+
+    rewritten_text = asr_manager.transcribe_file(
+        audio_path=audio_path,
+        prompt="\n".join(part for part in prompt_parts if part),
+    )
+    if rewritten_text:
+        return rewritten_text
+
+    _log_runtime_event(
+        runtime,
+        'answer_session_rewrite_fallback',
+        level='warning',
+        answer_session_id=answer_session.answer_session_id,
+        details=getattr(asr_manager, 'last_transcribe_error', '')[:200],
+    )
+    return answer_session.merged_text_draft
+
+
+def _finalize_answer_session(runtime, reason: str = "long_pause") -> None:
+    current = session_registry.get(runtime.client_id)
+    if not current or current.session_id != runtime.session_id or current.ended:
+        return
+
+    answer_session = current.current_answer_session
+    if not answer_session or answer_session.turn_id != current.turn_id or answer_session.committed:
+        return
+
+    if answer_session.current_partial:
+        answer_session.finalize_segment(answer_session.current_partial)
+
+    final_candidate = (answer_session.merged_text_draft or answer_session.live_text).strip()
+    if not final_candidate:
+        _reset_answer_session(current)
+        return
+
+    _set_runtime_asr_lock(current, True, reason or 'answer_finalized')
+    answer_session.mark_status('finalizing')
+    _log_runtime_event(
+        current,
+        'answer_session_finalizing',
+        source=reason,
+        answer_session_id=answer_session.answer_session_id,
+        segment_count=len(answer_session.segments),
+    )
+    _emit_orchestrator_state(current)
+    _emit_answer_session_update(current, source=f'{reason}_finalizing')
+
+    audio_path = _persist_answer_audio(current, answer_session)
+    final_text = _rewrite_answer_text(current, answer_session, audio_path=audio_path) or final_candidate
+    answer_session.mark_final(final_text, reason=reason, exported_audio_path=audio_path)
+    _emit_answer_session_update(current, source=f'{reason}_finalized')
+
+    answer_session.committed = True
+    _emit_answer_session_update(current, source=f'{reason}_commit')
+    _process_runtime_commit(
+        current,
+        answer_session.final_text or answer_session.merged_text_draft,
+        answer_session.turn_id,
+        source='answer_session',
+    )
+
+
+def _schedule_answer_session_finalize(
+    runtime,
+    reason: str = "long_pause",
+    asr_generation: int = 0,
+    speech_epoch: int = 0,
+) -> None:
+    current = session_registry.get(runtime.client_id)
+    if not current or current.session_id != runtime.session_id or current.ended:
+        return
+
+    answer_session = current.current_answer_session
+    if not answer_session or answer_session.turn_id != current.turn_id or answer_session.committed:
+        return
+
+    expected_speech_epoch = speech_epoch or getattr(answer_session, 'last_speech_epoch', 0)
+    expected_asr_generation = asr_generation or getattr(answer_session, 'last_asr_generation', 0)
+
+    if expected_speech_epoch and current.speech_epoch != expected_speech_epoch:
+        _log_runtime_event(
+            current,
+            'answer_session_finalize_dropped',
+            level='debug',
+            source=reason,
+            answer_session_id=answer_session.answer_session_id,
+            expected_speech_epoch=expected_speech_epoch,
+            current_speech_epoch=current.speech_epoch,
+            reason_detail='speech_epoch_advanced_before_schedule',
+        )
+        return
+
+    if expected_asr_generation and getattr(answer_session, 'last_asr_generation', 0) != expected_asr_generation:
+        _log_runtime_event(
+            current,
+            'answer_session_finalize_dropped',
+            level='debug',
+            source=reason,
+            answer_session_id=answer_session.answer_session_id,
+            expected_asr_generation=expected_asr_generation,
+            current_asr_generation=getattr(answer_session, 'last_asr_generation', 0),
+            reason_detail='asr_generation_changed_before_schedule',
+        )
+        return
+
+    _cancel_answer_finalize_timer(current)
+
+    answer_session_id = answer_session.answer_session_id
+
+    def finalize_task():
+        live_runtime = session_registry.get(runtime.client_id)
+        if not live_runtime or live_runtime.session_id != runtime.session_id or live_runtime.ended:
+            return
+        live_runtime.pending_answer_finalize_timer = None
+        live_answer_session = live_runtime.current_answer_session
+        if not live_answer_session or live_answer_session.answer_session_id != answer_session_id:
+            return
+        if expected_speech_epoch and live_runtime.speech_epoch != expected_speech_epoch:
+            _log_runtime_event(
+                live_runtime,
+                'answer_session_finalize_dropped',
+                level='debug',
+                source=reason,
+                answer_session_id=answer_session_id,
+                expected_speech_epoch=expected_speech_epoch,
+                current_speech_epoch=live_runtime.speech_epoch,
+                reason_detail='speech_epoch_advanced',
+            )
+            return
+        if expected_speech_epoch and getattr(live_answer_session, 'last_speech_epoch', 0) != expected_speech_epoch:
+            _log_runtime_event(
+                live_runtime,
+                'answer_session_finalize_dropped',
+                level='debug',
+                source=reason,
+                answer_session_id=answer_session_id,
+                expected_speech_epoch=expected_speech_epoch,
+                current_speech_epoch=getattr(live_answer_session, 'last_speech_epoch', 0),
+                reason_detail='answer_session_epoch_changed',
+            )
+            return
+        if expected_asr_generation and getattr(live_answer_session, 'last_asr_generation', 0) != expected_asr_generation:
+            _log_runtime_event(
+                live_runtime,
+                'answer_session_finalize_dropped',
+                level='debug',
+                source=reason,
+                answer_session_id=answer_session_id,
+                expected_asr_generation=expected_asr_generation,
+                current_asr_generation=getattr(live_answer_session, 'last_asr_generation', 0),
+                reason_detail='answer_session_generation_changed',
+            )
+            return
+        _finalize_answer_session(live_runtime, reason=reason)
+
+    timer = threading.Timer(current.long_pause_threshold_seconds, finalize_task)
+    timer.daemon = True
+    current.pending_answer_finalize_timer = timer
+    timer.start()
+    _log_runtime_event(
+        current,
+        'answer_session_finalize_scheduled',
+        source=reason,
+        answer_session_id=answer_session.answer_session_id,
+        speech_epoch=expected_speech_epoch or '',
+        asr_generation=expected_asr_generation or '',
+        after_seconds=current.long_pause_threshold_seconds,
+    )
+
+
+def _finalize_answer_segment(
+    runtime,
+    asr_generation: int,
+    speech_epoch: int = 0,
+    reason: str = "speech_end",
+) -> str:
+    current = session_registry.get(runtime.client_id)
+    if not current or current.session_id != runtime.session_id or current.ended:
+        return ""
+
+    answer_session = current.current_answer_session
+    if not answer_session or answer_session.turn_id != current.turn_id:
+        return ""
+
+    segment_text = _consume_runtime_segment_text(current, asr_generation=asr_generation)
+    if segment_text:
+        answer_session.finalize_segment(segment_text)
+    if speech_epoch and speech_epoch >= getattr(answer_session, 'last_speech_epoch', 0):
+        answer_session.last_speech_epoch = speech_epoch
+    if asr_generation and asr_generation >= getattr(answer_session, 'last_asr_generation', 0):
+        answer_session.last_asr_generation = asr_generation
+
+    answer_session.mark_status('paused_short')
+    _log_runtime_event(
+        current,
+        'answer_segment_finalized',
+        source=reason,
+        answer_session_id=answer_session.answer_session_id,
+        segment_preview=segment_text[:160],
+        segment_count=len(answer_session.segments),
+    )
+    _emit_answer_session_update(current, source=reason)
+    return segment_text
+
+
 def _generate_policy_response(
     user_answer: str,
     current_question: str,
@@ -300,247 +653,724 @@ def _generate_policy_response(
     return feedback, analysis_result, followup_decision, next_state, question_plan
 
 
-def _emit_tts_audio(client_id: str, text: str):
-    """异步发送 TTS 音频到指定客户端。"""
-    if not text or not text.strip():
-        return
-    if not tts_manager or not tts_manager.enabled:
+def _emit_pipeline_error(client_id: str, session_id: str, code: str, error: str, details: str = ""):
+    logger.error(
+        "[pipeline_error] client_id=%r session_id=%r code=%r error=%r details=%r",
+        client_id,
+        session_id,
+        code,
+        error,
+        details,
+    )
+    socketio.emit('pipeline_error', {
+        'session_id': session_id,
+        'code': code,
+        'error': error,
+        'details': details,
+        'timestamp': time.time()
+    }, to=client_id)
+
+
+def _emit_orchestrator_state(runtime):
+    socketio.emit(
+        'orchestrator_state',
+        {
+            **state_orchestrator.build_public_state(runtime),
+            'timestamp': time.time()
+        },
+        to=runtime.client_id
+    )
+
+
+def _set_runtime_asr_status(runtime, available: bool, code: str = "", details: str = ""):
+    runtime.asr_available = available
+    runtime.asr_error_code = str(code or "").strip()
+    runtime.asr_error = str(details or "").strip()
+
+
+def _set_runtime_asr_lock(runtime, locked: bool, reason: str = ""):
+    runtime.asr_locked = bool(locked)
+    runtime.asr_lock_reason = str(reason or "").strip() if locked else ""
+
+
+def _disable_runtime_asr(runtime, code: str, error: str, details: str = "", asr_generation: int | None = None):
+    current = session_registry.get(runtime.client_id)
+    if not current or current.session_id != runtime.session_id or current.ended:
         return
 
-    import threading
+    if asr_generation is not None and current.active_asr_generation != asr_generation:
+        return
 
-    def tts_task():
+    normalized_details = str(details or "").strip()
+    if (
+        not current.asr_available
+        and current.asr_error_code == code
+        and current.asr_error == normalized_details
+    ):
+        return
+
+    if current.pending_commit_timer:
+        current.pending_commit_timer.cancel()
+        current.pending_commit_timer = None
+    _cancel_answer_finalize_timer(current)
+    current.pending_asr_partials.clear()
+    current.pending_asr_finals.clear()
+    current.active_asr_generation = 0
+    current.active_asr_speech_epoch = 0
+    current.finalizing_asr_generation = 0
+    current.last_finalized_asr_generation = 0
+    current.last_finalized_asr_speech_epoch = 0
+    _set_runtime_asr_status(current, False, code, normalized_details or error)
+
+    if asr_manager and current.active_asr_stream_id:
         try:
-            def send_audio_chunk(audio_data):
-                import base64
-                audio_base64 = base64.b64encode(audio_data).decode('utf-8')
-                socketio.emit('tts_audio', {
-                    'audio': audio_base64
-                }, to=client_id)
+            asr_manager.stop_session(current.active_asr_stream_id)
+        except Exception as stop_error:
+            logger.warning(f"[ASR] 停止异常流失败: {stop_error}")
 
-            # 网络抖动时做一次轻量重试，降低偶发无语音概率
-            max_attempts = 2
-            ok = False
-            details = 'unknown tts error'
-
-            for attempt in range(1, max_attempts + 1):
-                ok = tts_manager.synthesize(text, callback=send_audio_chunk)  # type: ignore
-                if ok:
-                    break
-                details = getattr(tts_manager, 'last_error', '') or 'unknown tts error'
-                logger.warning(f"[TTS] 合成失败，第 {attempt}/{max_attempts} 次：{details}")
-                if attempt < max_attempts:
-                    time.sleep(0.35)
-
-            if not ok:
-                error_payload = {
-                    'error': 'TTS synthesis failed',
-                    'code': 'TTS_SYNTH_FAIL',
-                    'details': details
-                }
-                logger.info(f"[TTS] 发送错误到前端 - payload: {error_payload}")
-                socketio.emit('tts_error', error_payload, to=client_id)
-        except Exception as e:
-            logger.error(f"[TTS] 合成异常：{e}", exc_info=True)
-            socketio.emit('tts_error', {
-                'error': 'TTS synthesis exception',
-                'code': 'TTS_EXCEPTION',
-                'details': str(e)
-            }, to=client_id)
-
-    threading.Thread(target=tts_task, daemon=True).start()
+    _log_runtime_event(
+        current,
+        'asr_disabled',
+        level='warning',
+        asr_generation=asr_generation or '',
+        code=code,
+        details=(normalized_details or error)[:200],
+    )
+    _emit_orchestrator_state(current)
+    _emit_pipeline_error(current.client_id, current.session_id, code, error, normalized_details)
 
 
-def _flush_asr_text_buffer(client_id: str):
-    """把聚合后的 ASR 文本提交给 LLM。"""
-    text = ''
-    with asr_text_buffer_lock:
-        timer = asr_text_flush_timers.pop(client_id, None)
-        if timer:
-            timer.cancel()
-        buffer_items = asr_text_buffers.pop(client_id, [])
-
-    if buffer_items:
-        text = ''.join(buffer_items).strip()
-
-    if text:
-        logger.info(f"[ASR] 聚合提交文本：'{text[:80]}...'")
-        _process_asr_text_with_llm(client_id, text)
+def _get_runtime(client_id: str, expected_session_id: str = ""):
+    runtime = session_registry.get(client_id)
+    if not runtime:
+        return None
+    if expected_session_id and runtime.session_id != expected_session_id:
+        return None
+    return runtime
 
 
-def _enqueue_asr_text_for_llm(client_id: str, text: str):
-    """收集 ASR 分句，并在静默窗口后一次性提交。"""
-    cleaned = (text or '').strip()
-    if not cleaned:
+def _current_runtime_matches(
+    client_id: str,
+    session_id: str,
+    job_id: str = "",
+    interrupt_epoch: int | None = None,
+    asr_generation: int | None = None,
+    allow_finalizing_asr: bool = False,
+    allow_finalized_asr: bool = False,
+) -> bool:
+    runtime = session_registry.get(client_id)
+    if not runtime or runtime.session_id != session_id or runtime.ended:
+        return False
+    if interrupt_epoch is not None and runtime.interrupt_epoch != interrupt_epoch:
+        return False
+    if job_id and runtime.active_tts_job_id != job_id and runtime.active_llm_job_id != job_id:
+        return False
+    if asr_generation is not None:
+        valid_generation = runtime.active_asr_generation == asr_generation
+        if allow_finalizing_asr and runtime.finalizing_asr_generation == asr_generation:
+            valid_generation = True
+        if allow_finalized_asr and runtime.last_finalized_asr_generation == asr_generation:
+            valid_generation = True
+        if not valid_generation:
+            return False
+    return True
+
+
+def _runtime_log_fields(runtime, **fields):
+    payload = {
+        'client_id': runtime.client_id,
+        'session_id': runtime.session_id,
+        'turn_id': runtime.turn_id,
+        'mode': runtime.mode,
+        'interrupt_epoch': runtime.interrupt_epoch,
+    }
+    payload.update({key: value for key, value in fields.items() if value not in (None, '')})
+    return payload
+
+
+def _log_runtime_event(runtime, event: str, level: str = 'info', **fields):
+    payload = _runtime_log_fields(runtime, event=event, **fields)
+    log_fn = getattr(logger, level, logger.info)
+    details = ' '.join(f"{key}={payload[key]!r}" for key in sorted(payload))
+    log_fn(f"[runtime] {details}")
+
+
+def _print_asr_console(runtime, phase: str, text: str, asr_generation: int):
+    content = str(text or '').strip()
+    if not content:
         return
-
-    with asr_text_buffer_lock:
-        asr_text_buffers.setdefault(client_id, []).append(cleaned)
-
-        old_timer = asr_text_flush_timers.get(client_id)
-        if old_timer:
-            old_timer.cancel()
-
-        timer = threading.Timer(ASR_TEXT_DEBOUNCE_SECONDS, _flush_asr_text_buffer, args=(client_id,))
-        timer.daemon = True
-        asr_text_flush_timers[client_id] = timer
-        timer.start()
+    print(
+        f"[ASR_CONSOLE] phase={phase} session_id={runtime.session_id} "
+        f"turn_id={runtime.turn_id} stream_id={runtime.active_asr_stream_id} "
+        f"gen={asr_generation} text={content}",
+        flush=True,
+    )
 
 
-def _get_last_interviewer_question(chat_history):
-    """从历史中取最近一条面试官提问"""
-    if not chat_history:
-        return ''
-    for item in reversed(chat_history):
-        if isinstance(item, dict) and item.get('role') == 'interviewer':
-            return item.get('content', '')
-    return ''
+def _interrupt_runtime(runtime, reason: str):
+    payload = state_orchestrator.start_speech(runtime)
+    _log_runtime_event(runtime, 'interrupt', reason=reason, interrupted_job_id=payload.get('job_id', ''))
+    if payload:
+        socketio.emit('tts_stop', {
+            **payload,
+            'reason': reason,
+            'timestamp': time.time()
+        }, to=runtime.client_id)
+    _emit_orchestrator_state(runtime)
 
 
-def _is_noise_text(text: str) -> bool:
-    """过滤明显无意义的口头语，避免频繁触发 LLM"""
-    normalized = (text or '').strip()
-    if not normalized:
-        return True
-    # 语气词集合
-    fillers = {'啊', '嗯', '呃', '哦', '哎', '额', '唉', '哈', '噢', '嘛', '呗', '咯'}
-    if normalized in fillers:
-        return True
-    # 单字直接过滤
-    if len(normalized) < 3:
-        return True
-    # 常见无意义短语
-    noise_phrases = {'谢谢', '感谢', '好的', '好的呢', '然后', '还有', '那个', '这个', '就是', '还有谁', '都是谁'}
-    if normalized in noise_phrases:
-        return True
-    return False
-
-
-def _process_asr_text_with_llm(client_id: str, text: str):
-    """ASR 识别结果后端兜底直连 LLM，避免前端事件丢失导致流程中断"""
-    logger.info(f"[ASR->LLM] _process_asr_text_with_llm 被调用！client_id={client_id}, text='{text[:50]}...'")
-
-    if llm_manager is None:
-        logger.warning("[ASR->LLM] llm_manager 为 None，跳过")
-        return
-
-    if not interview_active:
-        logger.warning(f"[ASR->LLM] 面试未激活 (interview_active={interview_active})，跳过")
-        return
-
-    if _is_noise_text(text):
-        logger.warning(f"[ASR->LLM] 过滤噪声文本：'{text}'")
-        return
-
-    now = time.time()
-    with asr_llm_state_lock:
-        if client_id in asr_llm_processing_clients:
-            logger.warning(f"[ASR->LLM] 客户端正在处理中，忽略本次识别：'{text[:30]}'")
-            return
-
-        last_feedback_ts = asr_llm_last_feedback_ts.get(client_id, 0)
-        if now - last_feedback_ts < ASR_LLM_MIN_INTERVAL_SECONDS:
-            logger.warning(
-                f"[ASR->LLM] 命中冷却窗口({ASR_LLM_MIN_INTERVAL_SECONDS}s)，忽略本次识别：'{text[:30]}'"
-            )
-            return
-
-        asr_llm_processing_clients.add(client_id)
-
-    try:
-        chat_history = current_interview_session.get('chat_history', [])
-        current_question = _get_last_interviewer_question(chat_history)
-        if not current_question:
-            logger.warning("[ASR->LLM] 当前问题为空，跳过本次触发")
-            return
-
-        round_type = current_interview_session.get('round_type', 'technical')
-        position = current_interview_session.get('position', 'unknown')
-        feedback, analysis_result, followup_decision, next_state, next_question_plan = _generate_policy_response(
-            user_answer=text,
-            current_question=current_question,
-            position=position,
-            round_type=round_type,
-            chat_history=chat_history,
-            difficulty=current_interview_session.get('difficulty', 'medium'),
-            interview_state=current_interview_session.get('interview_state'),
-            question_plan=current_interview_session.get('last_question_plan')
-        )
-
-        logger.info(f"[ASR->LLM] ★★★ 开始调用 LLM - 问题：'{current_question[:30]}...'")
-        logger.info(f"[ASR->LLM] LLM 返回结果：'{feedback[:50] if feedback else 'None'}...'")
-
-        if not feedback:
-            socketio.emit('error', {
-                'error': 'Failed to process answer',
-                'code': 'LLM_ERROR'
-            }, to=client_id)
-            return
-
-        # 只是使用列表记录到内存中，速度快，不涉及复杂查询，暂不存数据库
-        data_manager.add_frame_data({
+def _record_runtime_dialogue(runtime, question: str, answer: str, feedback: str, analysis_result=None, followup_decision=None):
+    if runtime.data_manager:
+        runtime.data_manager.add_frame_data({
             'type': 'interview_dialogue',
-            'question': current_question,
-            'user_answer': text,
+            'question': question,
+            'user_answer': answer,
             'llm_feedback': feedback,
             'rag_analysis': analysis_result,
             'followup_decision': followup_decision,
             'timestamp': time.time()
         })
-        
-        # 正式环境建议改为异步入库，避免数据库操作影响响应速度
-        db_manager.save_interview_dialogue({
-            'interview_id': f"interview_{int(time.time())}",
-            'round_type': round_type,
-            'question': current_question,
-            'answer': text,
-            'llm_feedback': feedback
-        })
 
-        current_interview_session['chat_history'].append({
-            'role': 'candidate',
-            'content': text
-        })
-        current_interview_session['chat_history'].append({
-            'role': 'interviewer',
-            'content': feedback
-        })
-        next_action = str((followup_decision or {}).get('next_action', 'ask_followup')).strip()
-        current_interview_session['interview_state'] = next_state
-        if next_action in {'switch_question', 'raise_difficulty'} and next_question_plan:
-            current_interview_session['last_question_plan'] = next_question_plan
-            current_interview_session['last_answer_analysis'] = None
-            if next_action == 'raise_difficulty':
-                current_interview_session['difficulty'] = (followup_decision or {}).get('difficulty_target', current_interview_session.get('difficulty', 'medium'))
-        else:
-            current_interview_session['last_answer_analysis'] = analysis_result
+    db_manager.save_interview_dialogue({
+        'interview_id': runtime.interview_id,
+        'round_type': runtime.round_type,
+        'question': question,
+        'answer': answer,
+        'llm_feedback': feedback
+    })
 
-        socketio.emit('llm_answer', {
-            'success': True,
-            'feedback': feedback,
-            'analysis': analysis_result,
-            'followup_decision': followup_decision,
-            'round': round_type,
-            'timestamp': time.time()
-        }, to=client_id)
 
-        _emit_tts_audio(client_id, feedback)
+def _maybe_emit_session_notice(runtime):
+    if runtime.mode != 'listening':
+        return
+    if runtime.active_tts_job_id or runtime.active_llm_job_id:
+        return
+    if not runtime.notice_queue:
+        return
 
-        with asr_llm_state_lock:
-            asr_llm_last_feedback_ts[client_id] = time.time()
+    notice_text = runtime.notice_queue.pop(0)
+    normalized = speech_normalizer.normalize(notice_text)
+    _log_runtime_event(
+        runtime,
+        'session_notice',
+        source='detection_state',
+        display_text=normalized['display_text'][:120],
+        spoken_text=normalized['spoken_text'][:120],
+    )
+    socketio.emit('session_control_notice', {
+        'session_id': runtime.session_id,
+        'turn_id': runtime.turn_id,
+        'job_id': '',
+        'display_text': normalized['display_text'],
+        'spoken_text': normalized['spoken_text'],
+        'interrupt_epoch': runtime.interrupt_epoch,
+        'timestamp': time.time()
+    }, to=runtime.client_id)
+    _start_runtime_tts(runtime, normalized['spoken_text'], runtime.turn_id, source='session_control')
 
-        logger.info(f"[ASR->LLM] ✓ 已生成追问 - 轮次：{round_type}")
 
-    except Exception as e:
-        logger.error(f"[ASR->LLM] 处理失败：{e}", exc_info=True)
-        socketio.emit('error', {
-            'error': 'Internal server error',
-            'code': 'SERVER_ERROR',
-            'details': str(e)
-        }, to=client_id)
-    finally:
-        with asr_llm_state_lock:
-            asr_llm_processing_clients.discard(client_id)
+def _start_runtime_tts(runtime, spoken_text: str, turn_id: str, source: str = 'reply'):
+    text = str(spoken_text or '').strip()
+    if not text:
+        state_orchestrator.begin_listening(runtime)
+        _emit_orchestrator_state(runtime)
+        _maybe_emit_session_notice(runtime)
+        return
+
+    if not tts_manager or not getattr(tts_manager, 'enabled', False):
+        state_orchestrator.begin_listening(runtime)
+        _emit_orchestrator_state(runtime)
+        return
+
+    sentences = speech_normalizer.split_for_tts(text)
+    if not sentences:
+        state_orchestrator.begin_listening(runtime)
+        _emit_orchestrator_state(runtime)
+        return
+
+    tts_job_id = runtime.new_job('tts')
+    interrupt_epoch = runtime.interrupt_epoch
+    state_orchestrator.begin_speaking(runtime, tts_job_id)
+    _log_runtime_event(
+        runtime,
+        'tts_start',
+        job_id=tts_job_id,
+        source=source,
+        sentence_count=len(sentences),
+        spoken_preview=text[:160],
+    )
+    _emit_orchestrator_state(runtime)
+
+    def tts_task():
+        try:
+            for index, sentence in enumerate(sentences):
+                current = session_registry.get(runtime.client_id)
+                if not current or current.session_id != runtime.session_id:
+                    return
+                if current.active_tts_job_id != tts_job_id or current.interrupt_epoch != interrupt_epoch:
+                    return
+
+                emitted = {'ok': False}
+
+                def send_audio_chunk(audio_data, text_chunk=sentence, chunk_index=index):
+                    if not _current_runtime_matches(runtime.client_id, runtime.session_id, tts_job_id, interrupt_epoch):
+                        return
+                    audio_base64 = base64.b64encode(audio_data).decode('utf-8')
+                    emitted['ok'] = True
+                    _log_runtime_event(
+                        runtime,
+                        'tts_chunk',
+                        level='debug',
+                        job_id=tts_job_id,
+                        chunk_index=chunk_index,
+                        source=source,
+                        chunk_preview=str(text_chunk)[:120],
+                    )
+                    socketio.emit('tts_chunk', {
+                        'session_id': runtime.session_id,
+                        'turn_id': turn_id,
+                        'job_id': tts_job_id,
+                        'chunk_index': chunk_index,
+                        'text': text_chunk,
+                        'audio': audio_base64,
+                        'mime_type': getattr(tts_manager, 'last_content_type', 'audio/mpeg'),
+                        'interrupt_epoch': interrupt_epoch,
+                        'source': source,
+                        'timestamp': time.time()
+                    }, to=runtime.client_id)
+
+                ok = tts_manager.synthesize(sentence, callback=send_audio_chunk)
+                if not _current_runtime_matches(runtime.client_id, runtime.session_id, tts_job_id, interrupt_epoch):
+                    return
+                if not ok or not emitted['ok']:
+                    _emit_pipeline_error(
+                        runtime.client_id,
+                        runtime.session_id,
+                        'TTS_SYNTH_FAIL',
+                        'TTS synthesis failed',
+                        getattr(tts_manager, 'last_error', '') or 'unknown tts error'
+                    )
+                    break
+        except Exception as e:
+            logger.error(f"[TTS] 新会话链路异常：{e}", exc_info=True)
+            _emit_pipeline_error(runtime.client_id, runtime.session_id, 'TTS_EXCEPTION', 'TTS synthesis exception', str(e))
+        finally:
+            current = session_registry.get(runtime.client_id)
+            if current and current.session_id == runtime.session_id:
+                if state_orchestrator.finish_speaking(current, tts_job_id):
+                    _log_runtime_event(current, 'tts_finish', job_id=tts_job_id, source=source)
+                    _emit_orchestrator_state(current)
+                    _maybe_emit_session_notice(current)
+
+    threading.Thread(target=tts_task, daemon=True).start()
+
+
+def _start_runtime_asr(runtime, reason: str = "speech_start") -> bool:
+    if asr_manager is None:
+        _disable_runtime_asr(runtime, 'ASR_NOT_READY', 'ASR is not initialized on server', asr_import_error or '')
+        return False
+
+    stream_id = runtime.active_asr_stream_id or runtime.session_id
+    runtime.active_asr_stream_id = stream_id
+    with runtime.asr_start_lock:
+        current = session_registry.get(runtime.client_id)
+        if not current or current.session_id != runtime.session_id or current.ended:
+            return False
+
+        if current.active_asr_generation:
+            _log_runtime_event(
+                current,
+                'asr_start_skip',
+                stream_id=stream_id,
+                asr_generation=current.active_asr_generation,
+                reason='already_running_or_starting',
+            )
+            return True
+
+        current.asr_generation_counter += 1
+        asr_generation = current.asr_generation_counter
+        current.active_asr_generation = asr_generation
+        current.active_asr_speech_epoch = current.speech_epoch
+        current.finalizing_asr_generation = 0
+        current.last_finalized_asr_generation = 0
+        current.last_finalized_asr_speech_epoch = 0
+
+        def on_partial(text: str):
+            if not _current_runtime_matches(
+                runtime.client_id,
+                runtime.session_id,
+                asr_generation=asr_generation,
+            ):
+                return
+            live_runtime = session_registry.get(runtime.client_id)
+            if not live_runtime:
+                return
+            if live_runtime.asr_locked:
+                _log_runtime_event(
+                    live_runtime,
+                    'asr_partial_dropped',
+                    level='debug',
+                    stream_id=live_runtime.active_asr_stream_id,
+                    asr_generation=asr_generation,
+                    reason='asr_locked',
+                    lock_reason=live_runtime.asr_lock_reason,
+                )
+                return
+            live_runtime.pending_asr_partials = [text]
+            answer_session = _ensure_answer_session(live_runtime)
+            preview_text = ' '.join(live_runtime.pending_asr_finals + [text]).strip()
+            answer_session.mark_status('recording')
+            answer_session.update_partial(preview_text)
+            _print_asr_console(live_runtime, 'partial', text, asr_generation)
+            _log_runtime_event(
+                live_runtime,
+                'asr_partial',
+                level='debug',
+                stream_id=live_runtime.active_asr_stream_id,
+                asr_generation=asr_generation,
+                partial_preview=text[:120],
+            )
+            _emit_answer_session_update(live_runtime, source='asr_partial')
+            socketio.emit('asr_partial', {
+                'session_id': live_runtime.session_id,
+                'turn_id': live_runtime.turn_id,
+                'stream_id': live_runtime.active_asr_stream_id,
+                'text': text,
+                'interrupt_epoch': live_runtime.interrupt_epoch,
+                'timestamp': time.time()
+            }, to=live_runtime.client_id)
+
+        def on_final(text: str):
+            if not _current_runtime_matches(
+                runtime.client_id,
+                runtime.session_id,
+                asr_generation=asr_generation,
+                allow_finalizing_asr=True,
+                allow_finalized_asr=True,
+            ):
+                return
+            live_runtime = session_registry.get(runtime.client_id)
+            if not live_runtime:
+                return
+            if live_runtime.asr_locked:
+                _log_runtime_event(
+                    live_runtime,
+                    'asr_final_dropped',
+                    level='debug',
+                    stream_id=live_runtime.active_asr_stream_id,
+                    asr_generation=asr_generation,
+                    reason='asr_locked',
+                    lock_reason=live_runtime.asr_lock_reason,
+                )
+                return
+            if not live_runtime.pending_asr_finals or live_runtime.pending_asr_finals[-1] != text:
+                live_runtime.pending_asr_finals.append(text)
+            answer_session = _ensure_answer_session(live_runtime)
+            answer_session.mark_status('recording')
+            answer_session.update_partial(' '.join(live_runtime.pending_asr_finals).strip())
+            _print_asr_console(live_runtime, 'final', text, asr_generation)
+            _log_runtime_event(
+                live_runtime,
+                'asr_final',
+                stream_id=live_runtime.active_asr_stream_id,
+                asr_generation=asr_generation,
+                final_preview=text[:160],
+                final_count=len(live_runtime.pending_asr_finals),
+            )
+            _emit_answer_session_update(live_runtime, source='asr_sentence_final')
+            socketio.emit('asr_final', {
+                'session_id': live_runtime.session_id,
+                'turn_id': live_runtime.turn_id,
+                'stream_id': live_runtime.active_asr_stream_id,
+                'text': text,
+                'full_text': ' '.join(live_runtime.pending_asr_finals).strip(),
+                'interrupt_epoch': live_runtime.interrupt_epoch,
+                'timestamp': time.time()
+            }, to=live_runtime.client_id)
+
+        def on_error(error: str):
+            if not _current_runtime_matches(
+                runtime.client_id,
+                runtime.session_id,
+                asr_generation=asr_generation,
+            ):
+                return
+            live_runtime = session_registry.get(runtime.client_id)
+            if not live_runtime:
+                return
+            _log_runtime_event(
+                live_runtime,
+                'asr_error',
+                level='error',
+                stream_id=stream_id,
+                asr_generation=asr_generation,
+                details=error[:200],
+            )
+            _disable_runtime_asr(
+                live_runtime,
+                'ASR_STREAM_ERROR',
+                'ASR stream error',
+                error,
+                asr_generation=asr_generation,
+            )
+
+        started = asr_manager.start_session(
+            stream_id,
+            on_result=on_final,
+            on_partial=on_partial,
+            on_error=on_error
+        )
+        if started:
+            _set_runtime_asr_status(current, True)
+            _log_runtime_event(
+                current,
+                'asr_start',
+                stream_id=stream_id,
+                asr_generation=asr_generation,
+                speech_epoch=current.active_asr_speech_epoch,
+                reason=reason,
+            )
+            return True
+
+        _disable_runtime_asr(
+            current,
+            'ASR_START_FAILED',
+            'ASR failed to start',
+            f'stream_id={stream_id}',
+            asr_generation=asr_generation,
+        )
+        return False
+
+
+def _finalize_runtime_asr(runtime, reason: str = "speech_end") -> tuple[int, int]:
+    if asr_manager is None or not runtime.active_asr_stream_id:
+        return 0, 0
+
+    with runtime.asr_start_lock:
+        current = session_registry.get(runtime.client_id)
+        if not current or current.session_id != runtime.session_id or current.ended:
+            return 0, 0
+
+        asr_generation = current.active_asr_generation
+        if not asr_generation:
+            return current.last_finalized_asr_generation, current.last_finalized_asr_speech_epoch
+
+        speech_epoch = current.active_asr_speech_epoch
+
+        current.finalizing_asr_generation = asr_generation
+        current.active_asr_generation = 0
+        current.active_asr_speech_epoch = 0
+
+        try:
+            if asr_manager.is_available(current.active_asr_stream_id):
+                asr_manager.stop_session(current.active_asr_stream_id)
+            _log_runtime_event(
+                current,
+                'asr_finalize',
+                stream_id=current.active_asr_stream_id,
+                asr_generation=asr_generation,
+                speech_epoch=speech_epoch,
+                reason=reason,
+            )
+        except Exception as e:
+            logger.warning(f"[ASR] 结束识别流失败 - stream={current.active_asr_stream_id}: {e}")
+        finally:
+            current.finalizing_asr_generation = 0
+            current.last_finalized_asr_generation = asr_generation
+            current.last_finalized_asr_speech_epoch = speech_epoch
+
+        return asr_generation, speech_epoch
+
+
+def _schedule_runtime_commit(
+    runtime,
+    turn_id: str,
+    source: str,
+    text_override: str = "",
+    asr_generation: int = 0,
+):
+    timer = runtime.pending_commit_timer
+    if timer:
+        timer.cancel()
+
+    def commit_task():
+        current = session_registry.get(runtime.client_id)
+        if not current or current.session_id != runtime.session_id or current.ended:
+            return
+        current.pending_commit_timer = None
+        if asr_generation and current.last_finalized_asr_generation != asr_generation:
+            _log_runtime_event(
+                current,
+                'commit_dropped',
+                level='debug',
+                source=source,
+                dropped_turn_id=turn_id,
+                asr_generation=asr_generation,
+                reason='stale_asr_generation',
+            )
+            return
+        final_text = ' '.join(current.pending_asr_finals).strip()
+        partial_text = ' '.join(current.pending_asr_partials).strip()
+        stream_active = bool(
+            asr_manager
+            and current.active_asr_stream_id
+            and current.active_asr_generation == asr_generation
+            and asr_manager.is_available(current.active_asr_stream_id)
+        )
+        answer_text = str(
+            text_override
+            or final_text
+            or (partial_text if asr_generation and not stream_active else '')
+        ).strip()
+        current.pending_asr_partials.clear()
+        current.pending_asr_finals.clear()
+        if asr_generation and current.last_finalized_asr_generation == asr_generation:
+            current.last_finalized_asr_generation = 0
+        if answer_text:
+            _process_runtime_commit(current, answer_text, turn_id, source)
+
+    runtime.pending_commit_timer = threading.Timer(0.45, commit_task)
+    runtime.pending_commit_timer.daemon = True
+    runtime.pending_commit_timer.start()
+    _log_runtime_event(
+        runtime,
+        'commit_scheduled',
+        source=source,
+        scheduled_turn_id=turn_id,
+        text_override=bool(text_override),
+        asr_generation=asr_generation or '',
+    )
+
+
+def _process_runtime_commit(runtime, answer_text: str, turn_id: str, source: str):
+    if llm_manager is None:
+        _emit_pipeline_error(runtime.client_id, runtime.session_id, 'LLM_NOT_READY', 'LLM is not initialized on server', llm_import_error or '')
+        return
+
+    normalized_answer = str(answer_text or '').strip()
+    if not normalized_answer or _is_noise_text(normalized_answer):
+        _log_runtime_event(runtime, 'commit_ignored', source=source, ignored_turn_id=turn_id, answer_preview=normalized_answer[:120])
+        return
+
+    text_hash = hashlib.sha1(normalized_answer.encode('utf-8')).hexdigest()
+    now = time.time()
+    if not state_orchestrator.can_commit(runtime, turn_id, text_hash, now):
+        _log_runtime_event(runtime, 'commit_dropped', source=source, dropped_turn_id=turn_id, answer_preview=normalized_answer[:160])
+        return
+
+    current_question = runtime.current_question or _get_last_interviewer_question(runtime.chat_history)
+    if not current_question:
+        _emit_pipeline_error(runtime.client_id, runtime.session_id, 'QUESTION_MISSING', 'Current question is missing')
+        return
+
+    state_orchestrator.mark_committed(runtime, text_hash, now)
+    llm_job_id = runtime.new_job('llm')
+    interrupt_epoch = runtime.interrupt_epoch
+    state_orchestrator.begin_thinking(runtime, llm_job_id)
+    _log_runtime_event(
+        runtime,
+        'commit_accepted',
+        source=source,
+        job_id=llm_job_id,
+        accepted_turn_id=turn_id,
+        answer_preview=normalized_answer[:160],
+    )
+    _emit_orchestrator_state(runtime)
+
+    def llm_task():
+        try:
+            feedback, analysis_result, followup_decision, next_state, next_question_plan = _generate_policy_response(
+                user_answer=normalized_answer,
+                current_question=current_question,
+                position=runtime.position,
+                round_type=runtime.round_type,
+                chat_history=runtime.chat_history,
+                difficulty=runtime.difficulty,
+                interview_state=runtime.interview_state,
+                question_plan=runtime.last_question_plan
+            )
+
+            current = session_registry.get(runtime.client_id)
+            if not current or current.session_id != runtime.session_id or current.ended:
+                return
+            if current.active_llm_job_id != llm_job_id or current.interrupt_epoch != interrupt_epoch:
+                return
+
+            state_orchestrator.finish_thinking(current, llm_job_id)
+
+            if not feedback:
+                state_orchestrator.begin_listening(current)
+                _emit_orchestrator_state(current)
+                _emit_pipeline_error(current.client_id, current.session_id, 'LLM_ERROR', 'Failed to process answer')
+                return
+
+            _log_runtime_event(
+                current,
+                'llm_reply_ready',
+                job_id=llm_job_id,
+                reply_preview=str(feedback)[:200],
+                next_action=str((followup_decision or {}).get('next_action', 'ask_followup')),
+            )
+            _record_runtime_dialogue(current, current_question, normalized_answer, feedback, analysis_result, followup_decision)
+
+            current.chat_history.append({
+                'role': 'candidate',
+                'content': normalized_answer
+            })
+            _reset_answer_session(current)
+
+            next_action = str((followup_decision or {}).get('next_action', 'ask_followup')).strip()
+            current.interview_state = next_state
+            if next_action in {'switch_question', 'raise_difficulty'} and next_question_plan:
+                current.last_question_plan = next_question_plan
+                current.last_answer_analysis = None
+                if next_action == 'raise_difficulty':
+                    current.difficulty = (followup_decision or {}).get('difficulty_target', current.difficulty)
+            else:
+                current.last_answer_analysis = analysis_result
+
+            normalized_reply = speech_normalizer.normalize(feedback)
+            next_turn_id = current.next_turn()
+            _set_runtime_asr_lock(current, False)
+            current.current_question = normalized_reply['display_text']
+            current.chat_history.append({
+                'role': 'interviewer',
+                'content': current.current_question
+            })
+
+            _log_runtime_event(
+                current,
+                'dialog_reply_emit',
+                job_id=llm_job_id,
+                next_turn_id=next_turn_id,
+                display_preview=normalized_reply['display_text'][:160],
+                spoken_preview=normalized_reply['spoken_text'][:160],
+            )
+            socketio.emit('dialog_reply', {
+                'session_id': current.session_id,
+                'turn_id': next_turn_id,
+                'job_id': llm_job_id,
+                'display_text': normalized_reply['display_text'],
+                'spoken_text': normalized_reply['spoken_text'],
+                'analysis': analysis_result,
+                'followup_decision': followup_decision,
+                'interrupt_epoch': current.interrupt_epoch,
+                'source': source,
+                'timestamp': time.time()
+            }, to=current.client_id)
+
+            _start_runtime_tts(current, normalized_reply['spoken_text'], next_turn_id, source='reply')
+        except Exception as e:
+            logger.error(f"[LLM] 新会话链路处理失败：{e}", exc_info=True)
+            current = session_registry.get(runtime.client_id)
+            if current and current.session_id == runtime.session_id:
+                state_orchestrator.finish_thinking(current, llm_job_id)
+                state_orchestrator.begin_listening(current)
+                _emit_orchestrator_state(current)
+            _emit_pipeline_error(runtime.client_id, runtime.session_id, 'LLM_EXCEPTION', 'LLM processing exception', str(e))
+
+    threading.Thread(target=llm_task, daemon=True).start()
+
 
 # 初始化简历解析器
 try:
@@ -576,20 +1406,6 @@ if config.get('performance.enable_monitoring', True):
     performance_monitor.start_monitoring()
     logger.info("性能监控已启动")
 
-# 全局状态
-interview_active = False
-current_interview_session = {
-    'round_type': 'technical', # 面试轮次
-    'position': 'java_backend', # 岗位
-    'difficulty': 'medium', # 难度
-    'resume_data': None, # 简历数据
-    'chat_history': [], # 对话历史
-    'started_at': None, # 开始时间
-    'interview_state': None,
-    'last_question_plan': None,
-    'last_answer_analysis': None,
-}
-
 # 初始化速率限制器
 answer_rate_limiter = RateLimiter(max_calls=5, time_window=1.0)    # 回答提交：5 次/秒
 interview_rate_limiter = RateLimiter(max_calls=2, time_window=10.0) # 面试操作：2 次/10 秒
@@ -623,6 +1439,15 @@ def health():
             'fps': perf_stats['fps'],
             'cpu_percent': perf_stats['cpu_percent'],
             'memory_percent': perf_stats['memory_percent']
+        },
+        'services': {
+            'llm': bool(llm_manager and getattr(llm_manager, 'enabled', False)),
+            'rag': bool(rag_service),
+            'asr': bool(asr_manager and getattr(asr_manager, 'enabled', False)),
+            'tts': tts_manager.get_status() if tts_manager else {
+                'enabled': False,
+                'error': tts_import_error or 'tts manager unavailable'
+            }
         }
     })
 
@@ -666,91 +1491,88 @@ def handle_connect():
 def handle_disconnect():
     """客户端断开事件"""
     client_id = request.sid
-    with asr_llm_state_lock:
-        asr_llm_processing_clients.discard(client_id)
-        asr_llm_last_feedback_ts.pop(client_id, None)
-    with asr_text_buffer_lock:
-        timer = asr_text_flush_timers.pop(client_id, None)
-        if timer:
-            timer.cancel()
-        asr_text_buffers.pop(client_id, None)
+    runtime = session_registry.remove(client_id)
+    if runtime:
+        runtime.ended = True
+        if runtime.pending_commit_timer:
+            runtime.pending_commit_timer.cancel()
+        _cancel_answer_finalize_timer(runtime)
+        if asr_manager and runtime.active_asr_stream_id:
+            asr_manager.stop_session(runtime.active_asr_stream_id)
+        _log_runtime_event(runtime, 'disconnect_cleanup')
     logger.info(f"客户端已断开 - ID: {client_id}")
 
 
-@socketio.on('start_interview')
+@socketio.on('session_start')
 @rate_limit(interview_rate_limiter)
-def handle_start_interview(data=None):
-    """启动面试会话
-
-    参数:
-        data: {
-            'position': 'java_backend' | 'frontend',
-            'difficulty': 'easy' | 'medium' | 'hard',
-            'round': 'technical' | 'project' | 'system_design' | 'hr',
-            'user_id': str
-        }
-    """
-    global interview_active, current_interview_session
+def handle_session_start(data=None):
     client_id = request.sid
 
     try:
-        round_type = data.get('round', 'technical') if data else 'technical'
+        existing = session_registry.remove(client_id)
+        if existing:
+            if existing.pending_commit_timer:
+                existing.pending_commit_timer.cancel()
+            _cancel_answer_finalize_timer(existing)
+            if asr_manager and existing.active_asr_stream_id:
+                asr_manager.stop_session(existing.active_asr_stream_id)
+
+        round_type = data.get('round_type', data.get('round', 'technical')) if data else 'technical'
         position = data.get('position', 'java_backend') if data else 'java_backend'
         difficulty = data.get('difficulty', 'medium') if data else 'medium'
         user_id = data.get('user_id', 'default') if data else 'default'
+        session_id = str(data.get('session_id', '')).strip() if data else ''
+        if not session_id:
+            session_id = uuid.uuid4().hex
 
-        logger.info(f"启动面试会话 - 岗位：{position}, 轮次：{round_type}, 难度：{difficulty}")
+        runtime = session_registry.create(
+            client_id=client_id,
+            session_id=session_id,
+            user_id=user_id,
+            round_type=round_type,
+            position=position,
+            difficulty=difficulty,
+        )
+        runtime.started_at = time.time()
+        runtime.active_asr_stream_id = f"asr_{session_id}"
+        runtime.short_pause_threshold_seconds = SHORT_PAUSE_SECONDS
+        runtime.long_pause_threshold_seconds = LONG_PAUSE_SECONDS
+        _log_runtime_event(
+            runtime,
+            'session_start',
+            requested_round_type=round_type,
+            requested_position=position,
+            requested_difficulty=difficulty,
+        )
 
-        # 激活面试状态
-        interview_active = True
+        if runtime.data_manager:
+            runtime.data_manager.reset()
+            runtime.data_manager.start_interview()
 
-        # 重置状态
-        data_manager.reset()
-        current_interview_session = {
-            'round_type': round_type,
-            'position': position,
-            'difficulty': difficulty,
-            'resume_data': None,
-            'chat_history': [],
-            'started_at': time.time(),
-            'interview_state': (
-                rag_service.create_interview_state(
-                    role=position,
-                    round_type=round_type,
-                    difficulty=difficulty,
-                    session_id=client_id
-                )
-                if rag_service is not None and getattr(rag_service, 'enabled', False)
-                else None
-            ),
-            'last_question_plan': None,
-            'last_answer_analysis': None,
-        }
-
-        # 加载简历数据并设置 LLM 上下文
         if llm_manager:
             resume_data = llm_manager.load_resume_data(user_id)
-            if resume_data:
-                current_interview_session['resume_data'] = resume_data
-                llm_manager.set_interview_round(round_type, resume_data)
-                logger.info(f"已加载候选人简历数据")
-            else:
-                llm_manager.set_interview_round(round_type)
-                logger.info("未找到候选人简历，使用通用面试模式")
+            runtime.resume_data = resume_data
+            llm_manager.set_interview_round(round_type, resume_data)
 
-        # 开始记录
-        data_manager.start_interview()
+        if rag_service is not None and getattr(rag_service, 'enabled', False):
+            runtime.interview_state = rag_service.create_interview_state(
+                role=position,
+                round_type=round_type,
+                difficulty=difficulty,
+                session_id=session_id
+            )
 
-        # 生成初始问题
+        _emit_orchestrator_state(runtime)
+
         initial_question = ""
         if llm_manager:
             rag_context, question_plan = _build_question_rag_context(
                 position=position,
                 difficulty=difficulty,
                 round_type=round_type,
-                interview_state=current_interview_session.get('interview_state')
+                interview_state=runtime.interview_state
             )
-            current_interview_session['last_question_plan'] = question_plan
+            runtime.last_question_plan = question_plan
             initial_question = llm_manager.generate_round_question(
                 round_type=round_type,
                 position=position,
@@ -758,484 +1580,313 @@ def handle_start_interview(data=None):
                 rag_context=rag_context
             )
             if question_plan and rag_service is not None and getattr(rag_service, 'enabled', False):
-                current_interview_session['interview_state'] = rag_service.mark_question_asked(
-                    current_interview_session.get('interview_state'),
+                runtime.interview_state = rag_service.mark_question_asked(
+                    runtime.interview_state,
                     question_plan
                 )
-                current_interview_session['last_answer_analysis'] = None
-            # 更新 chat_history
-            current_interview_session['chat_history'].append({
-                'role': 'interviewer',
-                'content': initial_question
-            })
+                runtime.last_answer_analysis = None
 
-        emit('interview_started', {
-            'message': 'Interview session started',
-            'timestamp': time.time(),
-            'success': True,
-            'round': round_type,
-            'position': position,
-            'difficulty': difficulty,
-            'question': initial_question
+        normalized_question = speech_normalizer.normalize(initial_question)
+        runtime.next_turn()
+        _set_runtime_asr_lock(runtime, False)
+        runtime.current_question = normalized_question['display_text']
+        runtime.chat_history.append({
+            'role': 'interviewer',
+            'content': runtime.current_question
         })
 
-        # 首问同样发送语音，避免只有文字无声音
-        _emit_tts_audio(client_id, initial_question)
-
-        logger.info(f"✓ 面试会话已启动 - 轮次：{round_type}")
-
-    except Exception as e:
-        logger.error(f"启动面试错误：{e}", exc_info=True)
-        emit('error', {
-            'error': 'Failed to start interview',
-            'code': 'START_ERROR',
-            'details': str(e)
-        })
-
-
-@socketio.on('submit_answer')
-@rate_limit(answer_rate_limiter)
-def handle_submit_answer(data):
-    """处理学生的答案提交
-
-    参数:
-        data: {
-            'question_id': 'xxx',
-            'question': '问题内容',
-            'answer': '学生回答',
-            'input_type': 'text' | 'voice'
-        }
-    """
-    client_id = request.sid
-
-    try:
-        logger.debug(f"收到答案提交 - 客户端：{client_id}")
-
-        # 输入验证
-        if not data or not isinstance(data, dict):
-            logger.warning("答案提交 - 无效的数据格式")
-            emit('error', {
-                'error': 'Invalid data format',
-                'code': 'INVALID_DATA'
-            })
-            return
-
-        if 'answer' not in data:
-            emit('error', {
-                'error': 'Missing answer field',
-                'code': 'MISSING_FIELD'
-            })
-            return
-
-        # 检查面试状态
-        if not interview_active:
-            emit('error', {
-                'error': 'Interview session not active',
-                'code': 'SESSION_INACTIVE'
-            })
-            return
-
-        # 保存回答
-        data_manager.add_frame_data({
-            'type': 'answer',
-            'question_id': data.get('question_id'),
-            'answer': data.get('answer'),
-            'input_type': data.get('input_type', 'text'),
+        _log_runtime_event(
+            runtime,
+            'dialog_reply_emit',
+            job_id='session_start',
+            next_turn_id=runtime.turn_id,
+            display_preview=normalized_question['display_text'][:160],
+            spoken_preview=normalized_question['spoken_text'][:160],
+        )
+        socketio.emit('dialog_reply', {
+            'session_id': runtime.session_id,
+            'turn_id': runtime.turn_id,
+            'job_id': 'session_start',
+            'display_text': normalized_question['display_text'],
+            'spoken_text': normalized_question['spoken_text'],
+            'analysis': None,
+            'followup_decision': None,
+            'interrupt_epoch': runtime.interrupt_epoch,
+            'source': 'session_start',
             'timestamp': time.time()
-        })
+        }, to=client_id)
 
-        # 发送确认
-        emit('answer_received', {
-            'success': True,
-            'message': 'Answer received and recorded',
-            'timestamp': time.time()
-        })
-
-        logger.debug(f"✓ 答案已保存")
-
+        _start_runtime_tts(runtime, normalized_question['spoken_text'], runtime.turn_id, source='session_start')
+        logger.info(f"✓ 新会话已启动 - session_id={runtime.session_id}, client_id={client_id}")
     except Exception as e:
-        logger.error(f"处理答案错误：{e}", exc_info=True)
-        emit('error', {
-            'error': 'Internal server error',
-            'code': 'SERVER_ERROR'
-        })
+        logger.error(f"启动新会话错误：{e}", exc_info=True)
+        _emit_pipeline_error(client_id, '', 'SESSION_START_ERROR', 'Failed to start session', str(e))
 
 
-@socketio.on('end_interview')
+@socketio.on('session_end')
 @rate_limit(interview_rate_limiter)
-def handle_end_interview(data=None):
-    """结束面试并生成报告"""
-    global interview_active
+def handle_session_end(data=None):
     client_id = request.sid
+    runtime = _get_runtime(client_id, str((data or {}).get('session_id', '')).strip())
+    if not runtime:
+        return
 
     try:
-        logger.info("结束面试会话")
-        interview_active = False
-        asr_client_callbacks.pop(client_id, None)
-        asr_last_restart_attempt.pop(client_id, None)
-        with asr_llm_state_lock:
-            asr_llm_processing_clients.discard(client_id)
-            asr_llm_last_feedback_ts.pop(client_id, None)
-        with asr_text_buffer_lock:
-            timer = asr_text_flush_timers.pop(client_id, None)
-            if timer:
-                timer.cancel()
-            asr_text_buffers.pop(client_id, None)
-        if asr_manager and asr_manager.is_available():
-            asr_manager.stop()
+        _log_runtime_event(runtime, 'session_end_requested')
+        runtime.ended = True
+        if runtime.pending_commit_timer:
+            runtime.pending_commit_timer.cancel()
+            runtime.pending_commit_timer = None
+        _cancel_answer_finalize_timer(runtime)
+        if asr_manager and runtime.active_asr_stream_id:
+            asr_manager.stop_session(runtime.active_asr_stream_id)
 
-        # 结束记录
-        data_manager.end_interview()
+        if runtime.data_manager:
+            runtime.data_manager.end_interview()
+            report_data = runtime.data_manager.export_for_report()
+        else:
+            report_data = {}
 
-        # 获取面试数据
-        report_data = data_manager.export_for_report()
-
-        # 生成报告 (暂时)
-        report_path = report_generator.generate_report(report_data)
-
-        # 保存到数据库
-        try:
-            interview_record = {
-                'interview_id': report_data.get('interview_id', f"interview_{int(time.time())}"),
-                'start_time': report_data.get('start_time'),
-                'end_time': report_data.get('end_time'),
-                'duration': report_data.get('duration', 0),
+        report_path = report_generator.generate_report(report_data) if report_data else ""
+        if report_data:
+            db_manager.save_interview({
+                'interview_id': runtime.interview_id,
+                'start_time': report_data.get('summary', {}).get('start_time'),
+                'end_time': report_data.get('summary', {}).get('end_time'),
+                'duration': report_data.get('summary', {}).get('duration', 0),
                 'report_path': report_path
-            }
+            })
 
-            db_result = db_manager.save_interview(interview_record)
-
-            if db_result.get('success'):
-                logger.info("✓ 面试记录已保存到数据库")
-            else:
-                logger.error(f"✗ 数据库保存失败：{db_result.get('error')}")
-
-        except Exception as db_error:
-            logger.error(f"✗ 数据库操作出错：{db_error}", exc_info=True)
-
+        state_orchestrator.begin_listening(runtime)
+        runtime.mode = 'ended'
+        _log_runtime_event(runtime, 'session_end_completed', report_path=report_path)
+        _emit_orchestrator_state(runtime)
         emit('interview_ended', {
             'message': 'Interview session ended',
             'report_path': report_path,
+            'session_id': runtime.session_id,
             'timestamp': time.time(),
             'success': True
         })
-
-        logger.info("✓ 面试会话已结束")
-
     except Exception as e:
-        logger.error(f"结束面试错误：{e}", exc_info=True)
-        emit('error', {
-            'error': 'Failed to end interview',
-            'code': 'END_ERROR'
-        })
+        logger.error(f"结束新会话错误：{e}", exc_info=True)
+        _emit_pipeline_error(client_id, runtime.session_id, 'SESSION_END_ERROR', 'Failed to end session', str(e))
+    finally:
+        session_registry.remove(client_id)
 
 
-# ==================== LLM 事件处理 ====================
-
-# ==================== ASR 事件处理 ====================
-
-@socketio.on('start_asr')
-def handle_start_asr(data=None):
-    """启动 ASR 语音识别"""
+@socketio.on('speech_start')
+def handle_speech_start(data=None):
     client_id = request.sid
+    runtime = _get_runtime(client_id, str((data or {}).get('session_id', '')).strip())
+    if not runtime:
+        return
 
-    try:
-        if asr_manager is None:
-            emit('asr_error', {
-                'error': 'ASR is not initialized on server',
-                'code': 'ASR_NOT_READY',
-                'details': asr_import_error
-            })
-            return
-
-        def on_recognition_result(text: str):
-            """识别结果回调"""
-            logger.info(f"[ASR 回调] on_recognition_result 被调用！text='{text}'")
-            logger.info(f"[ASR 回调] 准备发送 asr_result 到前端")
-            # 发送识别结果到客户端
-            socketio.emit('asr_result', {
-                'success': True,
-                'text': text,
-                'timestamp': time.time()
-            }, to=client_id)
-            logger.info(f"[ASR 回调] 已发送 asr_result，准备进入聚合队列")
-            _enqueue_asr_text_for_llm(client_id, text)
-            logger.info(f"[ASR 回调] 已加入聚合队列")
-
-        # 缓存回调，供超时后自动恢复使用
-        asr_client_callbacks[client_id] = on_recognition_result
-
-        # 避免重复 start 导致状态不一致，先停再起
-        if asr_manager.is_available():
-            asr_manager.stop()
-
-        # 启动 ASR
-        success = asr_manager.start(on_recognition_result)
-
-        if success:
-            emit('asr_started', {
-                'success': True,
-                'message': 'ASR 已启动',
-                'timestamp': time.time()
-            })
-            logger.info(f"✓ ASR 已启动 - 客户端：{client_id}")
-        else:
-            emit('asr_error', {
-                'error': 'Failed to start ASR',
-                'code': 'ASR_START_ERROR'
-            })
-
-    except Exception as e:
-        logger.error(f"启动 ASR 错误：{e}", exc_info=True)
-        emit('asr_error', {
-            'error': 'Internal server error',
-            'code': 'SERVER_ERROR',
-            'details': str(e)
-        })
-
-
-@socketio.on('audio_stream')
-def handle_audio_stream(data):
-    """接收音频流并送入 ASR 处理
-
-    参数:
-        data: {
-            'audio': base64 编码的 PCM 音频数据 (16kHz, 16bit, 单声道)
-        }
-    """
-    client_id = request.sid
-
-    try:
-        if asr_manager is None:
-            logger.warning(f"[ASR] ASR 未初始化")
-            return
-
-        if not asr_manager.is_available():
-            # ASR 常见在云端超时后掉线，这里在新音频到达时自动尝试恢复
-            callback = asr_client_callbacks.get(client_id)
-            now = time.time()
-            last_attempt = asr_last_restart_attempt.get(client_id, 0)
-            can_retry = (now - last_attempt) >= ASR_RESTART_COOLDOWN_SECONDS
-
-            if callback and can_retry:
-                asr_last_restart_attempt[client_id] = now
-                logger.warning(f"[ASR] 检测到服务不可用，尝试自动恢复 - 客户端：{client_id}")
-                restart_ok = asr_manager.start(callback)
-                if restart_ok:
-                    socketio.emit('asr_started', {
-                        'success': True,
-                        'message': 'ASR 已自动恢复',
-                        'timestamp': time.time()
-                    }, to=client_id)
-                else:
-                    socketio.emit('asr_error', {
-                        'error': 'ASR auto-restart failed',
-                        'code': 'ASR_RECOVERY_FAILED',
-                        'timestamp': time.time()
-                    }, to=client_id)
-            return
-
-        # 如果 Socket SID 已变化但 ASR 仍在跑旧回调，重绑到当前客户端
-        if client_id not in asr_client_callbacks:
-            logger.warning(f"[ASR] 检测到客户端 SID 变化，重绑回调 - 客户端：{client_id}")
-
-            def on_recognition_result(text: str):
-                logger.info(f"[ASR] 识别结果：{text}")
-                socketio.emit('asr_result', {
-                    'success': True,
-                    'text': text,
-                    'timestamp': time.time()
-                }, to=client_id)
-                _enqueue_asr_text_for_llm(client_id, text)
-
-            asr_client_callbacks[client_id] = on_recognition_result
-            asr_manager.stop()
-            rebind_ok = asr_manager.start(on_recognition_result)
-            if rebind_ok:
-                socketio.emit('asr_started', {
-                    'success': True,
-                    'message': 'ASR 回调已重绑定',
-                    'timestamp': time.time()
-                }, to=client_id)
-            else:
-                socketio.emit('asr_error', {
-                    'error': 'ASR callback rebind failed',
-                    'code': 'ASR_REBIND_FAILED',
-                    'timestamp': time.time()
-                }, to=client_id)
-                return
-
-        if not data or 'audio' not in data:
-            logger.warning(f"[ASR] 数据格式错误：{data}")
-            return
-
-        import base64
-        audio_base64 = data.get('audio', '')
-
-        if audio_base64:
-            # 解码音频数据
-            audio_data = base64.b64decode(audio_base64)
-            # 送入 ASR 处理
-            asr_manager.send_audio(audio_data)
-            logger.debug(f"[ASR] 已发送音频到队列：{len(audio_data)} 字节")
-
-    except Exception as e:
-        logger.error(f"处理音频流错误：{e}", exc_info=True)
-
-
-@socketio.on('stop_asr')
-def handle_stop_asr(data=None):
-    """停止 ASR 语音识别"""
-    client_id = request.sid
-
-    try:
-        asr_client_callbacks.pop(client_id, None)
-        asr_last_restart_attempt.pop(client_id, None)
-        if asr_manager:
-            asr_manager.stop()
-            logger.info(f"✓ ASR 已停止 - 客户端：{client_id}")
-    except Exception as e:
-        logger.error(f"停止 ASR 错误：{e}", exc_info=True)
-
-
-@socketio.on('llm_process_answer')
-@rate_limit(answer_rate_limiter)
-def handle_llm_process_answer(data):
-    """处理用户回答，生成追问
-
-    参数:
-        data: {
-            'user_answer': '用户的回答文本',
-            'current_question': '当前问题',
-            'position': '职位名称',
-            'chat_history': []  # 可选，对话历史
-        }
-    """
-    client_id = request.sid
-
-    try:
-        if llm_manager is None:
-            emit('error', {
-                'error': 'LLM is not initialized on server',
-                'code': 'LLM_NOT_READY',
-                'details': llm_import_error
-            })
-            return
-
-        if not data or 'user_answer' not in data:
-            logger.warning("llm_process_answer - 缺少必要参数")
-            emit('error', {
-                'error': 'Missing required fields: user_answer',
-                'code': 'MISSING_FIELD'
-            })
-            return
-
-        logger.info(f"处理用户回答 - 客户端：{client_id}")
-
-        user_answer = data.get('user_answer', '').strip()
-        current_question = data.get('current_question', '')
-        position = data.get('position', 'unknown')
-        chat_history = data.get('chat_history', [])
-
-        # 发送正在处理的消息
-        emit('llm_processing', {
-            'message': '正在分析你的回答...',
-            'status': 'processing'
-        })
-
-        # 使用当前面试轮次
-        round_type = current_interview_session.get('round_type', 'technical')
-        feedback, analysis_result, followup_decision, next_state, next_question_plan = _generate_policy_response(
-            user_answer=user_answer,
-            current_question=current_question,
-            position=position,
-            round_type=round_type,
-            chat_history=chat_history,
-            difficulty=current_interview_session.get('difficulty', 'medium'),
-            interview_state=current_interview_session.get('interview_state'),
-            question_plan=current_interview_session.get('last_question_plan')
+    if runtime.asr_locked:
+        _log_runtime_event(
+            runtime,
+            'speech_start_ignored',
+            level='debug',
+            requested_turn_id=str((data or {}).get('turn_id', '')).strip(),
+            reason='asr_locked',
+            lock_reason=runtime.asr_lock_reason,
         )
+        return
 
-        if feedback:
-            # 保存对话历史
-            data_manager.add_frame_data({
-                'type': 'interview_dialogue',
-                'question': current_question,
-                'user_answer': user_answer,
-                'llm_feedback': feedback,
-                'rag_analysis': analysis_result,
-                'followup_decision': followup_decision,
-                'timestamp': time.time()
-            })
+    if (
+        asr_manager is not None
+        and runtime.active_asr_generation
+    ):
+        _log_runtime_event(
+            runtime,
+            'speech_start_ignored',
+            level='debug',
+            requested_turn_id=str((data or {}).get('turn_id', '')).strip(),
+            asr_generation=runtime.active_asr_generation,
+            reason='asr_already_running_or_starting',
+        )
+        return
 
-            # 保存对话到数据库
-            db_manager.save_interview_dialogue({
-                'interview_id': f"interview_{int(time.time())}",
-                'round_type': round_type,
-                'question': current_question,
-                'answer': user_answer,
-                'llm_feedback': feedback
-            })
+    runtime.speech_epoch += 1
+    _log_runtime_event(
+        runtime,
+        'speech_start',
+        requested_turn_id=str((data or {}).get('turn_id', '')).strip(),
+        speech_epoch=runtime.speech_epoch,
+    )
+    _interrupt_runtime(runtime, 'speech_start')
+    _cancel_answer_finalize_timer(runtime)
+    answer_session = _ensure_answer_session(runtime)
+    answer_session.last_speech_epoch = runtime.speech_epoch
+    answer_session.mark_status('recording')
+    _emit_answer_session_update(runtime, source='speech_start')
+    _start_runtime_asr(runtime, reason='speech_start')
 
-            # 更新 chat_history
-            current_interview_session['chat_history'].append({
-                'role': 'candidate',
-                'content': user_answer
-            })
-            current_interview_session['chat_history'].append({
-                'role': 'interviewer',
-                'content': feedback
-            })
-            next_action = str((followup_decision or {}).get('next_action', 'ask_followup')).strip()
-            current_interview_session['interview_state'] = next_state
-            if next_action in {'switch_question', 'raise_difficulty'} and next_question_plan:
-                current_interview_session['last_question_plan'] = next_question_plan
-                current_interview_session['last_answer_analysis'] = None
-                if next_action == 'raise_difficulty':
-                    current_interview_session['difficulty'] = (followup_decision or {}).get('difficulty_target', current_interview_session.get('difficulty', 'medium'))
-            else:
-                current_interview_session['last_answer_analysis'] = analysis_result
 
-            # 返回追问和反馈
-            emit('llm_answer', {
-                'success': True,
-                'feedback': feedback,
-                'analysis': analysis_result,
-                'followup_decision': followup_decision,
-                'round': round_type,
-                'timestamp': time.time()
-            })
+@socketio.on('manual_interrupt')
+def handle_manual_interrupt(data=None):
+    client_id = request.sid
+    runtime = _get_runtime(client_id, str((data or {}).get('session_id', '')).strip())
+    if not runtime:
+        return
 
-            _emit_tts_audio(client_id, feedback)
+    _log_runtime_event(runtime, 'manual_interrupt')
+    _interrupt_runtime(runtime, 'manual_interrupt')
 
-            logger.info(f"✓ 已生成追问 - 轮次：{round_type}")
-        else:
-            emit('error', {
-                'error': 'Failed to process answer',
-                'code': 'LLM_ERROR'
-            })
 
+@socketio.on('audio_chunk')
+def handle_audio_chunk(data):
+    client_id = request.sid
+    runtime = _get_runtime(client_id, str((data or {}).get('session_id', '')).strip())
+    if not runtime or asr_manager is None:
+        return
+
+    try:
+        if not data or 'audio' not in data:
+            return
+
+        if runtime.asr_locked:
+            return
+
+        if not runtime.asr_available:
+            return
+
+        if (
+            not runtime.active_asr_generation
+            or not runtime.active_asr_stream_id
+            or not asr_manager.is_available(runtime.active_asr_stream_id)
+        ):
+            return
+
+        audio_base64 = data.get('audio', '')
+        if audio_base64:
+            audio_data = base64.b64decode(audio_base64)
+            answer_session = runtime.current_answer_session
+            if answer_session and answer_session.turn_id == runtime.turn_id and answer_session.status != 'finalized':
+                answer_session.add_audio_chunk(audio_data)
+            asr_manager.send_audio(runtime.active_asr_stream_id, audio_data)
     except Exception as e:
-        logger.error(f"处理回答错误：{e}", exc_info=True)
-        emit('error', {
-            'error': 'Internal server error',
-            'code': 'SERVER_ERROR',
-            'details': str(e)
+        logger.error(f"处理 audio_chunk 错误：{e}", exc_info=True)
+        _emit_pipeline_error(client_id, runtime.session_id, 'AUDIO_CHUNK_ERROR', 'Failed to process audio chunk', str(e))
+
+
+@socketio.on('speech_end')
+def handle_speech_end(data=None):
+    client_id = request.sid
+    runtime = _get_runtime(client_id, str((data or {}).get('session_id', '')).strip())
+    if not runtime:
+        return
+
+    asr_generation, speech_epoch = _finalize_runtime_asr(runtime, reason='speech_end')
+    _finalize_answer_segment(
+        runtime,
+        asr_generation=asr_generation,
+        speech_epoch=speech_epoch,
+        reason='speech_end',
+    )
+    _schedule_answer_session_finalize(
+        runtime,
+        reason='long_pause',
+        asr_generation=asr_generation,
+        speech_epoch=speech_epoch,
+    )
+    state_orchestrator.begin_listening(runtime)
+    _log_runtime_event(
+        runtime,
+        'speech_end',
+        requested_turn_id=str((data or {}).get('turn_id', '')).strip(),
+        asr_generation=asr_generation or '',
+        speech_epoch=speech_epoch or '',
+    )
+    _emit_orchestrator_state(runtime)
+
+
+@socketio.on('utterance_commit')
+def handle_utterance_commit(data=None):
+    client_id = request.sid
+    runtime = _get_runtime(client_id, str((data or {}).get('session_id', '')).strip())
+    if not runtime:
+        return
+
+    turn_id = str((data or {}).get('turn_id', '')).strip() or runtime.turn_id
+    text_override = str((data or {}).get('text', '')).strip()
+    source = str((data or {}).get('source', 'asr')).strip() or 'asr'
+
+    if source == 'asr' and not text_override:
+        _cancel_answer_finalize_timer(runtime)
+        _finalize_answer_session(runtime, reason='utterance_commit')
+        return
+
+    if source == 'manual':
+        _cancel_answer_finalize_timer(runtime)
+        manual_asr_generation = 0
+        if runtime.active_asr_generation:
+            manual_asr_generation, _ = _finalize_runtime_asr(runtime, reason='manual_submit')
+            _consume_runtime_segment_text(runtime, asr_generation=manual_asr_generation)
+        _set_runtime_asr_lock(runtime, True, 'manual_submit')
+        answer_session = runtime.current_answer_session
+        if answer_session and answer_session.turn_id == turn_id and not answer_session.committed:
+            answer_session.mark_final(text_override or answer_session.merged_text_draft, reason='manual_submit')
+            answer_session.committed = True
+            _emit_answer_session_update(runtime, source='manual_commit')
+        _emit_orchestrator_state(runtime)
+
+    asr_generation = runtime.last_finalized_asr_generation if source == 'asr' and not text_override else 0
+    _log_runtime_event(
+        runtime,
+        'utterance_commit_request',
+        source=source,
+        requested_turn_id=turn_id,
+        has_text=bool(text_override),
+        asr_generation=asr_generation or '',
+    )
+    _schedule_runtime_commit(
+        runtime,
+        turn_id,
+        source,
+        text_override=text_override,
+        asr_generation=asr_generation,
+    )
+
+
+@socketio.on('detection_state')
+def handle_detection_state(data=None):
+    client_id = request.sid
+    runtime = _get_runtime(client_id, str((data or {}).get('session_id', '')).strip())
+    if not runtime:
+        return
+
+    payload = dict(data or {})
+    _log_runtime_event(
+        runtime,
+        'detection_state',
+        level='debug',
+        risk_level=payload.get('risk_level'),
+        risk_score=payload.get('risk_score'),
+        flags=','.join(payload.get('flags', []) or []),
+    )
+    notice_text = state_orchestrator.update_detection_state(runtime, payload)
+    if runtime.data_manager:
+        runtime.data_manager.add_frame_data({
+            'type': 'detection_state',
+            'probability': float(payload.get('risk_score', 0) or 0),
+            'risk_level': payload.get('risk_level', 'LOW'),
+            'has_face': payload.get('has_face', True),
+            'face_count': payload.get('face_count', 1),
+            'off_screen_ratio': payload.get('off_screen_ratio', 0),
+            'flags': payload.get('flags', []),
+            'timestamp': time.time()
         })
+
+    _emit_orchestrator_state(runtime)
+
+    if notice_text:
+        _maybe_emit_session_notice(runtime)
 
 
 @socketio.on('llm_generate_question')
 @rate_limit(interview_rate_limiter)
 def handle_llm_generate_question(data):
-    """生成面试问题
-
-    参数:
-        data: {
-            'position': '职位名称',
-            'difficulty': 'easy' | 'medium' | 'hard',
-            'context': '上下文信息（可选）'
-        }
-    """
     client_id = request.sid
 
     try:
@@ -1247,36 +1898,34 @@ def handle_llm_generate_question(data):
             })
             return
 
-        if not data or 'position' not in data:
-            logger.warning("llm_generate_question - 缺少职位信息")
+        runtime = _get_runtime(client_id, str((data or {}).get('session_id', '')).strip())
+        if not runtime:
             emit('error', {
-                'error': 'Missing required field: position',
-                'code': 'MISSING_FIELD'
+                'error': 'Session runtime not found',
+                'code': 'SESSION_NOT_FOUND'
             })
             return
 
-        position = data.get('position', '')
-        difficulty = data.get('difficulty', 'medium')
-        context = data.get('context', '')
-        round_type = current_interview_session.get('round_type', 'technical')
+        position = str((data or {}).get('position', runtime.position)).strip() or runtime.position
+        difficulty = str((data or {}).get('difficulty', runtime.difficulty)).strip() or runtime.difficulty
+        context = str((data or {}).get('context', '')).strip()
+        round_type = runtime.round_type
         rag_context, question_plan = _build_question_rag_context(
             position=position,
             difficulty=difficulty,
             round_type=round_type,
             context=context,
-            interview_state=current_interview_session.get('interview_state')
+            interview_state=runtime.interview_state
         )
-        current_interview_session['last_question_plan'] = question_plan
+        runtime.last_question_plan = question_plan
 
-        logger.info(f"生成面试问题 - 职位：{position}, 难度：{difficulty}")
+        _log_runtime_event(runtime, 'llm_generate_question', position=position, difficulty=difficulty)
 
-        # 发送正在生成的消息
         emit('llm_generating', {
             'message': '正在生成问题...',
             'status': 'generating'
         })
 
-        # 调用 LLM 生成问题
         question = llm_manager.generate_interview_question(
             position=position,
             difficulty=difficulty,
@@ -1286,30 +1935,30 @@ def handle_llm_generate_question(data):
 
         if question:
             if question_plan and rag_service is not None and getattr(rag_service, 'enabled', False):
-                current_interview_session['interview_state'] = rag_service.mark_question_asked(
-                    current_interview_session.get('interview_state'),
+                runtime.interview_state = rag_service.mark_question_asked(
+                    runtime.interview_state,
                     question_plan
                 )
-                current_interview_session['last_answer_analysis'] = None
-            # 保存问题
-            data_manager.add_frame_data({
-                'type': 'interview_question',
-                'question': question,
-                'position': position,
-                'difficulty': difficulty,
-                'timestamp': time.time()
-            })
+                runtime.last_answer_analysis = None
+            if runtime.data_manager:
+                runtime.data_manager.add_frame_data({
+                    'type': 'interview_question',
+                    'question': question,
+                    'position': position,
+                    'difficulty': difficulty,
+                    'timestamp': time.time()
+                })
 
-            # 返回生成的问题
             emit('llm_question', {
                 'success': True,
+                'session_id': runtime.session_id,
                 'question': question,
                 'position': position,
                 'difficulty': difficulty,
                 'timestamp': time.time()
             })
 
-            logger.info(f"✓ 已生成问题")
+            _log_runtime_event(runtime, 'llm_question_emitted', question_preview=question[:160], position=position, difficulty=difficulty)
         else:
             emit('error', {
                 'error': 'Failed to generate question',
@@ -1328,15 +1977,6 @@ def handle_llm_generate_question(data):
 @socketio.on('llm_evaluate_answer')
 @rate_limit(answer_rate_limiter)
 def handle_llm_evaluate_answer(data):
-    """评估用户回答质量
-
-    参数:
-        data: {
-            'user_answer': '用户回答',
-            'question': '问题内容',
-            'position': '职位名称'
-        }
-    """
     client_id = request.sid
 
     try:
@@ -1348,30 +1988,35 @@ def handle_llm_evaluate_answer(data):
             })
             return
 
-        if not data or 'user_answer' not in data:
+        runtime = _get_runtime(client_id, str((data or {}).get('session_id', '')).strip())
+        if not runtime:
+            emit('error', {
+                'error': 'Session runtime not found',
+                'code': 'SESSION_NOT_FOUND'
+            })
+            return
+
+        user_answer = str((data or {}).get('user_answer', '')).strip()
+        if not user_answer:
             emit('error', {
                 'error': 'Missing required fields',
                 'code': 'MISSING_FIELD'
             })
             return
-
-        user_answer = data.get('user_answer', '').strip()
-        question = data.get('question', '')
-        position = data.get('position', 'unknown')
-        round_type = current_interview_session.get('round_type', 'technical')
+        question = str((data or {}).get('question', runtime.current_question)).strip() or runtime.current_question
+        position = str((data or {}).get('position', runtime.position)).strip() or runtime.position
+        round_type = runtime.round_type
         question_id = str(data.get('question_id', '')).strip() or _extract_question_id_from_plan(
-            current_interview_session.get('last_question_plan')
+            runtime.last_question_plan
         )
 
-        logger.info(f"评估用户回答 - 职位：{position}")
+        _log_runtime_event(runtime, 'llm_evaluate_answer', question_preview=question[:120], answer_preview=user_answer[:120])
 
-        # 发送正在评估的消息
         emit('llm_evaluating', {
             'message': '正在评估回答质量...',
             'status': 'evaluating'
         })
 
-        # 调用 LLM 评估回答
         evaluation = llm_manager.evaluate_answer(
             user_answer=user_answer,
             question=question,
@@ -1383,20 +2028,20 @@ def handle_llm_evaluate_answer(data):
             analysis_result = rag_service.analyze_answer(
                 question_id=question_id,
                 candidate_answer=user_answer,
-                session_state=current_interview_session.get('interview_state'),
+                session_state=runtime.interview_state,
                 current_question=question,
                 position=position,
                 round_type=round_type
             )
-            current_interview_session['last_answer_analysis'] = analysis_result
-            current_interview_session['interview_state'] = rag_service.update_interview_state_from_analysis(
-                current_interview_session.get('interview_state'),
+            runtime.last_answer_analysis = analysis_result
+            runtime.interview_state = rag_service.update_interview_state_from_analysis(
+                runtime.interview_state,
                 analysis_result
             )
             followup_decision = rag_service.decide_followup(
                 question_id=question_id,
                 analysis_result=analysis_result,
-                session_state=current_interview_session.get('interview_state')
+                session_state=runtime.interview_state
             )
             evaluation = {
                 **(evaluation or {}),
@@ -1404,27 +2049,27 @@ def handle_llm_evaluate_answer(data):
                 'followup_decision': followup_decision
             }
 
-        # 保存评估结果
-        data_manager.add_frame_data({
-            'type': 'answer_evaluation',
-            'question': question,
-            'answer': user_answer,
-            'evaluation': evaluation,
-            'rag_analysis': analysis_result,
-            'followup_decision': followup_decision,
-            'timestamp': time.time()
-        })
+        if runtime.data_manager:
+            runtime.data_manager.add_frame_data({
+                'type': 'answer_evaluation',
+                'question': question,
+                'answer': user_answer,
+                'evaluation': evaluation,
+                'rag_analysis': analysis_result,
+                'followup_decision': followup_decision,
+                'timestamp': time.time()
+            })
 
-        # 返回评估结果
         emit('llm_evaluation', {
             'success': True,
+            'session_id': runtime.session_id,
             'evaluation': evaluation,
             'analysis': analysis_result,
             'followup_decision': followup_decision,
             'timestamp': time.time()
         })
 
-        logger.info(f"✓ 已完成评估")
+        _log_runtime_event(runtime, 'llm_evaluation_emitted', question_preview=question[:120], answer_preview=user_answer[:120])
 
     except Exception as e:
         logger.error(f"评估回答错误：{e}", exc_info=True)

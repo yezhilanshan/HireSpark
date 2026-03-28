@@ -27,8 +27,22 @@ class AudioProcessor extends AudioWorkletProcessor {
         this.buffer[this.bufferIndex++] = s < 0 ? s * 0x8000 : s * 0x7FFF
 
         if (this.bufferIndex >= this.buffer.length) {
-            const bytes = new Uint8Array(this.buffer.buffer)
-            this.port.postMessage(bytes.slice(0).buffer)
+            let energy = 0
+            for (let i = 0; i < this.buffer.length; i++) {
+                const normalized = this.buffer[i] / 0x7FFF
+                energy += normalized * normalized
+            }
+            const rms = Math.sqrt(energy / this.buffer.length)
+            const pcmBuffer = new ArrayBuffer(this.buffer.length * 2)
+            const view = new DataView(pcmBuffer)
+            for (let i = 0; i < this.buffer.length; i++) {
+                view.setInt16(i * 2, this.buffer[i], true)
+            }
+            this.port.postMessage({
+                type: 'audio-chunk',
+                audio: pcmBuffer,
+                rms
+            })
             this.bufferIndex = 0
         }
     }
@@ -43,13 +57,18 @@ class AudioProcessor extends AudioWorkletProcessor {
             this.pendingInput.push(channelData[i])
         }
 
-        while (this.resampleOffset + this.resampleRatio <= this.pendingInput.length) {
+        while (this.resampleOffset + this.resampleRatio <= this.pendingInput.length - 1) {
             const index = Math.floor(this.resampleOffset)
-            this.pushSample(this.pendingInput[index])
+            const nextIndex = index + 1
+            const fraction = this.resampleOffset - index
+            const current = this.pendingInput[index]
+            const next = this.pendingInput[nextIndex]
+            const sample = current + (next - current) * fraction
+            this.pushSample(sample)
             this.resampleOffset += this.resampleRatio
         }
 
-        const consumed = Math.floor(this.resampleOffset)
+        const consumed = Math.max(0, Math.floor(this.resampleOffset) - 1)
         if (consumed > 0) {
             this.pendingInput = this.pendingInput.slice(consumed)
             this.resampleOffset -= consumed

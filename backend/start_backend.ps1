@@ -3,6 +3,8 @@
 
 $ErrorActionPreference = "Stop"
 
+$BackendEnv = if ($env:BACKEND_CONDA_ENV) { $env:BACKEND_CONDA_ENV } else { "interview" }
+
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host "面试防作弊监控系统 - 后端服务启动脚本" -ForegroundColor Cyan
 Write-Host "============================================================" -ForegroundColor Cyan
@@ -12,17 +14,18 @@ Write-Host ""
 $BackendPath = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $BackendPath
 Write-Host "工作目录: $BackendPath" -ForegroundColor Gray
+Write-Host "Conda 环境: $BackendEnv" -ForegroundColor Gray
 Write-Host ""
 
 # 检查虚拟环境
 Write-Host "[1/4] 检查虚拟环境..." -ForegroundColor Yellow
 try {
-    $condaEnvs = conda env list 2>$null | Select-String "interview-anti-cheat"
+    $condaEnvs = conda env list 2>$null | Select-String $BackendEnv
     if ($condaEnvs) {
         Write-Host "✓ 虚拟环境已存在" -ForegroundColor Green
     } else {
         Write-Host "✗ 虚拟环境不存在" -ForegroundColor Red
-        Write-Host "请先运行: conda create -n interview-anti-cheat python=3.9" -ForegroundColor Yellow
+        Write-Host "请先运行: conda create -n $BackendEnv python=3.10" -ForegroundColor Yellow
         pause
         exit 1
     }
@@ -46,12 +49,12 @@ if (Test-Path "config.yaml") {
 # 检查依赖
 Write-Host ""
 Write-Host "[3/4] 检查依赖..." -ForegroundColor Yellow
-$checkDeps = conda run -n interview-anti-cheat python -c "import flask, flask_socketio, cv2, mediapipe, psutil, yaml" 2>&1
+$checkDeps = conda run -n $BackendEnv python -c "import flask, flask_socketio, cv2, mediapipe, psutil, yaml" 2>&1
 if ($LASTEXITCODE -eq 0) {
     Write-Host "✓ 所有依赖已安装" -ForegroundColor Green
 } else {
     Write-Host "! 部分依赖缺失，正在安装..." -ForegroundColor Yellow
-    conda run -n interview-anti-cheat pip install -r requirements.txt
+    conda run -n $BackendEnv pip install -r requirements.txt
     if ($LASTEXITCODE -eq 0) {
         Write-Host "✓ 依赖安装完成" -ForegroundColor Green
     } else {
@@ -74,7 +77,7 @@ Write-Host "============================================================" -Foreg
 Write-Host ""
 
 # 启动
-conda run -n interview-anti-cheat python app.py
+conda run -n $BackendEnv python app.py
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host ""
