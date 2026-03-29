@@ -40,7 +40,7 @@ class LoggerManager:
             log_config = config.get_logging_config()
             
             if not log_config.get('enabled', True):
-                print("⚠ 日志系统已禁用")
+                print("[WARN] 日志系统已禁用")
                 return
             
             # 创建日志目录
@@ -49,12 +49,12 @@ class LoggerManager:
                 log_dir = os.path.dirname(log_file)
                 if log_dir and not os.path.exists(log_dir):
                     os.makedirs(log_dir)
-                    print(f"✓ 创建日志目录: {log_dir}")
+                    print(f"[OK] 创建日志目录: {log_dir}")
             
-            print("✓ 日志系统初始化完成")
+            print("[OK] 日志系统初始化完成")
             
         except Exception as e:
-            print(f"✗ 日志系统初始化失败: {e}")
+            print(f"[ERROR] 日志系统初始化失败: {e}")
     
     def get_logger(self, name: str = 'interview_system') -> logging.Logger:
         """
@@ -124,7 +124,7 @@ class LoggerManager:
                 file_handler.setFormatter(formatter)
                 logger.addHandler(file_handler)
             except Exception as e:
-                print(f"✗ 创建文件日志处理器失败: {e}")
+                print(f"[ERROR] 创建文件日志处理器失败: {e}")
         
         # 缓存 logger
         self._loggers[name] = logger
@@ -342,5 +342,5 @@ if __name__ == '__main__':
     log_configuration()
     
     print("\n" + "=" * 60)
-    print("✓ 日志系统测试完成")
+    print("[OK] 日志系统测试完成")
     print("=" * 60)
