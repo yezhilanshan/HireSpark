@@ -98,6 +98,11 @@ uploads/
 # ====================================
 .chroma/
 chroma_db/
+backend/rag_data/
+
+# Backend generated outputs
+backend/logs/
+backend/reports/
 
 
 # Claude / local config

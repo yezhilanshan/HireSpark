@@ -91,7 +91,7 @@ class ConfigLoader:
             with open(config_path, 'r', encoding='utf-8') as f:
                 self._config = yaml.safe_load(f)
                 self._config_file = config_path
-                print(f"✓ 配置文件已加载: {config_path}")
+                print(f"[OK] 配置文件已加载: {config_path}")
         except yaml.YAMLError as e:
             raise ValueError(f"配置文件格式错误: {e}")
         except Exception as e:
@@ -264,7 +264,7 @@ class ConfigLoader:
                     allow_unicode=True,
                     sort_keys=False
                 )
-            print(f"✓ 配置已保存到: {output_path}")
+            print(f"[OK] 配置已保存到: {output_path}")
         except Exception as e:
             raise RuntimeError(f"保存配置文件失败: {e}")
     
@@ -375,9 +375,9 @@ if __name__ == '__main__':
         # 验证配置
         is_valid, errors = cfg.validate_config()
         if is_valid:
-            print("✓ 配置验证通过")
+            print("[OK] 配置验证通过")
         else:
-            print("✗ 配置验证失败:")
+            print("[ERROR] 配置验证失败:")
             for error in errors:
                 print(f"  - {error}")
         
@@ -402,9 +402,9 @@ if __name__ == '__main__':
         cfg.print_config('detection')
         
         print("=" * 60)
-        print("✓ 配置加载器测试完成")
+        print("[OK] 配置加载器测试完成")
         
     except Exception as e:
-        print(f"✗ 测试失败: {e}")
+        print(f"[ERROR] 测试失败: {e}")
         import traceback
         traceback.print_exc()

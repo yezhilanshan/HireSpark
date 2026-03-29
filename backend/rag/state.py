@@ -19,6 +19,9 @@ class InterviewState:
     asked_question_ids: List[str] = field(default_factory=list)
     covered_competencies: List[str] = field(default_factory=list)
     weak_competencies: List[str] = field(default_factory=list)
+    resume_skills: List[str] = field(default_factory=list)
+    resume_projects: List[str] = field(default_factory=list)
+    resume_keywords: List[str] = field(default_factory=list)
     current_topic: Optional[str] = None
     followup_depth: int = 0
     round_goal_progress: float = 0.0
@@ -49,6 +52,21 @@ class InterviewState:
             weak_competencies=[
                 str(item).strip()
                 for item in payload.get("weak_competencies", []) or []
+                if str(item).strip()
+            ],
+            resume_skills=[
+                str(item).strip()
+                for item in payload.get("resume_skills", []) or []
+                if str(item).strip()
+            ],
+            resume_projects=[
+                str(item).strip()
+                for item in payload.get("resume_projects", []) or []
+                if str(item).strip()
+            ],
+            resume_keywords=[
+                str(item).strip()
+                for item in payload.get("resume_keywords", []) or []
                 if str(item).strip()
             ],
             current_topic=str(payload.get("current_topic")).strip()

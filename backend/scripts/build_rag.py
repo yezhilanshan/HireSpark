@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build the interview RAG index.")
     parser.add_argument(
         "--source",
-        help="Optional path to a JSON/JSONL knowledge file. Defaults to rag.knowledge_path."
+        help="Optional path to a JSON/JSONL/Markdown file or a directory containing them. Defaults to rag.knowledge_path."
     )
     parser.add_argument(
         "--rebuild",
@@ -32,6 +32,26 @@ def parse_args() -> argparse.Namespace:
         help="Clear the persisted index before rebuilding."
     )
     return parser.parse_args()
+
+
+def resolve_source_path(source: str | None) -> str | None:
+    if not source:
+        return None
+
+    raw = Path(source)
+    if raw.is_absolute():
+        return str(raw)
+
+    candidates = [
+        Path.cwd() / raw,
+        BACKEND_ROOT / raw,
+        PROJECT_ROOT / raw,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate.resolve())
+
+    return str((PROJECT_ROOT / raw).resolve())
 
 
 def main() -> int:
@@ -42,7 +62,8 @@ def main() -> int:
         return 1
 
     try:
-        count = rag_service.build_index(source_path=args.source, rebuild=args.rebuild)
+        source_path = resolve_source_path(args.source)
+        count = rag_service.build_index(source_path=source_path, rebuild=args.rebuild)
     except Exception as exc:
         print(f"Failed to build RAG index: {exc}")
         return 2

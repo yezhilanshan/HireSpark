@@ -172,6 +172,18 @@ class RAGService:
 
     def _load_records(self, source_path: Optional[str] = None) -> List[Dict[str, Any]]:
         path = Path(source_path or self.knowledge_path)
+        if path.is_dir():
+            records: List[Dict[str, Any]] = []
+            supported_files = [
+                item for item in sorted(path.iterdir())
+                if item.is_file() and item.suffix.lower() in {".json", ".jsonl", ".md"}
+            ]
+            if not supported_files:
+                raise FileNotFoundError(f"知识库目录中没有可用文件: {path}")
+            for item in supported_files:
+                records.extend(self._load_records_from_file(item))
+            return records
+
         if not path.exists():
             fallback_candidates = [
                 path.with_name("llm_questions_v2.json"),
@@ -188,6 +200,13 @@ class RAGService:
                     f"知识库文件不存在: {path}。可用候选: "
                     + ", ".join(str(candidate) for candidate in fallback_candidates)
                 )
+
+        return self._load_records_from_file(path)
+
+    def _load_records_from_file(self, path: Path) -> List[Dict[str, Any]]:
+        suffix = path.suffix.lower()
+        if suffix == ".md":
+            return self._load_markdown_records(path)
 
         if path.suffix.lower() == ".jsonl":
             records: List[Dict[str, Any]] = []
@@ -210,6 +229,35 @@ class RAGService:
                 if isinstance(value, list):
                     return value
         raise ValueError(f"无法识别的知识库数据格式: {path}")
+
+    @staticmethod
+    def _load_markdown_records(path: Path) -> List[Dict[str, Any]]:
+        text = path.read_text(encoding="utf-8")
+        decoder = json.JSONDecoder()
+        records: List[Dict[str, Any]] = []
+        cursor = 0
+
+        while cursor < len(text):
+            start = text.find("{", cursor)
+            if start == -1:
+                break
+
+            try:
+                record, offset = decoder.raw_decode(text[start:])
+            except json.JSONDecodeError:
+                cursor = start + 1
+                continue
+
+            if isinstance(record, dict):
+                records.append(record)
+            elif isinstance(record, list):
+                records.extend(item for item in record if isinstance(item, dict))
+
+            cursor = start + offset
+
+        if not records:
+            raise ValueError(f"Markdown 文件中未解析到 JSON 记录: {path}")
+        return records
 
     def _normalize_record(self, raw: Dict[str, Any], index: int) -> Dict[str, Any]:
         record_id = str(raw.get("id") or f"rag_{index:04d}")
@@ -391,6 +439,125 @@ class RAGService:
             state.target_difficulty = difficulty
         return state
 
+    @staticmethod
+    def _dedupe_terms(values: List[Any], limit: int) -> List[str]:
+        terms: List[str] = []
+        seen = set()
+        for value in values:
+            text = str(value or "").strip()
+            if len(text) < 2:
+                continue
+            normalized = re.sub(r"\s+", "", text).lower()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            terms.append(text)
+            if len(terms) >= limit:
+                break
+        return terms
+
+    def _extract_resume_hints(self, resume_data: Optional[Dict[str, Any]]) -> Dict[str, List[str]]:
+        if not isinstance(resume_data, dict):
+            return {"skills": [], "projects": [], "keywords": []}
+
+        raw_skills = resume_data.get("skills", []) or []
+        raw_projects = resume_data.get("projects", []) or []
+        raw_experiences = resume_data.get("experiences", []) or []
+
+        skills = self._dedupe_terms(raw_skills, limit=8)
+
+        project_names: List[str] = []
+        project_terms: List[str] = []
+        for project in raw_projects[:4]:
+            if not isinstance(project, dict):
+                continue
+            project_names.append(project.get("name", ""))
+            project_terms.extend(project.get("technologies", []) or [])
+
+        experience_terms: List[str] = []
+        for experience in raw_experiences[:3]:
+            if not isinstance(experience, dict):
+                continue
+            experience_terms.append(experience.get("position", ""))
+
+        projects = self._dedupe_terms(project_names, limit=4)
+        keywords = self._dedupe_terms(project_terms + skills + experience_terms + projects, limit=10)
+        return {
+            "skills": skills,
+            "projects": projects,
+            "keywords": keywords,
+        }
+
+    def attach_resume_to_state(
+        self,
+        session_state: Optional[Any],
+        resume_data: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        state = self._coerce_interview_state(session_state)
+        hints = self._extract_resume_hints(resume_data)
+        state.resume_skills = hints["skills"]
+        state.resume_projects = hints["projects"]
+        state.resume_keywords = hints["keywords"]
+        return state.to_dict()
+
+    def _get_resume_weight_profile(self, round_type: str) -> Dict[str, Any]:
+        normalized = str(round_type or "technical").strip().lower()
+        profiles = {
+            "project": {
+                "project_limit": 3,
+                "keyword_limit": 4,
+                "skill_limit": 2,
+                "base_hit_boost": 0.08,
+                "max_hit_boost": 0.32,
+                "project_bonus": 0.10,
+                "skill_bonus": 0.04,
+                "enabled": True,
+            },
+            "system_design": {
+                "project_limit": 2,
+                "keyword_limit": 3,
+                "skill_limit": 2,
+                "base_hit_boost": 0.05,
+                "max_hit_boost": 0.22,
+                "project_bonus": 0.06,
+                "skill_bonus": 0.03,
+                "enabled": True,
+            },
+            "technical": {
+                "project_limit": 1,
+                "keyword_limit": 3,
+                "skill_limit": 3,
+                "base_hit_boost": 0.04,
+                "max_hit_boost": 0.18,
+                "project_bonus": 0.02,
+                "skill_bonus": 0.05,
+                "enabled": True,
+            },
+            "hr": {
+                "project_limit": 0,
+                "keyword_limit": 0,
+                "skill_limit": 0,
+                "base_hit_boost": 0.0,
+                "max_hit_boost": 0.0,
+                "project_bonus": 0.0,
+                "skill_bonus": 0.0,
+                "enabled": False,
+            },
+        }
+        return profiles.get(normalized, profiles["technical"])
+
+    def _select_resume_query_terms(self, state: InterviewState) -> List[str]:
+        profile = self._get_resume_weight_profile(state.target_round_type)
+        if not profile.get("enabled", True):
+            return []
+
+        candidates = (
+            state.resume_projects[: profile["project_limit"]]
+            + state.resume_keywords[: profile["keyword_limit"]]
+            + state.resume_skills[: profile["skill_limit"]]
+        )
+        return self._dedupe_terms(candidates, limit=6)
+
     def _build_question_query(
         self,
         state: InterviewState,
@@ -404,6 +571,7 @@ class RAGService:
         if state.current_topic:
             query_parts.append(state.current_topic)
         query_parts.extend(state.weak_competencies[:3])
+        query_parts.extend(self._select_resume_query_terms(state))
         if context:
             query_parts.append(context)
         return " ".join(part for part in query_parts if part)
@@ -433,6 +601,37 @@ class RAGService:
         if current_topic and item_topic and current_topic == item_topic:
             score += 0.04
 
+        resume_terms = self._select_resume_query_terms(state)
+        resume_profile = self._get_resume_weight_profile(state.target_round_type)
+        if resume_terms:
+            haystack = re.sub(
+                r"\s+",
+                "",
+                " ".join([
+                    str(item.get("question", "")).strip(),
+                    str(metadata.get("category", "")).strip(),
+                    str(metadata.get("subcategory", "")).strip(),
+                    " ".join(str(entry) for entry in metadata.get("keywords", []) or []),
+                ]).lower(),
+            )
+            resume_hits = [
+                term for term in resume_terms
+                if re.sub(r"\s+", "", str(term).lower()) in haystack
+            ]
+            if resume_hits:
+                score += min(
+                    len(resume_hits) * float(resume_profile.get("base_hit_boost", 0.0)),
+                    float(resume_profile.get("max_hit_boost", 0.0)),
+                )
+                if any(
+                    term in set(state.resume_projects) for term in resume_hits
+                ) and float(resume_profile.get("project_bonus", 0.0)) > 0:
+                    score += float(resume_profile.get("project_bonus", 0.0))
+                if any(
+                    term in set(state.resume_skills) for term in resume_hits
+                ) and float(resume_profile.get("skill_bonus", 0.0)) > 0:
+                    score += float(resume_profile.get("skill_bonus", 0.0))
+
         return round(score, 4)
 
     def get_next_question(
@@ -452,6 +651,7 @@ class RAGService:
             }
 
         query = self._build_question_query(state, context=context)
+        resume_focus_terms = self._select_resume_query_terms(state)
         candidate_limit = max((top_k or self.max_context_results) * 3, self.top_k)
         items = self.retrieve_questions(
             query=query,
@@ -500,6 +700,8 @@ class RAGService:
             reason = "优先补齐未覆盖能力，并避开本轮已问题目"
             if state.current_topic:
                 reason += f"，当前主题延续为 {state.current_topic}"
+            if resume_focus_terms:
+                reason += f"，并参考简历线索 {', '.join(resume_focus_terms[:3])}"
         else:
             reason = "未找到满足条件的新题目候选"
 
@@ -507,6 +709,7 @@ class RAGService:
             "target_competency": target_competency[:2],
             "round_type": state.target_round_type,
             "difficulty_target": state.target_difficulty,
+            "resume_focus_terms": resume_focus_terms[:4],
             "candidate_questions": candidate_questions,
             "selection_reason": reason,
         }
@@ -523,6 +726,9 @@ class RAGService:
         target_competency = question_plan.get("target_competency") or []
         if target_competency:
             parts.append(f"目标能力：{', '.join(str(item) for item in target_competency)}")
+        resume_focus_terms = question_plan.get("resume_focus_terms") or []
+        if resume_focus_terms:
+            parts.append(f"简历线索：{', '.join(str(item) for item in resume_focus_terms[:4])}")
         selection_reason = str(question_plan.get("selection_reason", "")).strip()
         if selection_reason:
             parts.append(f"选择依据：{selection_reason}")

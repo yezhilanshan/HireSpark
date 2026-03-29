@@ -1764,6 +1764,11 @@ def handle_session_start(data=None):
                 difficulty=difficulty,
                 session_id=session_id
             )
+            if runtime.resume_data:
+                runtime.interview_state = rag_service.attach_resume_to_state(
+                    runtime.interview_state,
+                    runtime.resume_data
+                )
 
         _emit_orchestrator_state(runtime)
 

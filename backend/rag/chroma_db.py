@@ -160,18 +160,13 @@ class KnowledgeStore:
     def _build_question_dense_text(question: Dict[str, Any]) -> str:
         competency = ", ".join(str(item) for item in question.get("competency", []) if item)
         keywords = ", ".join(str(item) for item in question.get("keywords", []) if item)
-        tags = ", ".join(str(item) for item in question.get("tags", []) if item)
+        category = str(question.get("category", "")).strip()
+        subcategory = str(question.get("subcategory", "")).strip()
         parts = [
-            f"岗位：{question.get('role', '')}",
             f"题目：{question.get('question', '')}",
-            f"类别：{question.get('category', '')} / {question.get('subcategory', '')}",
-            f"能力点：{competency}",
-            f"难度：{question.get('difficulty', '')}",
-            f"题型：{question.get('question_type', '')}",
-            f"轮次：{question.get('round_type', 'technical')}",
-            f"意图：{question.get('question_intent', 'screening')}",
+            f"场景：{subcategory or category}",
             f"关键词：{keywords}",
-            f"标签：{tags}",
+            f"考察能力：{competency}",
         ]
         return "。".join(part for part in parts if part and not part.endswith("："))
 
