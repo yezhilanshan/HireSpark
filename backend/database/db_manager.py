@@ -171,6 +171,109 @@ class DatabaseManager:
                 CREATE INDEX IF NOT EXISTS idx_interview_dialogues_interview_id
                 ON interview_dialogues(interview_id)
             ''')
+
+            # 语音表达评估明细表（整题终稿 + 对齐后指标）
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS speech_evaluations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    interview_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    answer_session_id TEXT,
+                    round_type TEXT,
+                    final_transcript TEXT,
+                    word_timestamps_json TEXT,
+                    pause_events_json TEXT,
+                    filler_events_json TEXT,
+                    speech_metrics_final_json TEXT,
+                    realtime_metrics_json TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(interview_id, turn_id),
+                    FOREIGN KEY (interview_id) REFERENCES interviews(interview_id)
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_speech_evaluations_interview_id
+                ON speech_evaluations(interview_id)
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_speech_evaluations_created_at
+                ON speech_evaluations(created_at)
+            ''')
+
+            # 三层评价结果表（支持版本化、幂等与聚合统计）
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS interview_evaluations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    interview_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    question_id TEXT,
+                    user_id TEXT,
+                    round_type TEXT NOT NULL,
+                    position TEXT,
+                    question TEXT,
+                    answer TEXT,
+                    evaluation_version TEXT NOT NULL DEFAULT 'v1',
+                    rubric_version TEXT NOT NULL DEFAULT 'unknown',
+                    prompt_version TEXT NOT NULL DEFAULT 'v1',
+                    llm_model TEXT NOT NULL DEFAULT '',
+                    eval_task_key TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    layer1_json TEXT,
+                    layer2_json TEXT,
+                    rubric_level TEXT,
+                    overall_score REAL,
+                    confidence REAL,
+                    technical_accuracy_score REAL,
+                    knowledge_depth_score REAL,
+                    completeness_score REAL,
+                    logic_score REAL,
+                    job_match_score REAL,
+                    authenticity_score REAL,
+                    ownership_score REAL,
+                    technical_depth_score REAL,
+                    reflection_score REAL,
+                    architecture_reasoning_score REAL,
+                    tradeoff_awareness_score REAL,
+                    scalability_score REAL,
+                    clarity_score REAL,
+                    relevance_score REAL,
+                    self_awareness_score REAL,
+                    communication_score REAL,
+                    retry_count_layer1 INTEGER DEFAULT 0,
+                    retry_count_layer2 INTEGER DEFAULT 0,
+                    retry_count_persist INTEGER DEFAULT 0,
+                    error_code TEXT,
+                    error_message TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(interview_id, turn_id, evaluation_version),
+                    UNIQUE(eval_task_key),
+                    FOREIGN KEY (interview_id) REFERENCES interviews(interview_id)
+                )
+            ''')
+
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_interview_evaluations_round_type
+                ON interview_evaluations(round_type)
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_interview_evaluations_position
+                ON interview_evaluations(position)
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_interview_evaluations_rubric_level
+                ON interview_evaluations(rubric_level)
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_interview_evaluations_overall_score
+                ON interview_evaluations(overall_score)
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_interview_evaluations_created_at
+                ON interview_evaluations(created_at)
+            ''')
             
             conn.commit()
             conn.close()
@@ -1340,6 +1443,222 @@ class DatabaseManager:
         except Exception as e:
             print(f"✗ 查询面试对话失败：{e}")
             return []
+
+    def save_or_update_speech_evaluation(self, payload):
+        """
+        保存或更新整题语音表达评估结果（interview_id + turn_id 幂等）。
+        """
+        columns = [
+            'interview_id',
+            'turn_id',
+            'answer_session_id',
+            'round_type',
+            'final_transcript',
+            'word_timestamps_json',
+            'pause_events_json',
+            'filler_events_json',
+            'speech_metrics_final_json',
+            'realtime_metrics_json',
+        ]
+        values = [payload.get(col) for col in columns]
+        placeholders = ', '.join(['?'] * len(columns))
+        update_cols = [col for col in columns if col not in ('interview_id', 'turn_id')]
+        update_set = ', '.join([f"{col}=excluded.{col}" for col in update_cols] + ["updated_at=CURRENT_TIMESTAMP"])
+
+        sql = f'''
+            INSERT INTO speech_evaluations ({', '.join(columns)})
+            VALUES ({placeholders})
+            ON CONFLICT(interview_id, turn_id)
+            DO UPDATE SET {update_set}
+        '''
+
+        with self._lock:
+            try:
+                with self.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(sql, values)
+                    conn.commit()
+                    cursor.execute(
+                        '''
+                        SELECT id
+                        FROM speech_evaluations
+                        WHERE interview_id = ? AND turn_id = ?
+                        LIMIT 1
+                        ''',
+                        (payload.get('interview_id', ''), payload.get('turn_id', ''))
+                    )
+                    row = cursor.fetchone()
+                    return {
+                        'success': True,
+                        'id': int(row['id']) if row and row['id'] is not None else 0,
+                    }
+            except Exception as e:
+                print(f"✗ 保存语音评估失败：{e}")
+                return {'success': False, 'error': str(e)}
+
+    def get_speech_evaluations(self, interview_id: str, start_time: str = None, end_time: str = None):
+        """
+        获取语音表达评估结果，可按 created_at 时间范围筛选。
+        """
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                if start_time and end_time:
+                    cursor.execute(
+                        '''
+                        SELECT *
+                        FROM speech_evaluations
+                        WHERE interview_id = ?
+                          AND datetime(created_at) >= datetime(?)
+                          AND datetime(created_at) <= datetime(?)
+                        ORDER BY datetime(created_at) ASC
+                        ''',
+                        (interview_id, start_time, end_time)
+                    )
+                else:
+                    cursor.execute(
+                        '''
+                        SELECT *
+                        FROM speech_evaluations
+                        WHERE interview_id = ?
+                        ORDER BY datetime(created_at) ASC
+                        ''',
+                        (interview_id,)
+                    )
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            print(f"✗ 查询语音评估失败：{e}")
+            return []
+
+    def save_or_update_evaluation(self, evaluation_data):
+        """
+        保存或更新单题评估结果（基于 interview_id+turn_id+evaluation_version 幂等）。
+
+        Args:
+            evaluation_data: 评估数据字典
+
+        Returns:
+            dict: {'success': bool, 'id': int}
+        """
+        columns = [
+            'interview_id', 'turn_id', 'question_id', 'user_id', 'round_type', 'position',
+            'question', 'answer', 'evaluation_version', 'rubric_version', 'prompt_version',
+            'llm_model', 'eval_task_key', 'status', 'layer1_json', 'layer2_json',
+            'rubric_level', 'overall_score', 'confidence',
+            'technical_accuracy_score', 'knowledge_depth_score', 'completeness_score',
+            'logic_score', 'job_match_score',
+            'authenticity_score', 'ownership_score', 'technical_depth_score', 'reflection_score',
+            'architecture_reasoning_score', 'tradeoff_awareness_score', 'scalability_score',
+            'clarity_score', 'relevance_score', 'self_awareness_score', 'communication_score',
+            'retry_count_layer1', 'retry_count_layer2', 'retry_count_persist',
+            'error_code', 'error_message'
+        ]
+
+        values = [evaluation_data.get(col) for col in columns]
+
+        placeholders = ', '.join(['?'] * len(columns))
+        update_columns = [col for col in columns if col not in ('interview_id', 'turn_id', 'evaluation_version')]
+        update_set = ', '.join([f"{col}=excluded.{col}" for col in update_columns] + ["updated_at=CURRENT_TIMESTAMP"])
+
+        sql = f'''
+            INSERT INTO interview_evaluations ({', '.join(columns)})
+            VALUES ({placeholders})
+            ON CONFLICT(interview_id, turn_id, evaluation_version)
+            DO UPDATE SET {update_set}
+        '''
+
+        with self._lock:
+            try:
+                with self.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(sql, values)
+                    conn.commit()
+
+                    cursor.execute(
+                        '''
+                        SELECT id
+                        FROM interview_evaluations
+                        WHERE interview_id = ? AND turn_id = ? AND evaluation_version = ?
+                        LIMIT 1
+                        ''',
+                        (
+                            evaluation_data.get('interview_id', ''),
+                            evaluation_data.get('turn_id', ''),
+                            evaluation_data.get('evaluation_version', 'v1'),
+                        )
+                    )
+                    row = cursor.fetchone()
+                    return {
+                        'success': True,
+                        'id': int(row['id']) if row and row['id'] is not None else 0
+                    }
+            except Exception as e:
+                print(f"✗ 保存评估记录失败：{e}")
+                return {
+                    'success': False,
+                    'error': str(e)
+                }
+
+    def get_interview_evaluations(self, interview_id: str, evaluation_version: str = None):
+        """
+        获取指定面试的评估记录。
+        """
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                if evaluation_version:
+                    cursor.execute(
+                        '''
+                        SELECT *
+                        FROM interview_evaluations
+                        WHERE interview_id = ? AND evaluation_version = ?
+                        ORDER BY created_at ASC
+                        ''',
+                        (interview_id, evaluation_version)
+                    )
+                else:
+                    cursor.execute(
+                        '''
+                        SELECT *
+                        FROM interview_evaluations
+                        WHERE interview_id = ?
+                        ORDER BY created_at ASC
+                        ''',
+                        (interview_id,)
+                    )
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            print(f"✗ 查询评估记录失败：{e}")
+            return []
+
+    def get_evaluation_record(
+        self,
+        interview_id: str,
+        turn_id: str,
+        evaluation_version: str = "v1"
+    ):
+        """
+        按唯一键获取单题评估记录。
+        """
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT *
+                    FROM interview_evaluations
+                    WHERE interview_id = ? AND turn_id = ? AND evaluation_version = ?
+                    LIMIT 1
+                    ''',
+                    (interview_id, turn_id, evaluation_version)
+                )
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            print(f"✗ 查询单题评估记录失败：{e}")
+            return None
 
 
 if __name__ == '__main__':

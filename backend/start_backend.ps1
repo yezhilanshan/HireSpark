@@ -54,7 +54,7 @@ if ($LASTEXITCODE -eq 0) {
     Write-Host "✓ 所有依赖已安装" -ForegroundColor Green
 } else {
     Write-Host "! 部分依赖缺失，正在安装..." -ForegroundColor Yellow
-    conda run -n $BackendEnv pip install -r requirements.txt
+    conda run -n $BackendEnv pip install -r ..\requirements.txt
     if ($LASTEXITCODE -eq 0) {
         Write-Host "✓ 依赖安装完成" -ForegroundColor Green
     } else {

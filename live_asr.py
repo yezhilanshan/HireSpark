@@ -408,7 +408,7 @@ if __name__ == '__main__':
     if TTS_AVAILABLE:
         print(f'🔊 EdgeTTS 已启用，发音人: {TTS_VOICE}')
     else:
-        print('⚠️  EdgeTTS 未启用。请安装 requirements-asr.txt 中新增依赖。')
+        print('⚠️  EdgeTTS 未启用。请安装项目根目录 requirements.txt 中的依赖。')
     
     # 连接到后端
     backend_connected = connect_to_backend()

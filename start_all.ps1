@@ -59,7 +59,7 @@ $TtsProvider = if ($env:TTS_PROVIDER) {
     Get-EnvFileValue -FilePath $EnvFilePath -Key "TTS_PROVIDER"
 }
 if (-not $TtsProvider) {
-    $TtsProvider = "melo"
+    $TtsProvider = "auto"
 }
 
 $TtsPort = if ($env:TTS_SERVICE_PORT) {

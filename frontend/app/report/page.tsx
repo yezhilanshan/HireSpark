@@ -35,6 +35,24 @@ type FollowupItem = {
     feedback: string
 }
 
+type ExpressionDetail = {
+    available: boolean
+    dimensions: {
+        speech_rate_score?: number
+        pause_anomaly_score?: number
+        filler_frequency_score?: number
+        fluency_score?: number
+        clarity_score?: number
+    }
+    summary: {
+        avg_speech_rate_wpm?: number
+        avg_fillers_per_100_words?: number
+        avg_pause_anomaly_ratio?: number
+        avg_long_pause_count?: number
+        samples?: number
+    }
+}
+
 type GrowthReport = {
     summary: {
         overall_score: number
@@ -45,6 +63,7 @@ type GrowthReport = {
         dominant_round: string
     }
     score_breakdown: ScoreBreakdown
+    expression_detail?: ExpressionDetail
     strengths: string[]
     weaknesses: string[]
     improvement_plan: ImprovementItem[]
@@ -239,6 +258,24 @@ export default function ReportPage() {
                                 )
                             })}
                         </div>
+                        {report.expression_detail?.available && (
+                            <div className='mt-6 rounded-xl border border-emerald-200/60 bg-emerald-50/70 p-4 dark:border-emerald-500/30 dark:bg-emerald-900/20'>
+                                <p className='text-sm font-semibold text-emerald-900 dark:text-emerald-200'>表达明细（语音）</p>
+                                <div className='mt-2 grid grid-cols-2 gap-2 text-xs text-emerald-900/90 dark:text-emerald-200/90'>
+                                    <p>语速评分：{(report.expression_detail.dimensions.speech_rate_score || 0).toFixed(1)}</p>
+                                    <p>停顿评分：{(report.expression_detail.dimensions.pause_anomaly_score || 0).toFixed(1)}</p>
+                                    <p>口头禅评分：{(report.expression_detail.dimensions.filler_frequency_score || 0).toFixed(1)}</p>
+                                    <p>流畅度：{(report.expression_detail.dimensions.fluency_score || 0).toFixed(1)}</p>
+                                    <p>清晰度代理：{(report.expression_detail.dimensions.clarity_score || 0).toFixed(1)}</p>
+                                    <p>样本数：{Math.max(0, Number(report.expression_detail.summary.samples || 0))}</p>
+                                </div>
+                                <p className='mt-2 text-xs text-emerald-800/80 dark:text-emerald-200/70'>
+                                    平均语速 {Number(report.expression_detail.summary.avg_speech_rate_wpm || 0).toFixed(1)} token/min，
+                                    口头禅 {Number(report.expression_detail.summary.avg_fillers_per_100_words || 0).toFixed(2)} 次/百词，
+                                    停顿异常占比 {((report.expression_detail.summary.avg_pause_anomaly_ratio || 0) * 100).toFixed(1)}%。
+                                </p>
+                            </div>
+                        )}
                     </div>
 
                     <div className='lg:col-span-2 space-y-6'>

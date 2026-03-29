@@ -29,6 +29,20 @@ OPENAI_EMBEDDING_MODELS = {
     "text-embedding-3-large",
 }
 
+# 第一层匹配默认同义词（当题库未配置 aliases 时作为兜底）
+DEFAULT_KEY_POINT_ALIASES = {
+    "数组": ["哈希桶", "桶数组", "bucket array"],
+    "链表": ["链地址法", "拉链法", "链式冲突处理"],
+    "红黑树": ["treeify", "树化", "rbtree"],
+    "哈希冲突": ["冲突处理", "碰撞处理", "collision"],
+    "扩容机制": ["resize", "容量翻倍", "rehash", "阈值触发扩容"],
+    "负载因子": ["load factor", "装载因子", "阈值"],
+    "索引计算": ["hash定位", "下标计算", "index calc"],
+    "线程": ["并发", "多线程", "thread"],
+    "事务": ["transaction", "acID", "隔离级别"],
+    "性能优化": ["调优", "优化", "benchmark"],
+}
+
 
 class RAGService:
     """Shared RAG service used by scripts and runtime handlers."""
@@ -240,6 +254,8 @@ class RAGService:
             "expected_answer_signals": expected_answer_signals,
             "common_mistakes": raw.get("common_mistakes", []),
             "scoring_rubric": raw.get("scoring_rubric", {}),
+            "aliases": raw.get("aliases", {}),
+            "rubric_version": raw.get("rubric_version", "unknown"),
             "followups": self._normalize_followups(raw.get("followups", []), keywords),
             "retrieval_text": raw.get("retrieval_text", "") or answer or question,
             "source": raw.get("source", ""),
@@ -831,6 +847,248 @@ class RAGService:
             "source_id": metadata.get("source_id"),
             "question": item.get("question", ""),
             **metadata,
+        }
+
+    @staticmethod
+    def _vector_cosine_similarity(vec_a: Any, vec_b: Any) -> float:
+        if vec_a is None or vec_b is None:
+            return 0.0
+        if hasattr(vec_a, "tolist"):
+            vec_a = vec_a.tolist()
+        if hasattr(vec_b, "tolist"):
+            vec_b = vec_b.tolist()
+        if not isinstance(vec_a, list) or not isinstance(vec_b, list):
+            return 0.0
+        if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+            return 0.0
+
+        dot = 0.0
+        norm_a = 0.0
+        norm_b = 0.0
+        for a, b in zip(vec_a, vec_b):
+            fa = float(a)
+            fb = float(b)
+            dot += fa * fb
+            norm_a += fa * fa
+            norm_b += fb * fb
+        if norm_a <= 0.0 or norm_b <= 0.0:
+            return 0.0
+        return float(dot / ((norm_a ** 0.5) * (norm_b ** 0.5) + 1e-8))
+
+    @staticmethod
+    def _default_aliases_for_point(point: str) -> List[str]:
+        point_text = str(point or "").strip()
+        if not point_text:
+            return []
+        aliases: List[str] = []
+        for seed, candidates in DEFAULT_KEY_POINT_ALIASES.items():
+            if seed in point_text:
+                aliases.extend(candidates)
+        # 去重保序
+        return list(dict.fromkeys(str(item).strip() for item in aliases if str(item).strip()))
+
+    def _build_aliases_for_key_point(
+        self,
+        key_point: str,
+        aliases_data: Any,
+    ) -> List[str]:
+        aliases: List[str] = []
+        if isinstance(aliases_data, dict):
+            aliases.extend(self._ensure_list(aliases_data.get(key_point)))
+            # 容错：按“包含关系”匹配字典键
+            for alias_key, alias_values in aliases_data.items():
+                key = str(alias_key or "").strip()
+                if key and (key in key_point or key_point in key):
+                    aliases.extend(self._ensure_list(alias_values))
+        elif isinstance(aliases_data, list):
+            aliases.extend(aliases_data)
+        elif aliases_data:
+            aliases.append(aliases_data)
+
+        aliases.extend(self._default_aliases_for_point(key_point))
+        normalized = [
+            str(item).strip()
+            for item in aliases
+            if str(item).strip()
+        ]
+        return list(dict.fromkeys(normalized))
+
+    def _semantic_match_entries(
+        self,
+        answer_text: str,
+        entries: List[str],
+        threshold: float = 0.74,
+        limit: int = 4,
+    ) -> List[str]:
+        if not answer_text or not entries or self.embedder is None:
+            return []
+        try:
+            answer_vector = self.embedder.encode(answer_text)
+        except Exception:
+            return []
+        if answer_vector is None:
+            return []
+
+        matched: List[str] = []
+        for entry in entries:
+            candidate = str(entry).strip()
+            if not candidate:
+                continue
+            try:
+                candidate_vector = self.embedder.encode(candidate)
+            except Exception:
+                continue
+            sim = self._vector_cosine_similarity(answer_vector, candidate_vector)
+            if sim >= threshold:
+                matched.append(candidate)
+            if len(matched) >= limit:
+                break
+        return matched
+
+    def evaluate_layer1(
+        self,
+        question_id: Optional[str],
+        candidate_answer: str,
+        current_question: Optional[str] = None,
+        position: Optional[str] = None,
+        round_type: Optional[str] = None,
+        semantic_threshold: float = 0.74,
+    ) -> Dict[str, Any]:
+        """
+        第一层评估：原词匹配 + 同义词匹配 + 轻量语义匹配。
+        """
+        answer_text = str(candidate_answer or "").strip()
+        rubric = self._resolve_rubric_profile(
+            question_id=question_id,
+            current_question=current_question,
+            candidate_answer=answer_text,
+            position=position,
+            round_type=round_type
+        )
+        if not rubric:
+            return {
+                "status": "skipped",
+                "error_code": "RUBRIC_NOT_FOUND",
+                "question_id": str(question_id or "").strip(),
+                "matched_rubric_id": "",
+                "rubric_version": "unknown",
+                "key_points": {"covered": [], "missing": [], "coverage_ratio": 0.0},
+                "rubric_match": {"basic": 0.0, "good": 0.0, "excellent": 0.0},
+                "signals": {"hit": [], "red_flags": []},
+            }
+
+        key_points = [
+            str(entry).strip()
+            for entry in rubric.get("key_points", []) or []
+            if str(entry).strip()
+        ]
+        aliases_data = rubric.get("aliases", {}) or {}
+        expected_signals = [
+            str(entry).strip()
+            for entry in rubric.get("expected_answer_signals", []) or []
+            if str(entry).strip()
+        ]
+        common_mistakes = [
+            str(entry).strip()
+            for entry in rubric.get("common_mistakes", []) or []
+            if str(entry).strip()
+        ]
+        scoring_rubric = rubric.get("scoring_rubric", {}) or {}
+
+        covered: List[Dict[str, Any]] = []
+        missing: List[str] = []
+        covered_set: List[str] = []
+
+        for key_point in key_points:
+            aliases = self._build_aliases_for_key_point(key_point, aliases_data)
+            direct_hit = self._matches_answer_entry(answer_text, key_point)
+            alias_hits = [
+                alias for alias in aliases
+                if self._matches_answer_entry(answer_text, alias)
+            ]
+            semantic_hits = self._semantic_match_entries(
+                answer_text,
+                [key_point] + aliases,
+                threshold=semantic_threshold,
+                limit=3,
+            )
+
+            strategies: List[str] = []
+            if direct_hit:
+                strategies.append("exact")
+            if alias_hits:
+                strategies.append("alias")
+            if semantic_hits:
+                strategies.append("semantic")
+
+            if strategies:
+                covered.append({
+                    "point": key_point,
+                    "strategies": strategies,
+                    "matched_aliases": alias_hits[:3],
+                    "semantic_hits": [entry for entry in semantic_hits if entry != key_point][:3],
+                })
+                covered_set.append(key_point)
+            else:
+                missing.append(key_point)
+
+        def _rubric_level_match(level_key: str) -> float:
+            entries = [
+                str(item).strip()
+                for item in scoring_rubric.get(level_key, []) or []
+                if str(item).strip()
+            ]
+            if not entries:
+                if level_key == "basic":
+                    entries = key_points[:2]
+                elif level_key == "good":
+                    entries = key_points
+                else:
+                    entries = []
+            if not entries:
+                return 0.0
+            hits = 0
+            for entry in entries:
+                direct_hit = self._matches_answer_entry(answer_text, entry)
+                semantic_hits = self._semantic_match_entries(
+                    answer_text,
+                    [entry],
+                    threshold=semantic_threshold,
+                    limit=1,
+                )
+                if direct_hit or semantic_hits:
+                    hits += 1
+            return round(hits / len(entries), 4)
+
+        hit_signals = self._collect_matched_entries(answer_text, expected_signals, limit=6)
+        red_flags = self._collect_matched_entries(answer_text, common_mistakes, limit=4)
+        coverage_ratio = round((len(covered_set) / len(key_points)), 4) if key_points else 0.0
+
+        return {
+            "status": "ok",
+            "error_code": "",
+            "question_id": str(rubric.get("source_id") or question_id or "").strip(),
+            "matched_rubric_id": str(rubric.get("id") or "").strip(),
+            "rubric_version": str(rubric.get("rubric_version", "unknown") or "unknown").strip(),
+            "scoring_rubric": scoring_rubric,
+            "key_points": {
+                "covered": covered,
+                "missing": missing,
+                "coverage_ratio": coverage_ratio,
+            },
+            "rubric_match": {
+                "basic": _rubric_level_match("basic"),
+                "good": _rubric_level_match("good"),
+                "excellent": _rubric_level_match("excellent"),
+            },
+            "signals": {
+                "hit": hit_signals,
+                "red_flags": red_flags,
+            },
+            "metadata": {
+                "semantic_threshold": semantic_threshold,
+                "alias_enabled": True,
+            },
         }
 
     def analyze_answer(

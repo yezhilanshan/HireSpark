@@ -44,11 +44,18 @@ try:
 except Exception as e:
     tts_manager = None
     tts_import_error = str(e)
+try:
+    from utils.evaluation_service import EvaluationService
+    evaluation_import_error = None
+except Exception as e:
+    EvaluationService = None
+    evaluation_import_error = str(e)
 from utils.logger import get_logger
 from utils.performance_monitor import performance_monitor, measure_time
 from utils.answer_session import AnswerSession, LONG_PAUSE_SECONDS, SHORT_PAUSE_SECONDS
 from utils.session_orchestrator import SessionRegistry, StateOrchestrator
 from utils.speech_normalizer import SpeechTextNormalizer
+from utils.speech_metrics import compute_final_speech_metrics, aggregate_expression_metrics
 from utils.security import (
     RateLimiter,
     rate_limit,
@@ -152,6 +159,19 @@ db_manager = DatabaseManager()
 session_registry = SessionRegistry()
 state_orchestrator = StateOrchestrator(session_registry)
 speech_normalizer = SpeechTextNormalizer()
+evaluation_service = (
+    EvaluationService(
+        db_manager=db_manager,
+        rag_service=rag_service,
+        llm_manager=llm_manager,
+        logger=logger,
+    )
+    if EvaluationService is not None else None
+)
+if evaluation_service is None and evaluation_import_error:
+    logger.error(f"评估服务初始化失败：{evaluation_import_error}")
+elif evaluation_service is not None:
+    logger.info("三层评价服务初始化成功")
 
 
 def _build_question_rag_context(
@@ -316,6 +336,30 @@ def _emit_answer_session_update(runtime, source: str = "") -> None:
     socketio.emit('answer_session_update', payload, to=runtime.client_id)
 
 
+def _emit_realtime_speech_metrics(
+    runtime,
+    answer_session: AnswerSession,
+    *,
+    is_speaking: bool,
+    text_snapshot: str = "",
+    source: str = "",
+) -> None:
+    metrics = answer_session.update_realtime_speech_metrics(
+        is_speaking=is_speaking,
+        text_snapshot=text_snapshot,
+        segment_index=max(1, len(answer_session.segments) + (1 if is_speaking else 0)),
+    )
+    socketio.emit('speech_metrics_realtime', {
+        'session_id': runtime.session_id,
+        'turn_id': runtime.turn_id,
+        'answer_session_id': answer_session.answer_session_id,
+        'interrupt_epoch': runtime.interrupt_epoch,
+        'source': source,
+        'timestamp': time.time(),
+        **metrics,
+    }, to=runtime.client_id)
+
+
 def _consume_runtime_segment_text(runtime, asr_generation: int = 0) -> str:
     final_text = ' '.join(runtime.pending_asr_finals).strip()
     partial_text = ' '.join(runtime.pending_asr_partials).strip()
@@ -350,9 +394,22 @@ def _persist_answer_audio(runtime, answer_session: AnswerSession) -> str:
     return str(output_path)
 
 
-def _rewrite_answer_text(runtime, answer_session: AnswerSession, audio_path: str = "") -> str:
+def _estimate_answer_audio_duration_ms(answer_session: AnswerSession, audio_path: str = "") -> float:
+    try:
+        if audio_path and os.path.isfile(audio_path):
+            import wave
+            with wave.open(audio_path, 'rb') as wav_file:
+                frames = wav_file.getnframes()
+                sample_rate = wav_file.getframerate() or 16000
+                return max(0.0, (frames / float(sample_rate)) * 1000.0)
+    except Exception as exc:
+        logger.debug(f"[ASR] 读取音频时长失败，回退字节估算: {exc}")
+    return max(0.0, (float(answer_session.audio_bytes) / 2.0 / 16000.0) * 1000.0)
+
+
+def _rewrite_answer_text(runtime, answer_session: AnswerSession, audio_path: str = "") -> dict:
     if not audio_path or asr_manager is None or not hasattr(asr_manager, 'transcribe_file'):
-        return answer_session.merged_text_draft
+        return {'text': answer_session.merged_text_draft, 'word_timestamps': [], 'confidence': None, 'mode': 'fallback_no_file'}
 
     prompt_parts = [
         "这是一次中文技术面试回答的音频转写，请尽量准确保留技术术语、英文缩写、数字和项目名称。",
@@ -363,12 +420,27 @@ def _rewrite_answer_text(runtime, answer_session: AnswerSession, audio_path: str
     if answer_session.merged_text_draft:
         prompt_parts.append(f"实时草稿：{answer_session.merged_text_draft}")
 
-    rewritten_text = asr_manager.transcribe_file(
-        audio_path=audio_path,
-        prompt="\n".join(part for part in prompt_parts if part),
-    )
+    rewrite_payload = {}
+    if hasattr(asr_manager, 'transcribe_file_with_meta'):
+        rewrite_payload = asr_manager.transcribe_file_with_meta(
+            audio_path=audio_path,
+            prompt="\n".join(part for part in prompt_parts if part),
+        ) or {}
+    else:
+        rewrite_text = asr_manager.transcribe_file(
+            audio_path=audio_path,
+            prompt="\n".join(part for part in prompt_parts if part),
+        )
+        rewrite_payload = {'text': rewrite_text}
+
+    rewritten_text = str(rewrite_payload.get('text') or '').strip()
     if rewritten_text:
-        return rewritten_text
+        return {
+            'text': rewritten_text,
+            'word_timestamps': rewrite_payload.get('word_timestamps') or [],
+            'confidence': rewrite_payload.get('confidence'),
+            'mode': 'asr_final',
+        }
 
     _log_runtime_event(
         runtime,
@@ -377,7 +449,47 @@ def _rewrite_answer_text(runtime, answer_session: AnswerSession, audio_path: str
         answer_session_id=answer_session.answer_session_id,
         details=getattr(asr_manager, 'last_transcribe_error', '')[:200],
     )
-    return answer_session.merged_text_draft
+    return {
+        'text': answer_session.merged_text_draft,
+        'word_timestamps': rewrite_payload.get('word_timestamps') or [],
+        'confidence': rewrite_payload.get('confidence'),
+        'mode': 'fallback_empty_rewrite',
+    }
+
+
+def _build_answer_session_final_metrics(runtime, answer_session: AnswerSession, audio_path: str, final_text: str):
+    align_result = {}
+    word_timestamps = []
+    if asr_manager is not None and hasattr(asr_manager, 'align_transcript'):
+        try:
+            align_result = asr_manager.align_transcript(
+                audio_path=audio_path,
+                transcript=final_text,
+                language=getattr(asr_manager, 'final_language', ''),
+            ) or {}
+            word_timestamps = align_result.get('word_timestamps') or []
+        except Exception as exc:
+            logger.warning(f"[ASR] 强制对齐失败，使用空时间戳回退: {exc}")
+            word_timestamps = []
+
+    audio_duration_ms = _estimate_answer_audio_duration_ms(answer_session, audio_path=audio_path)
+    speech_metrics_final, pause_events, filler_events = compute_final_speech_metrics(
+        transcript=final_text,
+        draft_text=answer_session.merged_text_draft,
+        word_timestamps=word_timestamps,
+        audio_duration_ms=audio_duration_ms,
+    )
+    speech_metrics_final.update({
+        'align_mode': str(align_result.get('mode') or 'unknown'),
+        'align_confidence': align_result.get('confidence'),
+    })
+    answer_session.mark_final_metrics(
+        final_transcript=final_text,
+        word_timestamps=word_timestamps,
+        pause_events=pause_events,
+        filler_events=filler_events,
+        speech_metrics_final=speech_metrics_final,
+    )
 
 
 def _finalize_answer_session(runtime, reason: str = "long_pause") -> None:
@@ -410,8 +522,17 @@ def _finalize_answer_session(runtime, reason: str = "long_pause") -> None:
     _emit_answer_session_update(current, source=f'{reason}_finalizing')
 
     audio_path = _persist_answer_audio(current, answer_session)
-    final_text = _rewrite_answer_text(current, answer_session, audio_path=audio_path) or final_candidate
+    rewrite_payload = _rewrite_answer_text(current, answer_session, audio_path=audio_path)
+    final_text = str(rewrite_payload.get('text') or '').strip() or final_candidate
     answer_session.mark_final(final_text, reason=reason, exported_audio_path=audio_path)
+    _build_answer_session_final_metrics(current, answer_session, audio_path=audio_path, final_text=final_text)
+    _emit_realtime_speech_metrics(
+        current,
+        answer_session,
+        is_speaking=False,
+        text_snapshot=final_text,
+        source=f'{reason}_finalized',
+    )
     _emit_answer_session_update(current, source=f'{reason}_finalized')
 
     answer_session.committed = True
@@ -555,6 +676,13 @@ def _finalize_answer_segment(
         answer_session.last_asr_generation = asr_generation
 
     answer_session.mark_status('paused_short')
+    _emit_realtime_speech_metrics(
+        current,
+        answer_session,
+        is_speaking=False,
+        text_snapshot=answer_session.live_text or answer_session.merged_text_draft,
+        source=reason,
+    )
     _log_runtime_event(
         current,
         'answer_segment_finalized',
@@ -819,7 +947,16 @@ def _interrupt_runtime(runtime, reason: str):
     _emit_orchestrator_state(runtime)
 
 
-def _record_runtime_dialogue(runtime, question: str, answer: str, feedback: str, analysis_result=None, followup_decision=None):
+def _record_runtime_dialogue(
+    runtime,
+    question: str,
+    answer: str,
+    feedback: str,
+    analysis_result=None,
+    followup_decision=None,
+    turn_id: str = "",
+    question_id: str = "",
+):
     if runtime.data_manager:
         runtime.data_manager.add_frame_data({
             'type': 'interview_dialogue',
@@ -838,6 +975,48 @@ def _record_runtime_dialogue(runtime, question: str, answer: str, feedback: str,
         'answer': answer,
         'llm_feedback': feedback
     })
+
+    answer_session = runtime.current_answer_session
+    if answer_session and hasattr(db_manager, 'save_or_update_speech_evaluation'):
+        normalized_turn_id = str(turn_id or runtime.turn_id or '').strip() or f"turn_{runtime.turn_index}"
+        try:
+            db_manager.save_or_update_speech_evaluation({
+                'interview_id': runtime.interview_id,
+                'turn_id': normalized_turn_id,
+                'answer_session_id': answer_session.answer_session_id,
+                'round_type': runtime.round_type,
+                'final_transcript': answer_session.final_transcript or answer_session.final_text or answer,
+                'word_timestamps_json': json.dumps(answer_session.word_timestamps or [], ensure_ascii=False),
+                'pause_events_json': json.dumps(answer_session.pause_events or [], ensure_ascii=False),
+                'filler_events_json': json.dumps(answer_session.filler_events or [], ensure_ascii=False),
+                'speech_metrics_final_json': json.dumps(answer_session.speech_metrics_final or {}, ensure_ascii=False),
+                'realtime_metrics_json': json.dumps(answer_session.realtime_speech_metrics or {}, ensure_ascii=False),
+            })
+        except Exception as exc:
+            logger.warning(f"保存语音表达评估失败：{exc}")
+
+    if evaluation_service is not None:
+        try:
+            enqueue_result = evaluation_service.enqueue_evaluation(
+                interview_id=runtime.interview_id,
+                turn_id=str(turn_id or runtime.turn_id or "").strip() or f"turn_{runtime.turn_index}",
+                question_id=str(question_id or "").strip() or _extract_question_id_from_plan(runtime.last_question_plan),
+                user_id=runtime.user_id,
+                round_type=runtime.round_type,
+                position=runtime.position,
+                question=question,
+                answer=answer,
+            )
+            if not enqueue_result.get('success'):
+                _log_runtime_event(
+                    runtime,
+                    'evaluation_enqueue_failed',
+                    level='warning',
+                    error=enqueue_result.get('error', ''),
+                    message=enqueue_result.get('message', ''),
+                )
+        except Exception as e:
+            logger.warning(f"投递三层评估任务失败：{e}")
 
 
 def _maybe_emit_session_notice(runtime):
@@ -934,6 +1113,7 @@ def _start_runtime_tts(runtime, spoken_text: str, turn_id: str, source: str = 'r
                         'text': text_chunk,
                         'audio': audio_base64,
                         'mime_type': getattr(tts_manager, 'last_content_type', 'audio/mpeg'),
+                        'provider': getattr(tts_manager, 'last_provider', ''),
                         'interrupt_epoch': interrupt_epoch,
                         'source': source,
                         'timestamp': time.time()
@@ -1021,6 +1201,13 @@ def _start_runtime_asr(runtime, reason: str = "speech_start") -> bool:
             preview_text = ' '.join(live_runtime.pending_asr_finals + [text]).strip()
             answer_session.mark_status('recording')
             answer_session.update_partial(preview_text)
+            _emit_realtime_speech_metrics(
+                live_runtime,
+                answer_session,
+                is_speaking=True,
+                text_snapshot=preview_text or text,
+                source='asr_partial',
+            )
             _print_asr_console(live_runtime, 'partial', text, asr_generation)
             _log_runtime_event(
                 live_runtime,
@@ -1068,6 +1255,13 @@ def _start_runtime_asr(runtime, reason: str = "speech_start") -> bool:
             answer_session = _ensure_answer_session(live_runtime)
             answer_session.mark_status('recording')
             answer_session.update_partial(' '.join(live_runtime.pending_asr_finals).strip())
+            _emit_realtime_speech_metrics(
+                live_runtime,
+                answer_session,
+                is_speaking=True,
+                text_snapshot=' '.join(live_runtime.pending_asr_finals).strip(),
+                source='asr_final',
+            )
             _print_asr_console(live_runtime, 'final', text, asr_generation)
             _log_runtime_event(
                 live_runtime,
@@ -1311,7 +1505,16 @@ def _process_runtime_commit(runtime, answer_text: str, turn_id: str, source: str
                 reply_preview=str(feedback)[:200],
                 next_action=str((followup_decision or {}).get('next_action', 'ask_followup')),
             )
-            _record_runtime_dialogue(current, current_question, normalized_answer, feedback, analysis_result, followup_decision)
+            _record_runtime_dialogue(
+                current,
+                current_question,
+                normalized_answer,
+                feedback,
+                analysis_result,
+                followup_decision,
+                turn_id=current.turn_id,
+                question_id=_extract_question_id_from_plan(current.last_question_plan),
+            )
 
             current.chat_history.append({
                 'role': 'candidate',
@@ -1719,6 +1922,13 @@ def handle_speech_start(data=None):
     answer_session = _ensure_answer_session(runtime)
     answer_session.last_speech_epoch = runtime.speech_epoch
     answer_session.mark_status('recording')
+    _emit_realtime_speech_metrics(
+        runtime,
+        answer_session,
+        is_speaking=True,
+        text_snapshot=answer_session.live_text or answer_session.merged_text_draft,
+        source='speech_start',
+    )
     _emit_answer_session_update(runtime, source='speech_start')
     _start_runtime_asr(runtime, reason='speech_start')
 
@@ -2110,8 +2320,26 @@ def _clamp_score(value):
     return max(0.0, min(100.0, float(value)))
 
 
-def _calc_dimension_scores(dialogues):
-    """基于问答过程做启发式多维评分。"""
+def _decode_speech_rows(raw_rows):
+    decoded = []
+    for row in raw_rows or []:
+        item = dict(row)
+        for key in ('word_timestamps_json', 'pause_events_json', 'filler_events_json', 'speech_metrics_final_json', 'realtime_metrics_json'):
+            raw_value = item.get(key)
+            if not raw_value:
+                item[key.replace('_json', '')] = [] if key != 'speech_metrics_final_json' else {}
+                continue
+            try:
+                parsed = json.loads(raw_value)
+            except Exception:
+                parsed = [] if key != 'speech_metrics_final_json' else {}
+            item[key.replace('_json', '')] = parsed
+        decoded.append(item)
+    return decoded
+
+
+def _calc_dimension_scores(dialogues, speech_summary=None):
+    """基于问答过程做启发式多维评分，并融合语音表达指标。"""
     if not dialogues:
         return {
             'technical_correctness': 60.0,
@@ -2151,6 +2379,13 @@ def _calc_dimension_scores(dialogues):
     job_match = _clamp_score(56 + min(30, match_hits * 2.6) + good_hits * 0.8)
     adaptability = _clamp_score(62 + (6 if second_bad <= first_bad else -6) - max(0, bad_hits - good_hits) * 0.6)
 
+    speech_dims = (speech_summary or {}).get('dimensions') or {}
+    if speech_dims:
+        clarity_from_speech = float(speech_dims.get('clarity_score', expression_clarity))
+        fluency_from_speech = float(speech_dims.get('fluency_score', adaptability))
+        expression_clarity = _clamp_score(expression_clarity * 0.35 + clarity_from_speech * 0.65)
+        adaptability = _clamp_score(adaptability * 0.65 + fluency_from_speech * 0.35)
+
     return {
         'technical_correctness': round(technical_correctness, 1),
         'knowledge_depth': round(knowledge_depth, 1),
@@ -2161,8 +2396,9 @@ def _calc_dimension_scores(dialogues):
     }
 
 
-def _build_growth_report(dialogues):
-    scores = _calc_dimension_scores(dialogues)
+def _build_growth_report(dialogues, speech_rows=None):
+    speech_summary = aggregate_expression_metrics(speech_rows or [])
+    scores = _calc_dimension_scores(dialogues, speech_summary=speech_summary)
     overall = round(
         scores['technical_correctness'] * 0.30
         + scores['knowledge_depth'] * 0.15
@@ -2235,6 +2471,12 @@ def _build_growth_report(dialogues):
     ended_at = _parse_db_datetime(dialogues[-1].get('created_at')) if dialogues else None
     duration_seconds = int((ended_at - started_at).total_seconds()) if started_at and ended_at else 0
 
+    expression_detail = {
+        'available': bool(speech_summary.get('available')),
+        'dimensions': speech_summary.get('dimensions', {}),
+        'summary': speech_summary.get('summary', {}),
+    }
+
     return {
         'summary': {
             'overall_score': overall,
@@ -2245,6 +2487,7 @@ def _build_growth_report(dialogues):
             'dominant_round': round_counter.most_common(1)[0][0] if round_counter else 'technical'
         },
         'score_breakdown': scores,
+        'expression_detail': expression_detail,
         'strengths': strengths,
         'weaknesses': weaknesses,
         'improvement_plan': improvement_plan,
@@ -2317,13 +2560,35 @@ def get_latest_growth_report():
 
         latest_session_desc = sessions_desc[0]
         latest_session = list(reversed(latest_session_desc))
-        report = _build_growth_report(latest_session)
+
+        def _load_session_speech_rows(session_rows):
+            if not session_rows or not hasattr(db_manager, 'get_speech_evaluations'):
+                return []
+            interview_id = str(session_rows[0].get('interview_id') or '').strip()
+            if not interview_id:
+                return []
+            start_time = session_rows[0].get('created_at')
+            end_time = session_rows[-1].get('created_at')
+            raw_speech_rows = db_manager.get_speech_evaluations(
+                interview_id=interview_id,
+                start_time=start_time,
+                end_time=end_time,
+            )
+            return _decode_speech_rows(raw_speech_rows)
+
+        report = _build_growth_report(
+            latest_session,
+            speech_rows=_load_session_speech_rows(latest_session),
+        )
 
         trend = []
         sessions_for_trend = list(reversed(sessions_desc))
         for idx, session_desc in enumerate(sessions_for_trend, start=1):
             session = list(reversed(session_desc))
-            session_report = _build_growth_report(session)
+            session_report = _build_growth_report(
+                session,
+                speech_rows=_load_session_speech_rows(session),
+            )
             trend.append({
                 'label': f'第{idx}次',
                 'overall_score': session_report['summary']['overall_score']

@@ -417,6 +417,148 @@ class LLMManager:
             logger.error(f"✗ 评估回答失败: {str(e)}")
             return {"score": 0, "error": str(e)}
 
+    def evaluate_answer_with_rubric(
+        self,
+        user_answer: str,
+        question: str,
+        position: str,
+        round_type: str,
+        scoring_rubric: Optional[Dict] = None,
+        layer1_result: Optional[Dict] = None,
+        prompt_version: str = "v1"
+    ) -> Dict:
+        """
+        第二层评估：结合题目、回答、三档 rubric 与第一层结果，输出结构化 JSON。
+        """
+        if not self.check_enabled():
+            return {"error": "LLM_NOT_READY", "message": "LLM 功能未启用"}
+
+        round_dimensions = {
+            "technical": ["technical_accuracy", "knowledge_depth", "completeness", "logic", "job_match"],
+            "project": ["authenticity", "ownership", "technical_depth", "reflection"],
+            "system_design": ["architecture_reasoning", "tradeoff_awareness", "scalability", "logic"],
+            "hr": ["clarity", "relevance", "self_awareness", "communication"],
+        }
+        dimensions = round_dimensions.get(round_type, round_dimensions["technical"])
+
+        rubric_text = json.dumps(scoring_rubric or {}, ensure_ascii=False, indent=2)
+        layer1_text = json.dumps(layer1_result or {}, ensure_ascii=False, indent=2)
+
+        dim_schema = ", ".join(
+            f'"{name}": {{"score": 0-100, "reason": "..."}}'
+            for name in dimensions
+        )
+
+        system_prompt = (
+            "你是资深技术面试评估官。"
+            "请严格输出 JSON，不要输出任何额外文本。"
+            "第一层结果仅作为辅助信号，不是唯一标准。"
+            "如果候选人使用等价技术表达（非关键词原词），可以判定为命中并给出解释。"
+        )
+        user_prompt = (
+            f"prompt_version: {prompt_version}\n"
+            f"岗位: {position}\n"
+            f"轮次: {round_type}\n"
+            f"题目: {question}\n"
+            f"候选人回答: {user_answer}\n\n"
+            f"评分标准 scoring_rubric:\n{rubric_text}\n\n"
+            f"第一层分析 layer1_result:\n{layer1_text}\n\n"
+            "请按以下 JSON schema 返回，字段不可缺失：\n"
+            "{\n"
+            '  "rubric_eval": {\n'
+            '    "basic_match": 0,\n'
+            '    "good_match": 0,\n'
+            '    "excellent_match": 0,\n'
+            '    "final_level": "basic|good|excellent",\n'
+            '    "confidence": 0.0,\n'
+            '    "reason": "..." \n'
+            "  },\n"
+            '  "dimension_scores": {\n'
+            f"    {dim_schema}\n"
+            "  },\n"
+            '  "overall_score": 0,\n'
+            '  "summary": {\n'
+            '    "strengths": ["..."],\n'
+            '    "weaknesses": ["..."],\n'
+            '    "next_actions": ["..."]\n'
+            "  }\n"
+            "}\n"
+            "注意：basic_match/good_match/excellent_match 与各维度 score 的范围都是 0~100。"
+        )
+
+        try:
+            response = Generation.call(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                top_p=0.5,
+                top_k=50,
+                temperature=0.2,
+                max_tokens=1200,
+                timeout=self.timeout
+            )
+
+            if response.status_code != 200:
+                return {"error": "API_ERROR", "message": response.message}
+
+            raw_text = str(response.output.text or "").strip()
+            import re
+            json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+            if not json_match:
+                return {"error": "INVALID_JSON", "message": "模型未返回 JSON", "raw_text": raw_text}
+
+            parsed = json.loads(json_match.group())
+            rubric_eval = parsed.get("rubric_eval", {}) or {}
+            dimension_scores = parsed.get("dimension_scores", {}) or {}
+            summary = parsed.get("summary", {}) or {}
+
+            def _clamp_100(value, default=0.0):
+                try:
+                    return round(max(0.0, min(100.0, float(value))), 2)
+                except Exception:
+                    return round(float(default), 2)
+
+            normalized_rubric_eval = {
+                "basic_match": _clamp_100(rubric_eval.get("basic_match", 0)),
+                "good_match": _clamp_100(rubric_eval.get("good_match", 0)),
+                "excellent_match": _clamp_100(rubric_eval.get("excellent_match", 0)),
+                "final_level": str(rubric_eval.get("final_level", "basic")).strip().lower() or "basic",
+                "confidence": round(max(0.0, min(1.0, float(rubric_eval.get("confidence", 0.5)))), 4),
+                "reason": str(rubric_eval.get("reason", "")).strip(),
+            }
+            if normalized_rubric_eval["final_level"] not in {"basic", "good", "excellent"}:
+                normalized_rubric_eval["final_level"] = "basic"
+
+            normalized_dimensions = {}
+            for dim in dimensions:
+                dim_payload = dimension_scores.get(dim, {}) or {}
+                normalized_dimensions[dim] = {
+                    "score": _clamp_100(dim_payload.get("score", 0)),
+                    "reason": str(dim_payload.get("reason", "")).strip(),
+                }
+
+            overall_score = parsed.get("overall_score")
+            if overall_score is None:
+                scores = [item["score"] for item in normalized_dimensions.values()]
+                overall_score = sum(scores) / len(scores) if scores else 0.0
+
+            normalized = {
+                "rubric_eval": normalized_rubric_eval,
+                "dimension_scores": normalized_dimensions,
+                "overall_score": _clamp_100(overall_score),
+                "summary": {
+                    "strengths": [str(x) for x in (summary.get("strengths", []) or [])][:5],
+                    "weaknesses": [str(x) for x in (summary.get("weaknesses", []) or [])][:5],
+                    "next_actions": [str(x) for x in (summary.get("next_actions", []) or [])][:5],
+                }
+            }
+            return normalized
+        except Exception as e:
+            logger.error(f"✗ 第二层 rubric 评估失败: {str(e)}")
+            return {"error": "EVALUATION_EXCEPTION", "message": str(e)}
+
     def set_interview_round(self, round_type: str, resume_data: Optional[Dict] = None):
         """设置面试轮次"""
         if round_type in INTERVIEW_ROUNDS:

@@ -20,7 +20,7 @@ echo [2/3] 检查依赖...
 python -c "import flask, flask_socketio, cv2, mediapipe, psutil, yaml" 2>nul
 if errorlevel 1 (
     echo ✗ 依赖检查失败，正在安装...
-    pip install -r requirements.txt
+    pip install -r ..\requirements.txt
     if errorlevel 1 (
         echo ✗ 依赖安装失败
         pause

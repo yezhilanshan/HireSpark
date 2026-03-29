@@ -15,7 +15,6 @@
 ```powershell
 conda create -n interview-anti-cheat python=3.9 -y
 conda activate interview-anti-cheat
-cd backend
 pip install -r requirements.txt
 ```
 
@@ -26,7 +25,7 @@ pip install -r requirements.txt
 ```powershell
 conda create -n interview-tts python=3.10 -y
 conda activate interview-tts
-pip install -r tts_service/requirements.txt
+pip install -r requirements.txt
 ```
 
 使用 MeloTTS：
@@ -34,7 +33,7 @@ pip install -r tts_service/requirements.txt
 ```powershell
 conda create -n interview-tts python=3.10 -y
 conda activate interview-tts
-pip install -r tts_service/requirements-melo.txt
+pip install -r requirements.txt
 ```
 
 ## 为什么这样拆
@@ -57,7 +56,7 @@ powershell -ExecutionPolicy Bypass -File .\start_all.ps1
 ### 单独启动 TTS 服务
 
 ```powershell
-$env:TTS_PROVIDER = "melo"
+$env:TTS_PROVIDER = "auto"
 powershell -ExecutionPolicy Bypass -File .\tts_service\start_tts_service.ps1
 ```
 
@@ -68,12 +67,20 @@ $env:TTS_PROVIDER = "edge"
 powershell -ExecutionPolicy Bypass -File .\tts_service\start_tts_service.ps1
 ```
 
-MeloTTS 默认优先，若合成失败会自动回退到 `edge-tts`。若要指定 Melo 参数：
+默认优先 `edge-tts`，若合成失败自动回退到 `MeloTTS`。若要指定 Melo 参数：
 
 ```powershell
-$env:TTS_PROVIDER = "melo"
+$env:TTS_PROVIDER = "auto"
 $env:TTS_MELO_LANGUAGE = "ZH"
 $env:TTS_MELO_SPEAKER = "ZH"
+powershell -ExecutionPolicy Bypass -File .\tts_service\start_tts_service.ps1
+```
+
+若你需要“只允许首选 provider，不允许回退”，可开启严格模式：
+
+```powershell
+$env:TTS_PROVIDER = "edge"  # 或 auto，严格模式下 auto 仅使用 edge
+$env:TTS_PROVIDER_STRICT = "true"
 powershell -ExecutionPolicy Bypass -File .\tts_service\start_tts_service.ps1
 ```
 

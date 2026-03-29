@@ -87,6 +87,13 @@ export default function InterviewPage() {
     const [currentQuestion, setCurrentQuestion] = useState('')
     const [userAnswer, setUserAnswer] = useState('')
     const [answerSessionStatus, setAnswerSessionStatus] = useState('idle')
+    const [speechRealtimeMetrics, setSpeechRealtimeMetrics] = useState({
+        is_speaking: false,
+        rough_wpm: 0,
+        silence_ms: 0,
+        segment_index: 0,
+    })
+    const [finalMetricsReady, setFinalMetricsReady] = useState(false)
     const [isProcessing, setIsProcessing] = useState(false)
     const [isVoiceSupported, setIsVoiceSupported] = useState(true)
     const [isBrowserAsrSupported, setIsBrowserAsrSupported] = useState(false)
@@ -135,22 +142,15 @@ export default function InterviewPage() {
     const currentTtsUrlRef = useRef<string | null>(null)
     const browserTtsUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null)
     const browserTtsActiveRef = useRef(false)
-    const ttsAudioQueueRef = useRef<Array<{ audio: string; jobId: string; turnId: string; mimeType: string }>>([])
+    const ttsAudioQueueRef = useRef<Array<{ audio: string; jobId: string; turnId: string; mimeType: string; provider?: string }>>([])
     const isTTSSpeakingRef = useRef(false)
-    const ttsSafetyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+    const receivedServerChunkForCurrentSpeakRef = useRef(false)
     const rppgMetrics = useFacePhysRppg(videoRef, cameraReady && interviewStarted)
 
     const clearLlmTimeout = () => {
         if (llmTimeoutRef.current) {
             clearTimeout(llmTimeoutRef.current)
             llmTimeoutRef.current = null
-        }
-    }
-
-    const clearTtsTimers = () => {
-        if (ttsSafetyTimerRef.current) {
-            clearTimeout(ttsSafetyTimerRef.current)
-            ttsSafetyTimerRef.current = null
         }
     }
 
@@ -222,17 +222,26 @@ export default function InterviewPage() {
         committedAnswerSessionIdsRef.current.clear()
         asrLockedRef.current = false
         setAnswerSessionStatus('idle')
+        setFinalMetricsReady(false)
+        setSpeechRealtimeMetrics({
+            is_speaking: false,
+            rough_wpm: 0,
+            silence_ms: 0,
+            segment_index: 0,
+        })
     }
 
     const stopCurrentTts = () => {
-        clearTtsTimers()
         ttsAudioQueueRef.current = []
         pendingTtsTextRef.current = ''
+        receivedServerChunkForCurrentSpeakRef.current = false
         isTTSSpeakingRef.current = false
         isAiSpeakingRef.current = false
         setIsAiSpeaking(false)
 
         if (currentTtsAudioRef.current) {
+            currentTtsAudioRef.current.onended = null
+            currentTtsAudioRef.current.onerror = null
             currentTtsAudioRef.current.pause()
             currentTtsAudioRef.current.currentTime = 0
             currentTtsAudioRef.current = null
@@ -260,7 +269,6 @@ export default function InterviewPage() {
             return
         }
 
-        clearTtsTimers()
         window.speechSynthesis.cancel()
 
         const utterance = new SpeechSynthesisUtterance(normalized)
@@ -281,6 +289,11 @@ export default function InterviewPage() {
             setIsAiSpeaking(false)
         }
         utterance.onerror = (error) => {
+            const reason = (error as any)?.error || ''
+            // 当服务端音频抢占时，浏览器合成会收到 canceled/interrupted，这属于正常现象。
+            if (reason === 'canceled' || reason === 'interrupted') {
+                return
+            }
             console.error('[TTS] 浏览器播报失败:', error)
             stopCurrentTts()
         }
@@ -517,7 +530,6 @@ export default function InterviewPage() {
 
         return () => {
             clearLlmTimeout()
-            clearTtsTimers()
             clearPendingCommit()
             stopCurrentTts()
             cleanupAudioRecording()
@@ -576,17 +588,10 @@ export default function InterviewPage() {
         if (!text || !text.trim()) return
 
         pendingTtsTextRef.current = text.trim()
+        receivedServerChunkForCurrentSpeakRef.current = false
         setIsAiSpeaking(true)
         isAiSpeakingRef.current = true
         isTTSSpeakingRef.current = true
-        clearTtsTimers()
-
-        ttsSafetyTimerRef.current = setTimeout(() => {
-            if (isTTSSpeakingRef.current && !currentTtsAudioRef.current && ttsAudioQueueRef.current.length === 0) {
-                console.warn('[TTS] 超时未收到音频，切换到浏览器播报')
-                playBrowserTts(pendingTtsTextRef.current)
-            }
-        }, 4000)
     }
 
     const playNextTtsChunk = () => {
@@ -615,14 +620,14 @@ export default function InterviewPage() {
             audio.src = url
             currentTtsAudioRef.current = audio
             audio.onended = () => {
+                if (currentTtsAudioRef.current !== audio) return
                 console.log('[TTS] 播放完成')
-                if (currentTtsUrlRef.current) {
+                if (currentTtsUrlRef.current === url) {
                     URL.revokeObjectURL(currentTtsUrlRef.current)
                     currentTtsUrlRef.current = null
                 }
                 currentTtsAudioRef.current = null
                 if (ttsAudioQueueRef.current.length === 0) {
-                    clearTtsTimers()
                     pendingTtsTextRef.current = ''
                     isTTSSpeakingRef.current = false
                     isAiSpeakingRef.current = false
@@ -631,6 +636,7 @@ export default function InterviewPage() {
                 playNextTtsChunk()
             }
             audio.onerror = (error) => {
+                if (currentTtsAudioRef.current !== audio) return
                 console.error('[TTS] 播放错误:', error)
                 stopCurrentTts()
             }
@@ -641,6 +647,11 @@ export default function InterviewPage() {
             }
 
             audio.play().catch((err) => {
+                if (currentTtsAudioRef.current !== audio) return
+                if ((err as any)?.name === 'AbortError') {
+                    // 可能被 stop/pause 或新音频抢占，不作为失败处理。
+                    return
+                }
                 console.error('[TTS] 播放失败:', err)
                 stopCurrentTts()
             })
@@ -856,6 +867,7 @@ export default function InterviewPage() {
             socketClient.off('orchestrator_state')
             socketClient.off('dialog_reply')
             socketClient.off('answer_session_update')
+            socketClient.off('speech_metrics_realtime')
             socketClient.off('asr_partial')
             socketClient.off('asr_final')
             socketClient.off('tts_chunk')
@@ -964,6 +976,15 @@ export default function InterviewPage() {
                 }
 
                 setAnswerSessionStatus(data?.status || 'idle')
+                setFinalMetricsReady(Boolean(data?.final_metrics_ready))
+                if (data?.speech_metrics_realtime) {
+                    setSpeechRealtimeMetrics({
+                        is_speaking: Boolean(data.speech_metrics_realtime.is_speaking),
+                        rough_wpm: Number(data.speech_metrics_realtime.rough_wpm || 0),
+                        silence_ms: Number(data.speech_metrics_realtime.silence_ms || 0),
+                        segment_index: Number(data.speech_metrics_realtime.segment_index || 0),
+                    })
+                }
 
                 const displayText = data?.display_text || data?.final_text || data?.live_text || data?.merged_text_draft || ''
                 if (typeof displayText === 'string') {
@@ -979,6 +1000,18 @@ export default function InterviewPage() {
                     committedAnswerSessionIdsRef.current.add(answerSessionId)
                     appendCandidateMessage(displayText)
                 }
+            })
+
+            socketClient.on('speech_metrics_realtime', (data: any) => {
+                if (!data?.session_id || data.session_id !== sessionIdRef.current) return
+                if (data?.turn_id && currentTurnIdRef.current && data.turn_id !== currentTurnIdRef.current) return
+                if (typeof data?.interrupt_epoch === 'number' && data.interrupt_epoch < interruptEpochRef.current) return
+                setSpeechRealtimeMetrics({
+                    is_speaking: Boolean(data?.is_speaking),
+                    rough_wpm: Number(data?.rough_wpm || 0),
+                    silence_ms: Number(data?.silence_ms || 0),
+                    segment_index: Number(data?.segment_index || 0),
+                })
             })
 
             socketClient.on('asr_partial', (data: any) => {
@@ -1012,20 +1045,25 @@ export default function InterviewPage() {
                 if (data.session_id !== sessionIdRef.current) return
                 if (typeof data?.interrupt_epoch === 'number' && data.interrupt_epoch < interruptEpochRef.current) return
                 if (activeTtsJobIdRef.current && data?.job_id && data.job_id !== activeTtsJobIdRef.current) return
-                if (browserTtsActiveRef.current) {
-                    return
-                }
 
-                if (ttsSafetyTimerRef.current) {
-                    clearTimeout(ttsSafetyTimerRef.current)
-                    ttsSafetyTimerRef.current = null
+                receivedServerChunkForCurrentSpeakRef.current = true
+
+                // 服务端音频到达后，优先使用服务端流，抢占浏览器播报。
+                if (browserTtsActiveRef.current && typeof window !== 'undefined' && 'speechSynthesis' in window) {
+                    window.speechSynthesis.cancel()
+                    browserTtsUtteranceRef.current = null
+                    browserTtsActiveRef.current = false
                 }
                 ttsAudioQueueRef.current.push({
                     audio: data.audio,
                     jobId: data.job_id || '',
                     turnId: data.turn_id || '',
-                    mimeType: data.mime_type || 'audio/mpeg'
+                    mimeType: data.mime_type || 'audio/mpeg',
+                    provider: data.provider || ''
                 })
+                if (data?.provider) {
+                    console.log('[TTS] 收到服务端音频:', data.provider, data.mime_type || 'audio/mpeg')
+                }
                 playNextTtsChunk()
             })
 
@@ -1061,8 +1099,18 @@ export default function InterviewPage() {
                 }
                 clearLlmTimeout()
                 setIsProcessing(false)
-                if (data?.code === 'TTS_SYNTH_FAIL' && pendingTtsTextRef.current) {
-                    playBrowserTts(pendingTtsTextRef.current)
+                if (data?.code === 'TTS_SYNTH_FAIL') {
+                    const shouldFallbackToBrowser =
+                        pendingTtsTextRef.current
+                        && !receivedServerChunkForCurrentSpeakRef.current
+                        && !currentTtsAudioRef.current
+                        && ttsAudioQueueRef.current.length === 0
+                    if (shouldFallbackToBrowser) {
+                        console.warn('[TTS] 服务端合成失败，切换到浏览器语音兜底')
+                        playBrowserTts(pendingTtsTextRef.current)
+                    } else {
+                        console.warn('[TTS] 服务端已开始输出，禁止浏览器语音兜底以避免重复播报')
+                    }
                 } else {
                     stopCurrentTts()
                 }
@@ -1270,6 +1318,10 @@ export default function InterviewPage() {
     }
 
     const voiceInputEnabled = isVoiceSupported && (isServerAsrAvailable || isBrowserAsrSupported)
+    const realtimePauseSeconds = (speechRealtimeMetrics.silence_ms / 1000).toFixed(1)
+    const realtimeWpmText = speechRealtimeMetrics.rough_wpm > 0
+        ? `${speechRealtimeMetrics.rough_wpm.toFixed(1)} token/min`
+        : '--'
     const voiceStatusText = !voiceInputEnabled
         ? (isVoiceSupported
             ? '语音识别当前不可用，请使用下方文本框继续回答。'
@@ -1306,7 +1358,9 @@ export default function InterviewPage() {
             ? '系统正在把同一题下的多个语音分段整理成完整回答'
             : answerSessionStatus === 'paused_short'
                 ? '这一小段停顿不会提交给面试官，继续说会自动续写'
-                : '语音转写会同步显示，可直接编辑后提交'
+                : finalMetricsReady
+                    ? '终稿指标已就绪（语速/停顿/口头禅/流畅度/清晰度代理）'
+                    : '语音转写会同步显示，可直接编辑后提交'
 
     useEffect(() => {
         if (!cameraReady || !socket || !interviewStarted || !sessionIdRef.current) return
@@ -1413,6 +1467,7 @@ export default function InterviewPage() {
                         playsInline
                         muted
                         className="absolute inset-0 h-full w-full object-cover"
+                        style={{ transform: 'scaleX(-1)' }}
                     />
 
                     {!cameraReady && (
@@ -1517,11 +1572,24 @@ export default function InterviewPage() {
                         </div>
 
                         <div className="flex flex-col gap-3">
-                            <div className="flex items-center gap-3 rounded-2xl border border-white/10 bg-white/10 px-4 py-3">
-                                <Mic className={`h-5 w-5 ${voiceInputEnabled && isListening && answerSessionStatus !== 'finalizing' ? 'animate-pulse text-emerald-300' : voiceInputEnabled ? 'text-white/65' : 'text-amber-300'}`} />
-                                <span className="text-sm text-white/80">
-                                    {voiceStatusText}
-                                </span>
+                            <div className="rounded-2xl border border-white/10 bg-white/10 px-4 py-3">
+                                <div className="flex items-center gap-3">
+                                    <Mic className={`h-5 w-5 ${voiceInputEnabled && isListening && answerSessionStatus !== 'finalizing' ? 'animate-pulse text-emerald-300' : voiceInputEnabled ? 'text-white/65' : 'text-amber-300'}`} />
+                                    <span className="text-sm text-white/80">
+                                        {voiceStatusText}
+                                    </span>
+                                </div>
+                                {voiceInputEnabled && (
+                                    <div className="mt-2 text-xs text-white/65">
+                                        <span>
+                                            {speechRealtimeMetrics.is_speaking ? '说话中' : `停顿 ${realtimePauseSeconds}s`}
+                                        </span>
+                                        <span className="mx-2">|</span>
+                                        <span>实时语速 {realtimeWpmText}</span>
+                                        <span className="mx-2">|</span>
+                                        <span>分段 #{Math.max(1, speechRealtimeMetrics.segment_index || 1)}</span>
+                                    </div>
+                                )}
                             </div>
 
                             {!voiceInputEnabled && (
@@ -1652,6 +1720,7 @@ export default function InterviewPage() {
                                 playsInline
                                 muted
                                 className="h-full w-full object-cover"
+                                style={{ transform: 'scaleX(-1)' }}
                             />
                             {!cameraReady && (
                                 <div className="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-gray-900 to-black">

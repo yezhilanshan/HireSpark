@@ -252,6 +252,8 @@ class KnowledgeStore:
                 "optional_points": q.get("optional_points", []),
                 "common_mistakes": q.get("common_mistakes", []),
                 "scoring_rubric": q.get("scoring_rubric", {}),
+                "aliases": q.get("aliases", {}),
+                "rubric_version": q.get("rubric_version", "unknown"),
                 "followups": q.get("followups", []),
                 "retrieval_text": self._build_rubric_dense_text(q),
                 "source": q.get("source", ""),

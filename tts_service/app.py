@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import io
+import logging
 import os
 import tempfile
 import threading
@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from backend.tts_text import prepare_tts_text
 
 app = FastAPI(title="Standalone TTS Service", version="1.0.0")
+logger = logging.getLogger("tts_service")
 
 
 class SynthesizeRequest(BaseModel):
@@ -90,25 +91,60 @@ class MeloTTSProvider:
     def _synthesize_sync(self, req: SynthesizeRequest) -> bytes:
         language = (req.language or self.default_language).upper()
         model = self._get_model(language)
-        speakers = model.hps.data.spk2id
-        speaker = (req.speaker or self.default_speaker or next(iter(speakers))).strip()
-        if speaker not in speakers:
-            raise ValueError(
-                f"Unknown Melo speaker '{speaker}'. Available speakers: {', '.join(speakers.keys())}"
-            )
+        speakers = dict(model.hps.data.spk2id or {})
+        if not speakers:
+            raise ValueError("Melo model has no available speakers")
+
+        raw_speaker = req.speaker if req.speaker not in (None, "") else self.default_speaker
+        speaker_key = next(iter(speakers.keys()))
+        if raw_speaker not in (None, ""):
+            candidate = raw_speaker.strip() if isinstance(raw_speaker, str) else raw_speaker
+            if candidate in speakers:
+                speaker_key = candidate
+            elif isinstance(candidate, str) and candidate.isdigit() and int(candidate) in speakers:
+                speaker_key = int(candidate)
+            else:
+                available = ", ".join(map(str, speakers.keys()))
+                raise ValueError(
+                    f"Unknown Melo speaker '{raw_speaker}'. Available speakers: {available}"
+                )
+
+        speaker_id = speakers[speaker_key]
+        if not isinstance(speaker_id, int):
+            try:
+                speaker_id = int(speaker_id)
+            except Exception as exc:
+                raise ValueError(
+                    f"Invalid Melo speaker id '{speaker_id}' for key '{speaker_key}'"
+                ) from exc
 
         speed = req.speed or self.default_speed
-        buffer = io.BytesIO()
-        with self._lock:
-            model.tts_to_file(
-                req.text,
-                speakers[speaker],
-                buffer,
-                speed=speed,
-                format="wav",
-                quiet=True,
-            )
-        return buffer.getvalue()
+        if not isinstance(speed, (float, int)):
+            raise ValueError("Melo speed must be a number")
+
+        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        tmp_path = tmp_file.name
+        tmp_file.close()
+        try:
+            with self._lock:
+                model.tts_to_file(
+                    req.text,
+                    speaker_id,
+                    output_path=tmp_path,
+                    speed=float(speed),
+                    format="wav",
+                    quiet=True,
+                )
+            with open(tmp_path, "rb") as f:
+                audio_data = f.read()
+            if not audio_data:
+                raise RuntimeError("Melo returned empty wav")
+            return audio_data
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
     async def synthesize(self, req: SynthesizeRequest) -> bytes:
         return await asyncio.to_thread(self._synthesize_sync, req)
@@ -146,13 +182,19 @@ class ProviderRuntime:
 
 
 def _resolve_provider_order() -> list[str]:
-    provider_name = os.environ.get("TTS_PROVIDER", "melo").strip().lower()
-    if provider_name == "melo":
-        return ["melo", "edge"]
-    if provider_name == "edge":
-        return ["edge"]
+    provider_name = os.environ.get("TTS_PROVIDER", "auto").strip().lower()
+    strict_mode = str(os.environ.get("TTS_PROVIDER_STRICT", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
     if provider_name == "auto":
-        return ["melo", "edge"]
+        return ["edge"] if strict_mode else ["edge", "melo"]
+    if provider_name == "melo":
+        return ["melo"] if strict_mode else ["melo", "edge"]
+    if provider_name == "edge":
+        return ["edge"] if strict_mode else ["edge", "melo"]
     raise RuntimeError(f"Unsupported TTS_PROVIDER: {provider_name}")
 
 
@@ -180,6 +222,15 @@ def _load_providers():
 
 providers, provider_errors, provider_order = _load_providers()
 
+loaded_names = [runtime.name for runtime in providers]
+logger.info(
+    "[TTS Service] provider_order=%s, loaded=%s",
+    provider_order,
+    loaded_names,
+)
+if provider_errors:
+    logger.warning("[TTS Service] provider load errors: %s", provider_errors)
+
 
 @app.get("/health")
 async def health():
@@ -187,6 +238,7 @@ async def health():
     return {
         "status": "healthy" if ready else "degraded",
         "ready": ready,
+        "provider_strict": str(os.environ.get("TTS_PROVIDER_STRICT", "")).strip().lower() in {"1", "true", "yes", "on"},
         "provider_order": provider_order,
         "active_provider": providers[0].name if providers else None,
         "providers": [runtime.health() for runtime in providers],

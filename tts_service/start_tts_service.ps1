@@ -5,9 +5,8 @@ $ErrorActionPreference = "Stop"
 $RootPath = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $ServicePath = Join-Path $RootPath "tts_service"
 $TtsEnv = if ($env:TTS_CONDA_ENV) { $env:TTS_CONDA_ENV } else { "interview-tts" }
-$Provider = if ($env:TTS_PROVIDER) { $env:TTS_PROVIDER } else { "melo" }
+$Provider = if ($env:TTS_PROVIDER) { $env:TTS_PROVIDER } else { "auto" }
 $Port = if ($env:TTS_SERVICE_PORT) { $env:TTS_SERVICE_PORT } else { "5001" }
-$RequirementsFile = if ($Provider -eq "melo") { "requirements-melo.txt" } else { "requirements.txt" }
 
 Write-Host "============================================================" -ForegroundColor Cyan
 Write-Host "独立 TTS 服务启动脚本" -ForegroundColor Cyan
@@ -35,15 +34,15 @@ try {
 }
 
 Write-Host "[1/2] 检查 TTS 依赖..." -ForegroundColor Yellow
-$ImportCheck = if ($Provider -eq "melo") {
+$ImportCheck = if ($Provider -eq "melo" -or $Provider -eq "auto") {
     "import fastapi, uvicorn, edge_tts; import melo"
 } else {
     "import fastapi, uvicorn, edge_tts"
 }
 conda run -n $TtsEnv python -c $ImportCheck *> $null
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "! 依赖缺失，开始安装 $RequirementsFile" -ForegroundColor Yellow
-    conda run -n $TtsEnv pip install -r "tts_service/$RequirementsFile"
+    Write-Host "! 依赖缺失，开始安装 requirements.txt" -ForegroundColor Yellow
+    conda run -n $TtsEnv pip install -r "requirements.txt"
     if ($LASTEXITCODE -ne 0) {
         Write-Host "✗ TTS 依赖安装失败" -ForegroundColor Red
         pause

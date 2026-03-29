@@ -31,6 +31,8 @@ class TTSManager:
     def __init__(self):
         self.last_error: str = ""
         self.last_content_type: str = "audio/mpeg"
+        self.last_provider: str = ""
+        self.expected_provider: str = str(os.environ.get("TTS_PROVIDER", "")).strip().lower()
         self.mode = str(
             os.environ.get("TTS_MODE") or config.get("tts.mode", "remote")
         ).strip().lower()
@@ -50,6 +52,7 @@ class TTSManager:
             logger.info(
                 f"[TTS] 远程 TTS 已初始化 - Mode: {self.mode}, URL: {self.service_url}"
             )
+            self._log_remote_provider_state()
         else:
             logger.warning(
                 f"[TTS] TTS 当前未启用 - Mode: {self.mode}, URL: {self.service_url or 'N/A'}"
@@ -74,6 +77,7 @@ class TTSManager:
                     resp.headers.get("Content-Type", "audio/mpeg").split(";")[0].strip()
                     or "audio/mpeg"
                 )
+                self.last_provider = str(resp.headers.get("X-TTS-Provider", "")).strip().lower()
                 audio_data = resp.read()
                 if not audio_data:
                     self.last_error = "Remote TTS returned empty audio"
@@ -90,6 +94,35 @@ class TTSManager:
         except Exception as exc:
             self.last_error = str(exc)[:200]
             return None
+
+    def _log_remote_provider_state(self) -> None:
+        req = request.Request(f"{self.service_url}/health", method="GET")
+        try:
+            with request.urlopen(req, timeout=min(self.timeout, 3.0)) as resp:
+                health = json.loads(resp.read().decode("utf-8"))
+        except Exception as exc:
+            logger.warning(f"[TTS] 拉取远程健康状态失败：{str(exc)[:200]}")
+            return
+
+        active_provider = str(health.get("active_provider") or "").strip().lower()
+        provider_order = health.get("provider_order") or []
+        provider_errors = health.get("provider_errors") or {}
+        logger.info(
+            f"[TTS] 远程健康状态 - active_provider: {active_provider or 'unknown'}, "
+            f"provider_order: {provider_order}"
+        )
+        if provider_errors:
+            logger.warning(f"[TTS] Provider 加载错误：{provider_errors}")
+        if (
+            self.expected_provider
+            and self.expected_provider != "auto"
+            and active_provider
+            and self.expected_provider != active_provider
+        ):
+            logger.warning(
+                f"[TTS] Provider 与期望不一致：expected={self.expected_provider}, "
+                f"active={active_provider}，可能已回退。"
+            )
 
     def synthesize(
         self,
@@ -120,6 +153,7 @@ class TTSManager:
         logger.info(f"[TTS] 开始远程合成：'{prepared_text[:30]}...'")
         self.last_error = ""
         self.last_content_type = "audio/mpeg"
+        self.last_provider = ""
         audio_data = self._synthesize_remote(prepared_text)
         if not audio_data:
             logger.error(f"[TTS] 远程合成失败：{self.last_error}")
@@ -148,6 +182,11 @@ class TTSManager:
             "enabled": self.enabled,
             "mode": self.mode,
             "service_url": self.service_url,
+            "expected_provider": (
+                self.expected_provider
+                if self.expected_provider and self.expected_provider != "auto"
+                else None
+            ),
         }
         if not self.enabled:
             return status

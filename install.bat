@@ -27,7 +27,7 @@ echo Step 1: Installing Backend Dependencies
 echo ============================================================
 cd backend
 echo Installing Python packages...
-pip install -r requirements.txt
+pip install -r ..\requirements.txt
 if errorlevel 1 (
     echo Failed to install backend dependencies
     pause
