@@ -425,13 +425,14 @@ class LLMManager:
         round_type: str,
         scoring_rubric: Optional[Dict] = None,
         layer1_result: Optional[Dict] = None,
-        prompt_version: str = "v1"
+        prompt_version: str = "v1",
+        speech_context: Optional[Dict] = None
     ) -> Dict:
         """
-        第二层评估：结合题目、回答、三档 rubric 与第一层结果，输出结构化 JSON。
+        ??????????????rubric?????????????????? JSON?
         """
         if not self.check_enabled():
-            return {"error": "LLM_NOT_READY", "message": "LLM 功能未启用"}
+            return {"error": "LLM_NOT_READY", "message": "LLM ?????"}
 
         round_dimensions = {
             "technical": ["technical_accuracy", "knowledge_depth", "completeness", "logic", "job_match"],
@@ -443,6 +444,7 @@ class LLMManager:
 
         rubric_text = json.dumps(scoring_rubric or {}, ensure_ascii=False, indent=2)
         layer1_text = json.dumps(layer1_result or {}, ensure_ascii=False, indent=2)
+        speech_text = json.dumps(speech_context or {}, ensure_ascii=False, indent=2)
 
         dim_schema = ", ".join(
             f'"{name}": {{"score": 0-100, "reason": "..."}}'
@@ -450,20 +452,28 @@ class LLMManager:
         )
 
         system_prompt = (
-            "你是资深技术面试评估官。"
-            "请严格输出 JSON，不要输出任何额外文本。"
-            "第一层结果仅作为辅助信号，不是唯一标准。"
-            "如果候选人使用等价技术表达（非关键词原词），可以判定为命中并给出解释。"
+            "You are an interview grading assistant. "
+            "Return valid JSON only. "
+            "Your dimension scores must be text-semantic base scores derived from the answer content, rubric, and layer1 evidence. "
+            "Do not apply speech weighting inside dimension scores or overall_score. "
+            "If speech_context is present, you may reference it only in reasons and summary wording. "
+            "Keep scores calibrated to 0-100 and ensure reasons are concise."
         )
         user_prompt = (
             f"prompt_version: {prompt_version}\n"
-            f"岗位: {position}\n"
-            f"轮次: {round_type}\n"
-            f"题目: {question}\n"
-            f"候选人回答: {user_answer}\n\n"
-            f"评分标准 scoring_rubric:\n{rubric_text}\n\n"
-            f"第一层分析 layer1_result:\n{layer1_text}\n\n"
-            "请按以下 JSON schema 返回，字段不可缺失：\n"
+            f"position: {position}\n"
+            f"round_type: {round_type}\n"
+            f"question: {question}\n"
+            f"candidate_answer: {user_answer}\n\n"
+            f"scoring_rubric:\n{rubric_text}\n\n"
+            f"layer1_result:\n{layer1_text}\n\n"
+            f"speech_context:\n{speech_text}\n\n"
+            "Scoring rules:\n"
+            "1. `dimension_scores` must be text-base scores only.\n"
+            "2. `overall_score` should be the mean of the text-base dimension scores.\n"
+            "3. `rubric_eval` should reflect rubric alignment.\n"
+            "4. `summary` can mention speaking strengths/weaknesses only if supported by speech_context.\n\n"
+            "Return JSON with this schema:\n"
             "{\n"
             '  "rubric_eval": {\n'
             '    "basic_match": 0,\n'
@@ -471,7 +481,7 @@ class LLMManager:
             '    "excellent_match": 0,\n'
             '    "final_level": "basic|good|excellent",\n'
             '    "confidence": 0.0,\n'
-            '    "reason": "..." \n'
+            '    "reason": "..."\n'
             "  },\n"
             '  "dimension_scores": {\n'
             f"    {dim_schema}\n"
@@ -483,7 +493,7 @@ class LLMManager:
             '    "next_actions": ["..."]\n'
             "  }\n"
             "}\n"
-            "注意：basic_match/good_match/excellent_match 与各维度 score 的范围都是 0~100。"
+            "All score fields except confidence must be between 0 and 100."
         )
 
         try:
@@ -507,7 +517,7 @@ class LLMManager:
             import re
             json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
             if not json_match:
-                return {"error": "INVALID_JSON", "message": "模型未返回 JSON", "raw_text": raw_text}
+                return {"error": "INVALID_JSON", "message": "????? JSON", "raw_text": raw_text}
 
             parsed = json.loads(json_match.group())
             rubric_eval = parsed.get("rubric_eval", {}) or {}
@@ -556,7 +566,7 @@ class LLMManager:
             }
             return normalized
         except Exception as e:
-            logger.error(f"✗ 第二层 rubric 评估失败: {str(e)}")
+            logger.error(f"??? rubric ????: {str(e)}")
             return {"error": "EVALUATION_EXCEPTION", "message": str(e)}
 
     def set_interview_round(self, round_type: str, resume_data: Optional[Dict] = None):

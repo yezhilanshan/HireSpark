@@ -5,6 +5,7 @@ import os
 import tempfile
 import time
 import unittest
+from datetime import datetime
 
 from database import DatabaseManager
 from rag.service import RAGService
@@ -53,6 +54,48 @@ class _StubLLMDisabled:
     model = "mock-disabled"
 
 
+class _StubLLMScored:
+    enabled = True
+    model = "mock-scored"
+
+    def evaluate_answer_with_rubric(self, **kwargs):
+        round_type = kwargs.get("round_type", "technical")
+        dimensions = {
+            "technical": {
+                "technical_accuracy": {"score": 92, "reason": "solid fundamentals"},
+                "knowledge_depth": {"score": 80, "reason": "good depth"},
+                "completeness": {"score": 70, "reason": "mostly complete"},
+                "logic": {"score": 60, "reason": "structure can improve"},
+                "job_match": {"score": 75, "reason": "relevant experience"},
+            },
+            "hr": {
+                "clarity": {"score": 68, "reason": "clear enough"},
+                "relevance": {"score": 72, "reason": "mostly relevant"},
+                "self_awareness": {"score": 66, "reason": "some reflection"},
+                "communication": {"score": 64, "reason": "can be tighter"},
+            },
+        }
+        dimension_scores = dimensions.get(round_type, dimensions["technical"])
+        overall_score = sum(item["score"] for item in dimension_scores.values()) / len(dimension_scores)
+        return {
+            "rubric_eval": {
+                "basic_match": 88,
+                "good_match": 76,
+                "excellent_match": 32,
+                "final_level": "good",
+                "confidence": 0.82,
+                "reason": "overall aligned",
+            },
+            "dimension_scores": dimension_scores,
+            "overall_score": overall_score,
+            "summary": {
+                "strengths": ["structured answer"],
+                "weaknesses": ["logic pacing"],
+                "next_actions": ["tighten examples"],
+            },
+        }
+
+
 class _StubRAGSkipped:
     enabled = True
 
@@ -81,7 +124,24 @@ class EvaluationServiceTestCase(unittest.TestCase):
         except Exception:
             pass
 
+    def _ensure_interview(self, interview_id: str):
+        now = datetime.now().isoformat()
+        result = self.db.save_interview({
+            "interview_id": interview_id,
+            "start_time": now,
+            "end_time": now,
+            "duration": 60,
+            "max_probability": 0.0,
+            "avg_probability": 0.0,
+            "risk_level": "LOW",
+            "events_count": 0,
+            "report_path": "",
+        })
+        if not result.get("success") and result.get("error") != "Interview ID already exists":
+            self.fail(f"failed to create interview fixture: {result}")
+
     def test_database_upsert_with_evaluation_version(self):
+        self._ensure_interview("i_001")
         base_payload = {
             "interview_id": "i_001",
             "turn_id": "t_001",
@@ -175,6 +235,7 @@ class EvaluationServiceTestCase(unittest.TestCase):
         self.assertIn("semantic", covered_semantic[0].get("strategies", []))
 
     def test_async_enqueue_partial_ok_when_llm_unavailable(self):
+        self._ensure_interview("i_async_001")
         eval_service = EvaluationService(
             db_manager=self.db,
             rag_service=_StubRAG(),
@@ -208,6 +269,7 @@ class EvaluationServiceTestCase(unittest.TestCase):
             eval_service.shutdown()
 
     def test_enqueue_idempotent_when_record_exists(self):
+        self._ensure_interview("i_idem_001")
         self.db.save_or_update_evaluation({
             "interview_id": "i_idem_001",
             "turn_id": "turn_1",
@@ -250,6 +312,7 @@ class EvaluationServiceTestCase(unittest.TestCase):
             eval_service.shutdown()
 
     def test_async_enqueue_skipped_when_rubric_missing(self):
+        self._ensure_interview("i_skip_001")
         eval_service = EvaluationService(
             db_manager=self.db,
             rag_service=_StubRAGSkipped(),
@@ -279,6 +342,90 @@ class EvaluationServiceTestCase(unittest.TestCase):
                 time.sleep(0.15)
 
             self.assertEqual(final_status, "skipped")
+        finally:
+            eval_service.shutdown()
+
+    def test_layer2_fuses_speech_only_on_supported_dimensions(self):
+        self._ensure_interview("i_speech_001")
+        self.db.save_or_update_speech_evaluation({
+            "interview_id": "i_speech_001",
+            "turn_id": "turn_1",
+            "answer_session_id": "answer_1",
+            "round_type": "technical",
+            "final_transcript": "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty one twenty two",
+            "word_timestamps_json": "[]",
+            "pause_events_json": "[]",
+            "filler_events_json": "[]",
+            "speech_metrics_final_json": '{"audio_duration_ms": 12000, "dimensions": {"clarity_score": 90, "fluency_score": 80, "speech_rate_score": 70, "pause_anomaly_score": 60, "filler_frequency_score": 50}}',
+            "realtime_metrics_json": "{}",
+        })
+        eval_service = EvaluationService(
+            db_manager=self.db,
+            rag_service=_StubRAG(),
+            llm_manager=_StubLLMScored(),
+        )
+        try:
+            payload = {
+                "interview_id": "i_speech_001",
+                "turn_id": "turn_1",
+                "question_id": "q_1",
+                "round_type": "technical",
+                "position": "java_backend",
+                "question": "Explain a design choice",
+                "answer": "Candidate answer",
+                "prompt_version": "v1",
+            }
+            layer2 = eval_service.evaluate_layer2(payload, _StubRAG().evaluate_layer1(question_id="q_1"))
+
+            self.assertTrue(layer2.get("speech_used"))
+            self.assertAlmostEqual(layer2.get("speech_expression_score"), 75.0, places=2)
+            self.assertAlmostEqual(layer2["text_base_dimension_scores"]["logic"]["score"], 60.0, places=2)
+            self.assertAlmostEqual(layer2["final_dimension_scores"]["logic"]["score"], 63.0, places=2)
+            self.assertAlmostEqual(layer2["speech_adjustments"]["logic"], 3.0, places=2)
+            self.assertAlmostEqual(layer2["final_dimension_scores"]["completeness"]["score"], 70.5, places=2)
+            self.assertAlmostEqual(layer2["final_dimension_scores"]["technical_accuracy"]["score"], 92.0, places=2)
+            self.assertAlmostEqual(layer2["overall_score_final"], 76.1, places=2)
+        finally:
+            eval_service.shutdown()
+
+    def test_layer2_keeps_text_scores_when_speech_gate_fails(self):
+        self._ensure_interview("i_speech_002")
+        self.db.save_or_update_speech_evaluation({
+            "interview_id": "i_speech_002",
+            "turn_id": "turn_1",
+            "answer_session_id": "answer_2",
+            "round_type": "technical",
+            "final_transcript": "too short",
+            "word_timestamps_json": "[]",
+            "pause_events_json": "[]",
+            "filler_events_json": "[]",
+            "speech_metrics_final_json": '{"audio_duration_ms": 3000, "dimensions": {"clarity_score": 95, "fluency_score": 92, "speech_rate_score": 88, "pause_anomaly_score": 85, "filler_frequency_score": 90}}',
+            "realtime_metrics_json": "{}",
+        })
+        eval_service = EvaluationService(
+            db_manager=self.db,
+            rag_service=_StubRAG(),
+            llm_manager=_StubLLMScored(),
+        )
+        try:
+            payload = {
+                "interview_id": "i_speech_002",
+                "turn_id": "turn_1",
+                "question_id": "q_2",
+                "round_type": "technical",
+                "position": "java_backend",
+                "question": "Explain a design choice",
+                "answer": "Candidate answer",
+                "prompt_version": "v1",
+            }
+            layer2 = eval_service.evaluate_layer2(payload, _StubRAG().evaluate_layer1(question_id="q_2"))
+
+            self.assertFalse(layer2.get("speech_used"))
+            self.assertIn("audio_duration_below_threshold", layer2.get("speech_context", {}).get("quality_gate", {}).get("reasons", []))
+            self.assertIn("token_count_below_threshold", layer2.get("speech_context", {}).get("quality_gate", {}).get("reasons", []))
+            self.assertAlmostEqual(layer2["final_dimension_scores"]["logic"]["score"], 60.0, places=2)
+            self.assertAlmostEqual(layer2["speech_adjustments"]["logic"], 0.0, places=2)
+            self.assertAlmostEqual(layer2["overall_score_final"], layer2["overall_score_base"], places=2)
         finally:
             eval_service.shutdown()
 

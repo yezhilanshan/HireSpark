@@ -2343,6 +2343,350 @@ def _decode_speech_rows(raw_rows):
     return decoded
 
 
+def _decode_evaluation_rows(raw_rows):
+    decoded = []
+    for row in raw_rows or []:
+        item = dict(row)
+        for key in ('layer1_json', 'layer2_json'):
+            raw_value = item.get(key)
+            if not raw_value:
+                item[key.replace('_json', '')] = {}
+                continue
+            try:
+                item[key.replace('_json', '')] = json.loads(raw_value)
+            except Exception:
+                item[key.replace('_json', '')] = {}
+        decoded.append(item)
+    return decoded
+
+
+def _score_to_level(score: float) -> str:
+    score = float(score or 0.0)
+    if score >= 85:
+        return 'excellent'
+    if score >= 70:
+        return 'good'
+    if score >= 55:
+        return 'developing'
+    return 'basic'
+
+
+def _safe_avg(values):
+    valid = [float(v) for v in values if isinstance(v, (int, float))]
+    return (sum(valid) / len(valid)) if valid else 0.0
+
+
+def _normalize_dimension_items(score_map):
+    label_map = {
+        'technical_correctness': '技术准确性',
+        'knowledge_depth': '知识深度',
+        'logical_rigor': '逻辑严谨性',
+        'expression_clarity': '表达清晰度',
+        'job_match': '岗位匹配度',
+        'adaptability': '应变与稳定性',
+    }
+    items = []
+    for key, label in label_map.items():
+        items.append({
+            'key': key,
+            'label': label,
+            'score': round(float(score_map.get(key, 0.0) or 0.0), 1),
+            'source': 'heuristic'
+        })
+    return items
+
+
+def _build_legacy_score_breakdown_from_dimensions(dimension_items):
+    score_map = {item.get('key'): float(item.get('score', 0.0) or 0.0) for item in (dimension_items or [])}
+    return {
+        'technical_correctness': round(score_map.get('technical_correctness', 0.0), 1),
+        'knowledge_depth': round(score_map.get('knowledge_depth', 0.0), 1),
+        'logical_rigor': round(score_map.get('logical_rigor', 0.0), 1),
+        'expression_clarity': round(score_map.get('expression_clarity', 0.0), 1),
+        'job_match': round(score_map.get('job_match', 0.0), 1),
+        'adaptability': round(score_map.get('adaptability', 0.0), 1),
+    }
+
+
+def _build_growth_report_v2(dialogues, evaluation_rows=None, speech_rows=None):
+    speech_summary = aggregate_expression_metrics(speech_rows or [])
+    decoded_evaluations = _decode_evaluation_rows(evaluation_rows or [])
+    rounds = [str(d.get('round_type') or 'unknown') for d in dialogues]
+    round_counter = Counter(rounds)
+    started_at = _parse_db_datetime(dialogues[0].get('created_at')) if dialogues else None
+    ended_at = _parse_db_datetime(dialogues[-1].get('created_at')) if dialogues else None
+    duration_seconds = int((ended_at - started_at).total_seconds()) if started_at and ended_at else 0
+    dominant_round = round_counter.most_common(1)[0][0] if round_counter else 'technical'
+
+    legacy_scores = _calc_dimension_scores(dialogues, speech_summary=speech_summary)
+    legacy_strengths = []
+    legacy_weaknesses = []
+
+    if decoded_evaluations:
+        dimension_labels = {
+            'technical_accuracy': '技术准确性',
+            'knowledge_depth': '知识深度',
+            'completeness': '回答完整度',
+            'logic': '逻辑严谨性',
+            'job_match': '岗位匹配度',
+            'authenticity': '项目真实性',
+            'ownership': '项目 ownership',
+            'technical_depth': '项目技术深度',
+            'reflection': '复盘反思',
+            'architecture_reasoning': '架构推理',
+            'tradeoff_awareness': '权衡意识',
+            'scalability': '扩展性设计',
+            'clarity': '表达清晰度',
+            'relevance': '回答相关性',
+            'self_awareness': '自我认知',
+            'communication': '沟通表现',
+        }
+
+        aggregated_dimension_scores = {}
+        round_score_values = {}
+        strengths = []
+        weaknesses = []
+        next_actions = []
+        question_reviews = []
+
+        for row in decoded_evaluations:
+            layer2 = row.get('layer2') or {}
+            text_base_dim_scores = (layer2.get('text_base_dimension_scores') or {})
+            dim_scores = (layer2.get('final_dimension_scores') or layer2.get('dimension_scores') or {})
+            speech_adjustments = (layer2.get('speech_adjustments') or {})
+            summary = (layer2.get('summary') or {})
+            round_type = str(row.get('round_type') or 'technical')
+            overall_score = float(
+                layer2.get('overall_score_final')
+                or row.get('overall_score')
+                or layer2.get('overall_score')
+                or 0.0
+            )
+            round_score_values.setdefault(round_type, []).append(overall_score)
+            speech_used = bool(layer2.get('speech_used'))
+
+            normalized_dims = []
+            for dim_key, dim_payload in dim_scores.items():
+                score = float((dim_payload or {}).get('score') or 0.0)
+                text_base_score = float(((text_base_dim_scores.get(dim_key) or {}).get('score')) or score)
+                speech_adjustment = speech_adjustments.get(dim_key, score - text_base_score)
+                aggregated_dimension_scores.setdefault(dim_key, []).append(score)
+                normalized_dims.append({
+                    'key': dim_key,
+                    'label': dimension_labels.get(dim_key, dim_key),
+                    'score': round(score, 1),
+                    'final_score': round(score, 1),
+                    'text_base_score': round(text_base_score, 1),
+                    'speech_adjustment': round(float(speech_adjustment or 0.0), 1),
+                    'speech_used': speech_used,
+                    'reason': str((dim_payload or {}).get('reason') or '').strip(),
+                })
+
+            strengths.extend([str(x).strip() for x in (summary.get('strengths') or []) if str(x).strip()])
+            weaknesses.extend([str(x).strip() for x in (summary.get('weaknesses') or []) if str(x).strip()])
+            next_actions.extend([str(x).strip() for x in (summary.get('next_actions') or []) if str(x).strip()])
+
+            question_reviews.append({
+                'turn_id': row.get('turn_id', ''),
+                'question_id': row.get('question_id', ''),
+                'round_type': round_type,
+                'question': row.get('question', ''),
+                'answer': row.get('answer', ''),
+                'rubric_level': row.get('rubric_level', ''),
+                'overall_score': round(overall_score, 1),
+                'overall_score_base': round(float(layer2.get('overall_score_base') or overall_score), 1),
+                'overall_score_final': round(float(layer2.get('overall_score_final') or overall_score), 1),
+                'confidence': round(float(row.get('confidence') or 0.0), 4),
+                'status': row.get('status', ''),
+                'speech_used': speech_used,
+                'speech_fusion_version': layer2.get('speech_fusion_version', ''),
+                'speech_expression_score': round(float(layer2.get('speech_expression_score') or 0.0), 1) if layer2.get('speech_expression_score') is not None else None,
+                'dimensions': normalized_dims,
+                'summary': {
+                    'strengths': [str(x) for x in (summary.get('strengths') or [])][:3],
+                    'weaknesses': [str(x) for x in (summary.get('weaknesses') or [])][:3],
+                    'next_actions': [str(x) for x in (summary.get('next_actions') or [])][:3],
+                }
+            })
+
+        overall_score = round(_safe_avg([
+            (row.get('layer2') or {}).get('overall_score_final')
+            or row.get('overall_score')
+            or (row.get('layer2') or {}).get('overall_score')
+            for row in decoded_evaluations
+        ]), 1)
+        dimension_items = [
+            {
+                'key': dim_key,
+                'label': dimension_labels.get(dim_key, dim_key),
+                'score': round(_safe_avg(values), 1),
+                'source': 'evaluation_service'
+            }
+            for dim_key, values in sorted(aggregated_dimension_scores.items())
+        ]
+
+        legacy_scores = {
+            'technical_correctness': round(_safe_avg(aggregated_dimension_scores.get('technical_accuracy', [])) or 60.0, 1),
+            'knowledge_depth': round(_safe_avg(aggregated_dimension_scores.get('knowledge_depth', [])) or 60.0, 1),
+            'logical_rigor': round(_safe_avg(aggregated_dimension_scores.get('logic', [])) or 60.0, 1),
+            'expression_clarity': round(_safe_avg(
+                aggregated_dimension_scores.get('clarity', []) or aggregated_dimension_scores.get('communication', [])
+            ) or 60.0, 1),
+            'job_match': round(_safe_avg(aggregated_dimension_scores.get('job_match', [])) or 60.0, 1),
+            'adaptability': round(_safe_avg(
+                aggregated_dimension_scores.get('reflection', []) or aggregated_dimension_scores.get('tradeoff_awareness', [])
+            ) or 60.0, 1),
+        }
+
+        legacy_strengths = strengths[:]
+        legacy_weaknesses = weaknesses[:]
+
+        round_breakdown = [
+            {
+                'round_type': round_type,
+                'count': len(values),
+                'avg_score': round(_safe_avg(values), 1),
+            }
+            for round_type, values in sorted(round_score_values.items())
+        ]
+
+        coaching = {
+            'strengths': list(dict.fromkeys(strengths))[:6],
+            'weaknesses': list(dict.fromkeys(weaknesses))[:6],
+            'next_actions': list(dict.fromkeys(next_actions))[:6],
+        }
+        report_mode = 'structured_evaluation'
+        has_structured = True
+    else:
+        overall_score = round(
+            legacy_scores['technical_correctness'] * 0.30
+            + legacy_scores['knowledge_depth'] * 0.15
+            + legacy_scores['logical_rigor'] * 0.15
+            + legacy_scores['expression_clarity'] * 0.15
+            + legacy_scores['job_match'] * 0.15
+            + legacy_scores['adaptability'] * 0.10,
+            1
+        )
+
+        if legacy_scores['technical_correctness'] >= 75:
+            legacy_strengths.append('技术回答整体较准确，基础知识掌握相对扎实。')
+        if legacy_scores['logical_rigor'] >= 75:
+            legacy_strengths.append('回答结构较清晰，能够体现一定的逻辑组织能力。')
+        if legacy_scores['job_match'] >= 72:
+            legacy_strengths.append('回答内容与目标岗位方向较匹配。')
+        if legacy_scores['adaptability'] >= 70:
+            legacy_strengths.append('在追问或上下文变化下表现出一定稳定性。')
+        if legacy_scores['knowledge_depth'] < 65:
+            legacy_weaknesses.append('部分回答停留在表层，缺少更深入的技术展开。')
+        if legacy_scores['expression_clarity'] < 65:
+            legacy_weaknesses.append('表达不够紧凑，重点提炼和结构化能力仍可提升。')
+        if legacy_scores['job_match'] < 65:
+            legacy_weaknesses.append('岗位相关关键词和项目联系体现不足。')
+        if legacy_scores['adaptability'] < 65:
+            legacy_weaknesses.append('面对追问时的稳定性和灵活性还有提升空间。')
+        if not legacy_strengths:
+            legacy_strengths.append('整体作答完成度尚可，具备继续提升的基础。')
+        if not legacy_weaknesses:
+            legacy_weaknesses.append('当前样本未暴露明显短板，但仍建议继续做专项训练。')
+
+        dimension_items = _normalize_dimension_items(legacy_scores)
+        round_breakdown = [
+            {
+                'round_type': round_type,
+                'count': count,
+                'avg_score': round(overall_score, 1),
+            }
+            for round_type, count in sorted(round_counter.items())
+        ]
+        question_reviews = [
+            {
+                'turn_id': item.get('id', ''),
+                'question_id': '',
+                'round_type': item.get('round_type', 'unknown'),
+                'question': item.get('question', ''),
+                'answer': item.get('answer', ''),
+                'rubric_level': '',
+                'overall_score': round(overall_score, 1),
+                'confidence': 0.0,
+                'status': 'legacy',
+                'dimensions': [],
+                'summary': {
+                    'strengths': [],
+                    'weaknesses': [],
+                    'next_actions': [],
+                }
+            }
+            for item in dialogues[-6:]
+        ]
+        coaching = {
+            'strengths': legacy_strengths[:6],
+            'weaknesses': legacy_weaknesses[:6],
+            'next_actions': [
+                '围绕高频题建立标准化答题结构，并增加项目细节表达。',
+                '针对当前目标岗位补齐关键技术点和典型场景表述。',
+                '结合录音或转写结果复盘语速、停顿和冗余表达。'
+            ],
+        }
+        report_mode = 'heuristic_fallback'
+        has_structured = False
+
+    expression_detail = {
+        'available': bool(speech_summary.get('available')),
+        'dimensions': speech_summary.get('dimensions', {}),
+        'summary': speech_summary.get('summary', {}),
+    }
+
+    followup_chain = []
+    for item in dialogues[-6:]:
+        followup_chain.append({
+            'round': item.get('round_type', 'unknown'),
+            'question': item.get('question', ''),
+            'answer': item.get('answer', ''),
+            'feedback': item.get('llm_feedback', '')
+        })
+
+    report = {
+        'schema_version': 'growth_report_v2',
+        'meta': {
+            'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'interview_id': str(dialogues[0].get('interview_id') or '').strip() if dialogues else '',
+            'report_mode': report_mode,
+            'has_structured_evaluations': has_structured,
+            'dialogue_count': len(dialogues),
+            'evaluation_count': len(decoded_evaluations),
+        },
+        'summary': {
+            'overall_score': overall_score,
+            'level': _score_to_level(overall_score),
+            'interview_count': len(dialogues),
+            'started_at': dialogues[0].get('created_at') if dialogues else '',
+            'ended_at': dialogues[-1].get('created_at') if dialogues else '',
+            'duration_seconds': max(0, duration_seconds),
+            'dominant_round': dominant_round,
+        },
+        'dimensions': dimension_items,
+        'round_breakdown': round_breakdown,
+        'expression': expression_detail,
+        'coaching': coaching,
+        'question_reviews': question_reviews,
+        # legacy fields kept for current frontend compatibility
+        'score_breakdown': _build_legacy_score_breakdown_from_dimensions(_normalize_dimension_items(legacy_scores)),
+        'expression_detail': expression_detail,
+        'strengths': coaching['strengths'],
+        'weaknesses': coaching['weaknesses'],
+        'improvement_plan': [
+            {
+                'focus': action,
+                'action': action,
+                'target': ''
+            }
+            for action in coaching['next_actions'][:3]
+        ],
+        'followup_chain': followup_chain,
+    }
+    return report
+
+
 def _calc_dimension_scores(dialogues, speech_summary=None):
     """基于问答过程做启发式多维评分，并融合语音表达指标。"""
     if not dialogues:
@@ -2402,6 +2746,17 @@ def _calc_dimension_scores(dialogues, speech_summary=None):
 
 
 def _build_growth_report(dialogues, speech_rows=None):
+    evaluation_rows = []
+    try:
+        interview_id = str(dialogues[0].get('interview_id') or '').strip() if dialogues else ''
+        if interview_id and hasattr(db_manager, 'get_interview_evaluations'):
+            evaluation_rows = db_manager.get_interview_evaluations(interview_id=interview_id)
+    except Exception:
+        evaluation_rows = []
+    return _build_growth_report_v2(dialogues, evaluation_rows=evaluation_rows, speech_rows=speech_rows)
+
+
+def _build_legacy_growth_report(dialogues, speech_rows=None):
     speech_summary = aggregate_expression_metrics(speech_rows or [])
     scores = _calc_dimension_scores(dialogues, speech_summary=speech_summary)
     overall = round(
@@ -2534,7 +2889,7 @@ def _split_recent_sessions(rows):
 
 @app.route('/api/growth-report/latest')
 def get_latest_growth_report():
-    """基于面试过程对话生成成长报告。"""
+    """Return latest interview report plus historical trend data."""
     try:
         with db_manager.get_connection() as conn:
             cursor = conn.cursor()
@@ -2546,12 +2901,24 @@ def get_latest_growth_report():
             ''')
             rows = [dict(row) for row in cursor.fetchall()]
 
+        empty_history = {
+            'session_count': 0,
+            'average_score': 0.0,
+            'best_score': 0.0,
+            'latest_score': 0.0,
+            'delta_from_previous': None,
+            'trend': [],
+            'sessions': [],
+        }
+
         if not rows:
             return jsonify({
                 'success': True,
                 'report': None,
+                'latest_report': None,
                 'trend': [],
-                'message': '暂无面试过程数据'
+                'history': empty_history,
+                'message': 'no interview dialogue data',
             })
 
         sessions_desc = _split_recent_sessions(rows)
@@ -2559,12 +2926,13 @@ def get_latest_growth_report():
             return jsonify({
                 'success': True,
                 'report': None,
+                'latest_report': None,
                 'trend': [],
-                'message': '暂无可分析会话'
+                'history': empty_history,
+                'message': 'no analyzable sessions',
             })
 
-        latest_session_desc = sessions_desc[0]
-        latest_session = list(reversed(latest_session_desc))
+        latest_session = list(reversed(sessions_desc[0]))
 
         def _load_session_speech_rows(session_rows):
             if not session_rows or not hasattr(db_manager, 'get_speech_evaluations'):
@@ -2581,12 +2949,13 @@ def get_latest_growth_report():
             )
             return _decode_speech_rows(raw_speech_rows)
 
-        report = _build_growth_report(
+        latest_report = _build_growth_report(
             latest_session,
             speech_rows=_load_session_speech_rows(latest_session),
         )
 
         trend = []
+        history_reports = []
         sessions_for_trend = list(reversed(sessions_desc))
         for idx, session_desc in enumerate(sessions_for_trend, start=1):
             session = list(reversed(session_desc))
@@ -2594,19 +2963,54 @@ def get_latest_growth_report():
                 session,
                 speech_rows=_load_session_speech_rows(session),
             )
-            trend.append({
-                'label': f'第{idx}次',
-                'overall_score': session_report['summary']['overall_score']
+            interview_id = str(session[0].get('interview_id') or '').strip() if session else ''
+            started_at = session[0].get('created_at') if session else ''
+            ended_at = session[-1].get('created_at') if session else ''
+            label = f'Session {idx}'
+            history_reports.append({
+                'session_index': idx,
+                'label': label,
+                'interview_id': interview_id,
+                'started_at': started_at,
+                'ended_at': ended_at,
+                'summary': session_report.get('summary', {}),
+                'dimensions': session_report.get('dimensions', []),
+                'meta': session_report.get('meta', {}),
             })
+            trend.append({
+                'label': label,
+                'interview_id': interview_id,
+                'started_at': started_at,
+                'overall_score': session_report.get('summary', {}).get('overall_score', 0.0),
+            })
+
+        trend_scores = [float(item.get('overall_score') or 0.0) for item in trend]
+        latest_score = float(latest_report.get('summary', {}).get('overall_score') or 0.0)
+        previous_score = float(trend[-2].get('overall_score') or 0.0) if len(trend) >= 2 else None
+        delta_from_previous = round(latest_score - previous_score, 1) if previous_score is not None else None
+        best_score = round(max(trend_scores), 1) if trend_scores else round(latest_score, 1)
+        average_score = round(sum(trend_scores) / len(trend_scores), 1) if trend_scores else round(latest_score, 1)
+
+        history = {
+            'session_count': len(history_reports),
+            'average_score': average_score,
+            'best_score': best_score,
+            'latest_score': round(latest_score, 1),
+            'delta_from_previous': delta_from_previous,
+            'trend': trend,
+            'sessions': history_reports[-8:],
+        }
 
         return jsonify({
             'success': True,
-            'report': report,
-            'trend': trend
+            'report': latest_report,
+            'latest_report': latest_report,
+            'trend': trend,
+            'history': history,
         })
 
     except Exception as e:
-        logger.error(f"生成成长报告失败：{e}", exc_info=True)
+        logger.error(f'????????: {e}', exc_info=True)
         return jsonify({
             'success': False,
             'error': str(e)

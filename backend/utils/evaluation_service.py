@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -35,6 +36,22 @@ class EvaluationService:
         "project": ["authenticity", "ownership", "technical_depth", "reflection"],
         "system_design": ["architecture_reasoning", "tradeoff_awareness", "scalability", "logic"],
         "hr": ["clarity", "relevance", "self_awareness", "communication"],
+    }
+    SPEECH_GATE_MIN_AUDIO_MS = 8000.0
+    SPEECH_GATE_MIN_TOKENS = 20
+    SPEECH_FUSION_VERSION = "speech_fusion_v1"
+    SPEECH_EXPRESSION_WEIGHTS = {
+        "clarity_score": 0.30,
+        "fluency_score": 0.25,
+        "speech_rate_score": 0.20,
+        "pause_anomaly_score": 0.15,
+        "filler_frequency_score": 0.10,
+    }
+    SPEECH_DIMENSION_BLEND = {
+        "technical": {"logic": 0.20, "completeness": 0.10},
+        "project": {"reflection": 0.15},
+        "system_design": {"logic": 0.20},
+        "hr": {"clarity": 0.30, "communication": 0.30, "relevance": 0.10, "self_awareness": 0.10},
     }
 
     def __init__(
@@ -81,6 +98,182 @@ class EvaluationService:
             return float(value)
         except Exception:
             return None
+
+    @staticmethod
+    def _clamp_score(value: Any, default: float = 0.0) -> float:
+        try:
+            return round(max(0.0, min(100.0, float(value))), 2)
+        except Exception:
+            return round(float(default), 2)
+
+    @staticmethod
+    def _safe_json_loads(value: Any, default: Any) -> Any:
+        if value in (None, ""):
+            return default
+        if isinstance(value, (dict, list)):
+            return value
+        try:
+            return json.loads(value)
+        except Exception:
+            return default
+
+    @staticmethod
+    def _count_transcript_tokens(text: str) -> int:
+        content = str(text or "").strip()
+        if not content:
+            return 0
+        return len(re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]", content))
+
+    def _load_turn_speech_evaluation(self, interview_id: str, turn_id: str) -> Optional[Dict[str, Any]]:
+        if not interview_id or not turn_id or not hasattr(self.db_manager, "get_speech_evaluations"):
+            return None
+
+        try:
+            rows = self.db_manager.get_speech_evaluations(interview_id=interview_id)
+        except Exception as e:  # pragma: no cover - runtime resilience
+            self.logger.warning("load speech evaluation failed: %s", e)
+            return None
+
+        for row in rows or []:
+            if str((row or {}).get("turn_id", "")).strip() != str(turn_id).strip():
+                continue
+
+            item = dict(row or {})
+            item["word_timestamps"] = self._safe_json_loads(item.get("word_timestamps_json"), [])
+            item["pause_events"] = self._safe_json_loads(item.get("pause_events_json"), [])
+            item["filler_events"] = self._safe_json_loads(item.get("filler_events_json"), [])
+            item["speech_metrics_final"] = self._safe_json_loads(item.get("speech_metrics_final_json"), {})
+            item["realtime_metrics"] = self._safe_json_loads(item.get("realtime_metrics_json"), {})
+            return item
+        return None
+
+    def _calculate_speech_expression_score(self, expression_dimensions: Dict[str, Any]) -> Optional[float]:
+        weighted_sum = 0.0
+        total_weight = 0.0
+        for key, weight in self.SPEECH_EXPRESSION_WEIGHTS.items():
+            value = self._safe_float((expression_dimensions or {}).get(key))
+            if value is None:
+                continue
+            weighted_sum += self._clamp_score(value) * float(weight)
+            total_weight += float(weight)
+
+        if total_weight <= 0:
+            return None
+        return round(weighted_sum / total_weight, 2)
+
+    def build_speech_context(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        speech_row = self._load_turn_speech_evaluation(
+            interview_id=str(payload.get("interview_id", "")).strip(),
+            turn_id=str(payload.get("turn_id", "")).strip(),
+        )
+        metrics = (speech_row or {}).get("speech_metrics_final") or {}
+        expression_dimensions = (metrics.get("dimensions") or {}) if isinstance(metrics, dict) else {}
+        final_transcript = str((speech_row or {}).get("final_transcript", "") or "").strip()
+        audio_duration_ms = self._safe_float((metrics or {}).get("audio_duration_ms")) or 0.0
+        token_count = self._count_transcript_tokens(final_transcript)
+        gate_reasons = []
+
+        if not speech_row:
+            gate_reasons.append("missing_speech_evaluation")
+        if not isinstance(metrics, dict) or not metrics:
+            gate_reasons.append("missing_speech_metrics_final")
+        if not final_transcript:
+            gate_reasons.append("missing_final_transcript")
+        if audio_duration_ms < self.SPEECH_GATE_MIN_AUDIO_MS:
+            gate_reasons.append("audio_duration_below_threshold")
+        if token_count < self.SPEECH_GATE_MIN_TOKENS:
+            gate_reasons.append("token_count_below_threshold")
+        if not expression_dimensions:
+            gate_reasons.append("missing_expression_dimensions")
+
+        expression_score = self._calculate_speech_expression_score(expression_dimensions)
+        speech_used = not gate_reasons and expression_score is not None
+
+        return {
+            "available": bool(speech_row),
+            "speech_used": speech_used,
+            "quality_gate": {
+                "passed": speech_used,
+                "reasons": gate_reasons,
+                "min_audio_ms": self.SPEECH_GATE_MIN_AUDIO_MS,
+                "min_tokens": self.SPEECH_GATE_MIN_TOKENS,
+            },
+            "audio_duration_ms": round(audio_duration_ms, 2),
+            "token_count": token_count,
+            "final_transcript_excerpt": final_transcript[:160],
+            "expression_dimensions": {
+                key: self._clamp_score(value)
+                for key, value in (expression_dimensions or {}).items()
+                if self._safe_float(value) is not None
+            },
+            "expression_score": expression_score,
+            "turn_id": str(payload.get("turn_id", "")).strip(),
+        }
+
+    def fuse_speech_with_dimension_scores(
+        self,
+        round_type: str,
+        layer2_result: Dict[str, Any],
+        speech_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        layer2_result = dict(layer2_result or {})
+        dimensions = self.ROUND_DIMENSIONS.get(round_type, self.ROUND_DIMENSIONS["technical"])
+        raw_dimension_scores = layer2_result.get("dimension_scores", {}) or {}
+
+        text_base_dimension_scores = {}
+        for dim in dimensions:
+            payload = raw_dimension_scores.get(dim, {}) or {}
+            text_base_dimension_scores[dim] = {
+                "score": self._clamp_score(payload.get("score", 0.0)),
+                "reason": str(payload.get("reason", "") or "").strip(),
+            }
+
+        blend_weights = self.SPEECH_DIMENSION_BLEND.get(round_type, {})
+        speech_used = bool((speech_context or {}).get("speech_used"))
+        expression_score = self._safe_float((speech_context or {}).get("expression_score"))
+        if expression_score is None:
+            speech_used = False
+
+        speech_adjustments = {}
+        final_dimension_scores = {}
+        for dim in dimensions:
+            base_score = float(text_base_dimension_scores[dim]["score"])
+            blend_weight = float(blend_weights.get(dim, 0.0)) if speech_used else 0.0
+            if blend_weight > 0.0:
+                final_score = self._clamp_score(base_score * (1.0 - blend_weight) + float(expression_score) * blend_weight)
+            else:
+                final_score = round(base_score, 2)
+
+            speech_adjustments[dim] = round(final_score - base_score, 2)
+            final_dimension_scores[dim] = {
+                "score": final_score,
+                "reason": text_base_dimension_scores[dim]["reason"],
+            }
+
+        overall_score_base = round(
+            sum(item["score"] for item in text_base_dimension_scores.values()) / len(text_base_dimension_scores),
+            2,
+        ) if text_base_dimension_scores else 0.0
+        overall_score_final = round(
+            sum(item["score"] for item in final_dimension_scores.values()) / len(final_dimension_scores),
+            2,
+        ) if final_dimension_scores else overall_score_base
+
+        layer2_result.update({
+            "text_base_dimension_scores": text_base_dimension_scores,
+            "speech_context": speech_context or {},
+            "speech_adjustments": speech_adjustments,
+            "final_dimension_scores": final_dimension_scores,
+            "overall_score_base": overall_score_base,
+            "overall_score_final": overall_score_final,
+            "speech_used": speech_used,
+            "speech_fusion_version": self.SPEECH_FUSION_VERSION,
+            "dimension_scores": final_dimension_scores,
+            "overall_score": overall_score_final,
+        })
+        if expression_score is not None:
+            layer2_result["speech_expression_score"] = round(float(expression_score), 2)
+        return layer2_result
 
     def _build_task_key(self, interview_id: str, turn_id: str, evaluation_version: str) -> str:
         raw = f"{interview_id}|{turn_id}|{evaluation_version}"
@@ -221,7 +414,8 @@ class EvaluationService:
         if not scoring_rubric:
             scoring_rubric = payload.get("scoring_rubric", {})
 
-        return self.llm_manager.evaluate_answer_with_rubric(
+        speech_context = self.build_speech_context(payload)
+        layer2_result = self.llm_manager.evaluate_answer_with_rubric(
             user_answer=payload.get("answer", ""),
             question=payload.get("question", ""),
             position=payload.get("position", ""),
@@ -229,6 +423,15 @@ class EvaluationService:
             scoring_rubric=scoring_rubric,
             layer1_result=layer1_result,
             prompt_version=payload.get("prompt_version", self.prompt_version),
+            speech_context=speech_context,
+        )
+        if layer2_result.get("error"):
+            return layer2_result
+
+        return self.fuse_speech_with_dimension_scores(
+            round_type=payload.get("round_type", "technical"),
+            layer2_result=layer2_result,
+            speech_context=speech_context,
         )
 
     def _derive_rubric_level(self, layer1_result: Dict[str, Any], layer2_result: Dict[str, Any]) -> Optional[str]:
@@ -243,7 +446,11 @@ class EvaluationService:
         return ranked[0][0] if ranked else None
 
     def _extract_dimension_columns(self, round_type: str, layer2_result: Dict[str, Any]) -> Dict[str, Optional[float]]:
-        dimension_scores = (layer2_result or {}).get("dimension_scores", {}) or {}
+        dimension_scores = (
+            (layer2_result or {}).get("final_dimension_scores")
+            or (layer2_result or {}).get("dimension_scores")
+            or {}
+        )
         columns = {
             "technical_accuracy_score": None,
             "knowledge_depth_score": None,
@@ -280,6 +487,8 @@ class EvaluationService:
                 best_level = ranked[0][0]
                 confidence = min(0.75, max(0.2, float(ranked[0][1] or 0.0)))
 
+        overall_score = float(rubric_match.get("good", 0.0) or 0.0) * 100.0
+
         return {
             "rubric_eval": {
                 "basic_match": float(rubric_match.get("basic", 0.0) or 0.0) * 100.0,
@@ -290,7 +499,15 @@ class EvaluationService:
                 "reason": reason,
             },
             "dimension_scores": {},
-            "overall_score": float(rubric_match.get("good", 0.0) or 0.0) * 100.0,
+            "text_base_dimension_scores": {},
+            "speech_context": {},
+            "speech_adjustments": {},
+            "final_dimension_scores": {},
+            "overall_score_base": overall_score,
+            "overall_score_final": overall_score,
+            "overall_score": overall_score,
+            "speech_used": False,
+            "speech_fusion_version": self.SPEECH_FUSION_VERSION,
             "summary": {
                 "strengths": [],
                 "weaknesses": [],
