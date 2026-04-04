@@ -95,11 +95,19 @@ uploads/
 *.backup
 
 # ====================================
-# Chroma向量数据库
+# Chroma 向量数据库
 # ====================================
 .chroma/
 chroma_db/
 backend/rag_data/
+
+# ====================================
+# 脚本文件（启动脚本、部署脚本等）
+# ====================================
+*.sh
+*.bat
+*.ps1
+*.cmd
 
 # Backend generated outputs
 backend/logs/
