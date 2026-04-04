@@ -81,6 +81,7 @@ tmp/
 temp/
 *.tmp
 *.temp
+.review-target.diff
 
 # ====================================
 # 用户上传文件
@@ -121,6 +122,8 @@ backend/FacePhys-Demo-main/
 # TypeScript build cache
 *.tsbuildinfo
 
-# backup
-*.bak
-*.backup
+# local large/runtime assets
+Qwen3-ForcedAligner-0.6B/
+
+# accidental mirrored system path
+%SystemDrive%/

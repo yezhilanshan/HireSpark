@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import tempfile
 import threading
 import uuid
@@ -19,6 +20,8 @@ logger = logging.getLogger("tts_service")
 
 class SynthesizeRequest(BaseModel):
     text: str = Field(..., min_length=1)
+    interview_id: Optional[str] = None
+    session_id: Optional[str] = None
     language: Optional[str] = None
     speaker: Optional[str] = None
     speed: Optional[float] = None
@@ -35,17 +38,78 @@ class EdgeTTSProvider:
         import edge_tts
 
         self.edge_tts = edge_tts
-        self.voice = os.environ.get("TTS_EDGE_VOICE", "zh-CN-XiaoxiaoNeural")
+        self.voice = os.environ.get("TTS_EDGE_VOICE", "").strip()
+        self.female_voice = os.environ.get("TTS_EDGE_FEMALE_VOICE", "zh-CN-XiaoxiaoNeural").strip()
+        self.male_voice = os.environ.get("TTS_EDGE_MALE_VOICE", "zh-CN-YunyangNeural").strip()
+        self.auto_gender = str(os.environ.get("TTS_EDGE_AUTO_GENDER", "1")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self.random_by_interview = str(os.environ.get("TTS_EDGE_RANDOM_BY_INTERVIEW", "1")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._interview_voice_map: dict[str, str] = {}
+        self._rng = random.Random()
+        self._voice_turn = 0
+        self._voice_lock = threading.Lock()
         self.rate = os.environ.get("TTS_EDGE_RATE", "+0%")
         self.volume = os.environ.get("TTS_EDGE_VOLUME", "+0%")
         self.timeout = float(os.environ.get("TTS_EDGE_TIMEOUT", "30"))
 
+    def _random_voice(self) -> str:
+        candidates = []
+        if self.female_voice:
+            candidates.append(self.female_voice)
+        if self.male_voice and self.male_voice != self.female_voice:
+            candidates.append(self.male_voice)
+        if not candidates:
+            return "zh-CN-XiaoxiaoNeural"
+        return self._rng.choice(candidates)
+
+    def _resolve_voice(
+        self,
+        request_voice: Optional[str],
+        interview_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> str:
+        if request_voice and request_voice.strip():
+            return request_voice.strip()
+        if self.voice:
+            return self.voice
+        if not self.auto_gender:
+            return self.female_voice
+
+        normalized_interview_id = str(interview_id or "").strip()
+        normalized_session_id = str(session_id or "").strip()
+        bind_key = normalized_interview_id or normalized_session_id
+
+        if self.random_by_interview and bind_key:
+            with self._voice_lock:
+                if bind_key not in self._interview_voice_map:
+                    self._interview_voice_map[bind_key] = self._random_voice()
+                return self._interview_voice_map[bind_key]
+
+        with self._voice_lock:
+            voice = self.female_voice if self._voice_turn % 2 == 0 else self.male_voice
+            self._voice_turn += 1
+        return voice
+
     async def synthesize(self, req: SynthesizeRequest) -> bytes:
         filename = f"tts_{uuid.uuid4().hex}.mp3"
         file_path = os.path.join(tempfile.gettempdir(), filename)
+        selected_voice = self._resolve_voice(
+            req.voice,
+            interview_id=req.interview_id,
+            session_id=req.session_id,
+        )
         communicate = self.edge_tts.Communicate(
             text=req.text,
-            voice=req.voice or self.voice,
+            voice=selected_voice,
             rate=req.rate or self.rate,
             volume=req.volume or self.volume,
         )
@@ -62,7 +126,12 @@ class EdgeTTSProvider:
     def health(self) -> dict:
         return {
             "provider": self.name,
-            "voice": self.voice,
+            "voice": self.voice or None,
+            "female_voice": self.female_voice,
+            "male_voice": self.male_voice,
+            "auto_gender": self.auto_gender,
+            "random_by_interview": self.random_by_interview,
+            "bound_interview_voice_count": len(self._interview_voice_map),
             "timeout": self.timeout,
         }
 

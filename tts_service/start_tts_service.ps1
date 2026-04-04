@@ -1,6 +1,33 @@
 # 独立 TTS 服务启动脚本
 
 $ErrorActionPreference = "Stop"
+$env:CONDA_NO_PLUGINS = "true"
+$env:CONDA_REPORT_ERRORS = "false"
+
+function Ensure-HomeEnv {
+    $userProfile = $env:USERPROFILE
+    if (-not $userProfile) {
+        $userProfile = [Environment]::GetFolderPath('UserProfile')
+    }
+    if (-not $userProfile -or -not (Test-Path $userProfile)) {
+        if ($env:USERNAME -and (Test-Path "C:\Users\$($env:USERNAME)")) {
+            $userProfile = "C:\Users\$($env:USERNAME)"
+        } else {
+            $userProfile = "C:\Users\Public"
+        }
+    }
+
+    $env:USERPROFILE = $userProfile
+    $env:HOME = $userProfile
+    $homeRoot = [System.IO.Path]::GetPathRoot($userProfile)
+    if (-not $homeRoot) {
+        $homeRoot = "C:\"
+    }
+    $env:HOMEDRIVE = $homeRoot.TrimEnd('\')
+    $env:HOMEPATH = $userProfile.Substring($env:HOMEDRIVE.Length)
+}
+
+Ensure-HomeEnv
 
 $RootPath = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $ServicePath = Join-Path $RootPath "tts_service"
@@ -20,7 +47,7 @@ Write-Host ""
 Set-Location $RootPath
 
 try {
-    $condaEnvs = conda env list 2>$null | Select-String $TtsEnv
+    $condaEnvs = conda --no-plugins env list 2>$null | Select-String $TtsEnv
     if (-not $condaEnvs) {
         Write-Host "✗ 虚拟环境不存在: $TtsEnv" -ForegroundColor Red
         Write-Host "请先创建环境，例如: conda create -n $TtsEnv python=3.10" -ForegroundColor Yellow
@@ -39,10 +66,10 @@ $ImportCheck = if ($Provider -eq "melo" -or $Provider -eq "auto") {
 } else {
     "import fastapi, uvicorn, edge_tts"
 }
-conda run -n $TtsEnv python -c $ImportCheck *> $null
+conda --no-plugins run -n $TtsEnv python -c $ImportCheck *> $null
 if ($LASTEXITCODE -ne 0) {
     Write-Host "! 依赖缺失，开始安装 requirements.txt" -ForegroundColor Yellow
-    conda run -n $TtsEnv pip install -r "requirements.txt"
+    conda --no-plugins run -n $TtsEnv pip install -r "requirements.txt"
     if ($LASTEXITCODE -ne 0) {
         Write-Host "✗ TTS 依赖安装失败" -ForegroundColor Red
         pause
@@ -55,4 +82,4 @@ Write-Host "服务地址: http://localhost:$Port" -ForegroundColor Green
 Write-Host "健康检查: http://localhost:$Port/health" -ForegroundColor Green
 Write-Host ""
 
-conda run -n $TtsEnv python -m uvicorn tts_service.app:app --host 0.0.0.0 --port $Port
+conda --no-plugins run -n $TtsEnv python -m uvicorn tts_service.app:app --host 0.0.0.0 --port $Port

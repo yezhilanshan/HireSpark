@@ -149,7 +149,7 @@ rag:
   store: "chroma"
   vector_db: "chroma"  # 兼容旧字段
   embedding_model: "shibing624/text2vec-base-chinese"
-  knowledge_path: "knowledge/llm_questions_v2.json"
+  knowledge_path: "interview_knowledge"
   persist_dir: "rag_data"
   collection_name: "interview_questions"
   search_type: "similarity"
@@ -173,6 +173,39 @@ evaluation:
     layer2: 2
     persist: 2
     backoff_seconds: 0.2
+
+# ====================================
+# 面试复盘配置（A/B/C/D/E）
+# ====================================
+replay:
+  version: "v2_qwen_fallback"
+  max_workers: 2
+  llm:
+    enabled: true
+    model: "qwen-plus"
+    timeout: 45
+    max_turns: 14
+  behavior:
+    enabled: true
+    auto_trigger: true
+    max_workers: 1
+    version: "v2_behavior_heuristic"
+    min_gaze_offscreen_ratio: 20
+    long_latency_ms: 3500
+    filler_per_100_words_threshold: 6
+    long_pause_count_threshold: 2
+
+# ====================================
+# 视频上传与回放配置
+# ====================================
+video_upload:
+  tmp_dir: "backend/uploads/video_uploads"
+  final_dir: "backend/uploads/interview_videos"
+  chunk_size_hint: 2097152
+  upload_expires_seconds: 3600
+  enable_transcode: true
+  keep_raw: true
+  playback_signing_secret: "CHANGE-THIS-VIDEO-SIGNING-SECRET"
 
 # ====================================
 # 岗位配置（后续扩展）

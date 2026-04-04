@@ -167,42 +167,65 @@ def test_process_answer():
 
 
 def test_evaluate_answer():
-    """测试评估用户回答"""
-    print_header("测试 5: 评估用户回答")
-    
+    """测试结构化评估用户回答"""
+    print_header("测试 5: 结构化评估用户回答")
+
     if not llm_manager.check_enabled():
         print("⏭️  跳过 - LLM 未启用")
         return False
-    
+
     try:
         question = "什么是 Spring Boot 的自动配置原理?"
         answer = "Spring Boot 通过 @SpringBootApplication 注解和自动配置类来实现。" \
                 "它会根据 classpath 上的 jar 包进行智能配置。"
-        
+
         print(f"❓ 问题: {question}")
         print(f"💬 用户回答: {answer}")
-        print("\n🔄 正在评估回答质量...")
-        
-        evaluation = llm_manager.evaluate_answer(
+        print("\n🔄 正在执行结构化评估...")
+
+        evaluation = llm_manager.evaluate_answer_with_rubric(
             user_answer=answer,
             question=question,
-            position="Java后端工程师"
+            position="Java后端工程师",
+            round_type="technical",
+            scoring_rubric={
+                "basic": ["能解释自动配置核心机制"],
+                "good": ["能说明条件注解与自动配置类加载"],
+                "excellent": ["能结合源码或具体场景分析"]
+            },
+            layer1_result={
+                "key_points": {
+                    "covered": ["@SpringBootApplication", "classpath 条件装配"],
+                    "missing": ["AutoConfigurationImportSelector 原理"]
+                }
+            },
+            prompt_version="v1"
         )
-        
-        if evaluation.get('score'):
-            print(f"✅ 评估完成:")
-            print(f"   ⭐ 分数: {evaluation.get('score')}/10")
-            if 'feedback' in evaluation:
-                print(f"   📝 反馈: {evaluation.get('feedback')}")
-            if 'strengths' in evaluation:
-                print(f"   ✅ 优点: {evaluation.get('strengths')}")
-            if 'weaknesses' in evaluation:
-                print(f"   ⚠️  缺点: {evaluation.get('weaknesses')}")
-            return True
-        else:
-            print(f"❌ 评估失败: {evaluation.get('error')}")
+
+        if evaluation.get('error'):
+            print(f"❌ 评估失败: {evaluation.get('error')} | {evaluation.get('message', '')}")
             return False
-            
+
+        overall_score = evaluation.get('overall_score')
+        rubric_eval = evaluation.get('rubric_eval') or {}
+        summary = evaluation.get('summary') or {}
+
+        if isinstance(overall_score, (int, float)):
+            print("✅ 结构化评估完成:")
+            print(f"   ⭐ overall_score: {overall_score}/100")
+            print(f"   📊 final_level: {rubric_eval.get('final_level', 'unknown')}")
+            print(f"   🔎 confidence: {rubric_eval.get('confidence', 'unknown')}")
+            if summary.get('strengths'):
+                print(f"   ✅ 优点: {summary.get('strengths')}")
+            if summary.get('weaknesses'):
+                print(f"   ⚠️  缺点: {summary.get('weaknesses')}")
+            if summary.get('next_actions'):
+                print(f"   📝 建议: {summary.get('next_actions')}")
+            return True
+
+        print("❌ 评估返回缺少 overall_score")
+        return False
+
     except Exception as e:
         print(f"❌ 错误: {e}")
         return False

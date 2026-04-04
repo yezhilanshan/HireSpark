@@ -1,8 +1,7 @@
 'use client'
 
-import { useMemo, useState, useEffect, useCallback } from 'react'
-import Link from 'next/link'
-import { Upload, FileText, Save, Trash2, ArrowLeft, RefreshCw, CheckCircle, AlertCircle, Loader2 } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Upload, FileText, Save, Trash2, RefreshCw, CheckCircle, AlertCircle, Loader2 } from 'lucide-react'
 
 const BACKEND_API_BASE = (process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000').replace(/\/$/, '')
 
@@ -58,7 +57,6 @@ export default function MyPage() {
     const [resumeFile, setResumeFile] = useState<File | null>(null)
     const [savedAt, setSavedAt] = useState<string>('')
 
-    // 简历相关状态
     const [uploadedResumes, setUploadedResumes] = useState<ResumeData[]>([])
     const [latestResume, setLatestResume] = useState<ResumeData | null>(null)
     const [isUploading, setIsUploading] = useState(false)
@@ -155,7 +153,6 @@ export default function MyPage() {
         })
     }, [])
 
-    // 加载最新简历
     const loadLatestResume = useCallback(async () => {
         try {
             const res = await fetch(`${BACKEND_API_BASE}/api/resume/latest`)
@@ -169,7 +166,6 @@ export default function MyPage() {
         }
     }, [applyParsedProfileToForm])
 
-    // 加载简历列表
     const loadResumes = useCallback(async () => {
         try {
             const res = await fetch(`${BACKEND_API_BASE}/api/resume?limit=10`)
@@ -224,11 +220,8 @@ export default function MyPage() {
                     created_at: new Date().toISOString(),
                     parsed_data: result.data,
                 })
-                // 清空文件选择
                 setResumeFile(null)
-                // 刷新列表
                 loadResumes()
-                // 填充表单
                 applyParsedProfileToForm(result.data)
             } else {
                 setUploadProgress('error')
@@ -240,7 +233,6 @@ export default function MyPage() {
             console.error('上传错误:', error)
         } finally {
             setIsUploading(false)
-            // 3 秒后重置状态
             setTimeout(() => {
                 setUploadProgress((prev) => (prev === 'success' ? 'idle' : prev))
             }, 3000)
@@ -291,11 +283,11 @@ export default function MyPage() {
             case 'parsed':
                 return <CheckCircle className="h-5 w-5 text-green-500" />
             case 'parsing':
-                return <Loader2 className="h-5 w-5 text-blue-500 animate-spin" />
+                return <Loader2 className="h-5 w-5 text-[#666666] animate-spin" />
             case 'error':
                 return <AlertCircle className="h-5 w-5 text-red-500" />
             default:
-                return <FileText className="h-5 w-5 text-gray-400" />
+                return <FileText className="h-5 w-5 text-[#999999]" />
         }
     }
 
@@ -313,293 +305,286 @@ export default function MyPage() {
     }
 
     return (
-        <main className="min-h-screen bg-[radial-gradient(circle_at_top_right,_#ccfbf1_0%,_#dbeafe_40%,_#f8fafc_100%)] p-4 text-slate-800 transition-colors dark:bg-[radial-gradient(circle_at_top_right,_#0f172a_0%,_#111827_45%,_#030712_100%)] dark:text-slate-100 sm:p-8">
-            <div className="mx-auto max-w-6xl">
-                <div className="mb-6 flex flex-wrap items-center gap-3">
-                    <h1 className="text-2xl font-black tracking-tight sm:text-3xl">我的信息</h1>
-                    <Link
-                        href="/"
-                        className="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium shadow-sm transition hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-900 dark:hover:bg-slate-800"
-                    >
-                        <ArrowLeft className="h-4 w-4" />
-                        返回首页
-                    </Link>
+        <main className="page-shell">
+            <div className="mb-6 rounded-3xl border border-[#E5E5E5] bg-[#FAF9F6] p-6 shadow-sm sm:p-8">
+                <p className="text-xs font-medium uppercase tracking-[0.18em] text-[#999999]">Candidate Profile</p>
+                <h1 className="mt-2 text-3xl text-[#111111] sm:text-4xl">我的信息与简历</h1>
+                <p className="mt-2 text-sm text-[#666666]">维护候选人资料，并通过简历解析自动补全关键信息。</p>
+            </div>
+
+            <section className="grid gap-6 lg:grid-cols-3">
+                <div className="rounded-2xl border border-[#E5E5E5] bg-white p-6 shadow-sm lg:col-span-2">
+                    <div className="mb-4 flex items-center justify-between">
+                        <h2 className="text-xl text-[#111111]">用户自定义资料</h2>
+                        <button
+                            type="button"
+                            onClick={onSave}
+                            className="inline-flex items-center gap-2 rounded-lg bg-[#111111] px-4 py-2 text-sm font-medium text-white transition hover:bg-[#222222]"
+                        >
+                            <Save className="h-4 w-4" />
+                            保存资料
+                        </button>
+                    </div>
+
+                    <div className="grid gap-4 sm:grid-cols-2">
+                        <Field label="昵称" value={form.nickname} onChange={(v) => onFieldChange('nickname', v)} />
+                        <Field label="邮箱" value={form.email} onChange={(v) => onFieldChange('email', v)} />
+                        <Field label="手机号" value={form.phone} onChange={(v) => onFieldChange('phone', v)} />
+                        <Field label="所在城市" value={form.city} onChange={(v) => onFieldChange('city', v)} />
+                        <Field label="目标岗位" value={form.targetRole} onChange={(v) => onFieldChange('targetRole', v)} />
+                        <Field label="工作年限" value={form.yearsOfExperience} onChange={(v) => onFieldChange('yearsOfExperience', v)} />
+                    </div>
+
+                    <div className="mt-4 grid gap-4">
+                        <Field
+                            label="核心技能"
+                            value={form.skills}
+                            onChange={(v) => onFieldChange('skills', v)}
+                            placeholder="例如：Java, Spring Boot, Redis, MySQL"
+                        />
+                        <AreaField
+                            label="个人介绍"
+                            value={form.intro}
+                            onChange={(v) => onFieldChange('intro', v)}
+                            placeholder="简要描述你的项目经验、技术栈和求职方向"
+                        />
+                    </div>
+
+                    {savedAt ? (
+                        <p className="mt-4 rounded-lg bg-[#F5F5F5] px-3 py-2 text-sm text-[#666666]">
+                            已保存到前端状态：{savedAt}
+                        </p>
+                    ) : null}
                 </div>
 
-                <section className="grid gap-6 lg:grid-cols-3">
-                    {/* 左侧：用户资料 */}
-                    <div className="rounded-2xl border border-white/70 bg-white/85 p-6 shadow-xl backdrop-blur dark:border-slate-700 dark:bg-slate-900/70 lg:col-span-2">
-                        <div className="mb-4 flex items-center justify-between">
-                            <h2 className="text-xl font-bold">用户自定义资料</h2>
+                <div className="rounded-2xl border border-[#E5E5E5] bg-white p-6 shadow-sm">
+                    <h2 className="mb-4 text-xl text-[#111111]">添加简历文档</h2>
+
+                    {uploadProgress === 'uploading' && (
+                        <div className="mb-4 flex items-center gap-2 rounded-lg bg-[#F5F5F5] p-3 text-sm text-[#666666]">
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                            正在上传文件...
+                        </div>
+                    )}
+                    {uploadProgress === 'parsing' && (
+                        <div className="mb-4 flex items-center gap-2 rounded-lg bg-[#F5F5F5] p-3 text-sm text-[#666666]">
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                            正在解析简历内容...
+                        </div>
+                    )}
+                    {uploadProgress === 'success' && (
+                        <div className="mb-4 flex items-center gap-2 rounded-lg bg-green-50 p-3 text-sm text-green-700">
+                            <CheckCircle className="h-4 w-4" />
+                            简历上传并解析成功！
+                        </div>
+                    )}
+                    {uploadProgress === 'error' && (
+                        <div className="mb-4 flex items-center gap-2 rounded-lg bg-red-50 p-3 text-sm text-red-700">
+                            <AlertCircle className="h-4 w-4" />
+                            {uploadError}
+                        </div>
+                    )}
+
+                    <label
+                        onDragEnter={(e) => {
+                            e.preventDefault()
+                            e.stopPropagation()
+                            setIsDragOver(true)
+                        }}
+                        onDragOver={(e) => {
+                            e.preventDefault()
+                            e.stopPropagation()
+                            setIsDragOver(true)
+                        }}
+                        onDragLeave={(e) => {
+                            e.preventDefault()
+                            e.stopPropagation()
+                            setIsDragOver(false)
+                        }}
+                        onDrop={onDropResume}
+                        className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed p-6 text-center transition ${
+                            isDragOver
+                                ? 'border-[#111111] bg-[#F5F5F5]'
+                                : 'border-[#E5E5E5] bg-[#FAF9F6] hover:border-[#111111] hover:bg-[#F5F5F5]'
+                        }`}
+                    >
+                        <Upload className="mb-2 h-7 w-7 text-[#111111]" />
+                        <span className="whitespace-nowrap text-sm font-medium text-[#111111]">点击上传简历（PDF/DOC/DOCX）</span>
+                        <span className="mt-1 text-xs text-[#666666]">支持拖拽文件到此区域，AI 自动识别项目经历与技术栈</span>
+                        <input
+                            type="file"
+                            accept=".pdf,.doc,.docx"
+                            onChange={onResumeChange}
+                            className="hidden"
+                            disabled={isUploading}
+                        />
+                    </label>
+
+                    {resumeFile ? (
+                        <div className="mt-4 space-y-3">
+                            <div className="rounded-xl border border-[#E5E5E5] bg-white p-3">
+                                <div className="flex items-start gap-3">
+                                    <FileText className="mt-0.5 h-5 w-5 text-[#666666]" />
+                                    <div className="min-w-0 flex-1">
+                                        <p className="truncate text-sm font-medium text-[#111111]">{resumeFile.name}</p>
+                                        <p className="text-xs text-[#666666]">{resumeSizeText}</p>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        onClick={clearResume}
+                                        className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-[#8A3B3B] transition hover:bg-[#F8EEEE]"
+                                        disabled={isUploading}
+                                        aria-label="移除已选择简历"
+                                        title="移除已选择简历"
+                                    >
+                                        <Trash2 className="h-3.5 w-3.5" />
+                                    </button>
+                                </div>
+                            </div>
                             <button
-                                type="button"
-                                onClick={onSave}
-                                className="inline-flex items-center gap-2 rounded-lg bg-teal-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-teal-700"
+                                onClick={handleUpload}
+                                disabled={isUploading}
+                                className="w-full rounded-lg bg-[#111111] py-2 text-sm font-medium text-white transition hover:bg-[#222222] disabled:cursor-not-allowed disabled:bg-[#C8C2B7]"
                             >
-                                <Save className="h-4 w-4" />
-                                保存资料
+                                {isUploading ? '上传中...' : '上传并解析'}
                             </button>
                         </div>
+                    ) : (
+                        <p className="mt-4 text-sm text-[#666666]">尚未选择简历文件</p>
+                    )}
 
-                        <div className="grid gap-4 sm:grid-cols-2">
-                            <Field label="昵称" value={form.nickname} onChange={(v) => onFieldChange('nickname', v)} />
-                            <Field label="邮箱" value={form.email} onChange={(v) => onFieldChange('email', v)} />
-                            <Field label="手机号" value={form.phone} onChange={(v) => onFieldChange('phone', v)} />
-                            <Field label="所在城市" value={form.city} onChange={(v) => onFieldChange('city', v)} />
-                            <Field label="目标岗位" value={form.targetRole} onChange={(v) => onFieldChange('targetRole', v)} />
-                            <Field label="工作年限" value={form.yearsOfExperience} onChange={(v) => onFieldChange('yearsOfExperience', v)} />
-                        </div>
+                    {latestResume?.parsed_data && (
+                        <div className="mt-6 border-t border-[#E5E5E5] pt-4">
+                            <h3 className="mb-3 text-sm font-medium text-[#111111]">简历解析结果</h3>
 
-                        <div className="mt-4 grid gap-4">
-                            <Field
-                                label="核心技能"
-                                value={form.skills}
-                                onChange={(v) => onFieldChange('skills', v)}
-                                placeholder="例如：Java, Spring Boot, Redis, MySQL"
-                            />
-                            <AreaField
-                                label="个人介绍"
-                                value={form.intro}
-                                onChange={(v) => onFieldChange('intro', v)}
-                                placeholder="简要描述你的项目经验、技术栈和求职方向"
-                            />
-                        </div>
-
-                        {savedAt ? (
-                            <p className="mt-4 rounded-lg bg-teal-50 px-3 py-2 text-sm text-teal-700 dark:bg-teal-900/30 dark:text-teal-300">
-                                已保存到前端状态：{savedAt}
-                            </p>
-                        ) : null}
-                    </div>
-
-                    {/* 右侧：简历上传 */}
-                    <div className="rounded-2xl border border-white/70 bg-white/85 p-6 shadow-xl backdrop-blur dark:border-slate-700 dark:bg-slate-900/70">
-                        <h2 className="mb-4 text-xl font-bold">添加简历文档</h2>
-
-                        {/* 上传状态提示 */}
-                        {uploadProgress === 'uploading' && (
-                            <div className="mb-4 flex items-center gap-2 rounded-lg bg-blue-50 p-3 text-sm text-blue-700 dark:bg-blue-900/30 dark:text-blue-300">
-                                <Loader2 className="h-4 w-4 animate-spin" />
-                                正在上传文件...
-                            </div>
-                        )}
-                        {uploadProgress === 'parsing' && (
-                            <div className="mb-4 flex items-center gap-2 rounded-lg bg-purple-50 p-3 text-sm text-purple-700 dark:bg-purple-900/30 dark:text-purple-300">
-                                <Loader2 className="h-4 w-4 animate-spin" />
-                                正在解析简历内容...
-                            </div>
-                        )}
-                        {uploadProgress === 'success' && (
-                            <div className="mb-4 flex items-center gap-2 rounded-lg bg-green-50 p-3 text-sm text-green-700 dark:bg-green-900/30 dark:text-green-300">
-                                <CheckCircle className="h-4 w-4" />
-                                简历上传并解析成功！
-                            </div>
-                        )}
-                        {uploadProgress === 'error' && (
-                            <div className="mb-4 flex items-center gap-2 rounded-lg bg-red-50 p-3 text-sm text-red-700 dark:bg-red-900/30 dark:text-red-300">
-                                <AlertCircle className="h-4 w-4" />
-                                {uploadError}
-                            </div>
-                        )}
-
-                        <label
-                            onDragEnter={(e) => {
-                                e.preventDefault()
-                                e.stopPropagation()
-                                setIsDragOver(true)
-                            }}
-                            onDragOver={(e) => {
-                                e.preventDefault()
-                                e.stopPropagation()
-                                setIsDragOver(true)
-                            }}
-                            onDragLeave={(e) => {
-                                e.preventDefault()
-                                e.stopPropagation()
-                                setIsDragOver(false)
-                            }}
-                            onDrop={onDropResume}
-                            className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed p-6 text-center transition dark:bg-slate-800 ${isDragOver
-                                    ? 'border-teal-500 bg-teal-50 dark:border-teal-400 dark:bg-slate-700'
-                                    : 'border-slate-300 bg-slate-50 hover:border-teal-400 hover:bg-teal-50 dark:border-slate-600 dark:hover:border-teal-500 dark:hover:bg-slate-700'
-                                }`}
-                        >
-                            <Upload className="mb-2 h-7 w-7 text-teal-600 dark:text-teal-300" />
-                            <span className="whitespace-nowrap text-sm font-medium">点击上传简历（PDF/DOC/DOCX）</span>
-                            <span className="mt-1 text-xs text-slate-500">支持拖拽文件到此区域，AI 自动识别项目经历与技术栈</span>
-                            <input
-                                type="file"
-                                accept=".pdf,.doc,.docx"
-                                onChange={onResumeChange}
-                                className="hidden"
-                                disabled={isUploading}
-                            />
-                        </label>
-
-                        {resumeFile ? (
-                            <div className="mt-4 space-y-3">
-                                <div className="rounded-xl border border-slate-200 bg-white p-3 dark:border-slate-700 dark:bg-slate-900">
-                                    <div className="flex items-start gap-3">
-                                        <FileText className="mt-0.5 h-5 w-5 text-indigo-600 dark:text-indigo-300" />
-                                        <div className="min-w-0 flex-1">
-                                            <p className="truncate text-sm font-medium">{resumeFile.name}</p>
-                                            <p className="text-xs text-slate-500">{resumeSizeText}</p>
-                                        </div>
-                                        <button
-                                            type="button"
-                                            onClick={clearResume}
-                                            className="inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-rose-600 transition hover:bg-rose-50 dark:text-rose-300 dark:hover:bg-rose-900/30"
-                                            disabled={isUploading}
-                                        >
-                                            <Trash2 className="h-3.5 w-3.5" />
-                                        </button>
+                            {latestResume.parsed_data.education && latestResume.parsed_data.education.length > 0 && (
+                                <div className="mb-3 rounded-lg bg-[#FAF9F6] p-2 text-xs text-[#333333]">
+                                    <span className="font-medium">学历：</span>
+                                    <div className="mt-1 space-y-1">
+                                        {latestResume.parsed_data.education.map((edu, idx) => (
+                                            <div key={idx}>
+                                                <span className="font-medium">{edu.school}</span>
+                                                {edu.major && ` · ${edu.major}`}
+                                                {edu.degree && ` · ${edu.degree}`}
+                                                {(edu.start_date || edu.end_date) && ` (${edu.start_date || ''} - ${edu.end_date || ''})`}
+                                            </div>
+                                        ))}
                                     </div>
                                 </div>
-                                <button
-                                    onClick={handleUpload}
-                                    disabled={isUploading}
-                                    className="w-full rounded-lg bg-teal-600 py-2 text-sm font-semibold text-white transition hover:bg-teal-700 disabled:bg-teal-400"
-                                >
-                                    {isUploading ? '上传中...' : '上传并解析'}
-                                </button>
-                            </div>
-                        ) : (
-                            <p className="mt-4 text-sm text-slate-500">尚未选择简历文件</p>
-                        )}
+                            )}
 
-                        {/* 最新解析结果 */}
-                        {latestResume?.parsed_data && (
-                            <div className="mt-6 border-t border-slate-200 pt-4 dark:border-slate-700">
-                                <h3 className="mb-3 text-sm font-bold">简历解析结果</h3>
-
-                                {/* 教育经历 - 支持多个 */}
-                                {latestResume.parsed_data.education && latestResume.parsed_data.education.length > 0 && (
-                                    <div className="mb-3 rounded-lg bg-slate-50 p-2 text-xs dark:bg-slate-800">
-                                        <span className="font-semibold">学历：</span>
-                                        <div className="mt-1 space-y-1">
-                                            {latestResume.parsed_data.education.map((edu, idx) => (
-                                                <div key={idx}>
-                                                    <span className="font-medium">{edu.school}</span>
-                                                    {edu.major && ` · ${edu.major}`}
-                                                    {edu.degree && ` · ${edu.degree}`}
-                                                    {(edu.start_date || edu.end_date) && ` (${edu.start_date || ''} - ${edu.end_date || ''})`}
-                                                </div>
-                                            ))}
-                                        </div>
+                            {latestResume.parsed_data.skills && latestResume.parsed_data.skills.length > 0 && (
+                                <div className="mb-3">
+                                    <span className="text-xs font-medium text-[#111111]">技术栈：</span>
+                                    <div className="mt-1 flex flex-wrap gap-1">
+                                        {latestResume.parsed_data.skills.slice(0, 10).map((skill, i) => (
+                                            <span key={i} className="rounded bg-[#F5F5F5] px-2 py-0.5 text-xs text-[#555555]">
+                                                {skill}
+                                            </span>
+                                        ))}
                                     </div>
-                                )}
+                                </div>
+                            )}
 
-                                {latestResume.parsed_data.skills && latestResume.parsed_data.skills.length > 0 && (
-                                    <div className="mb-3">
-                                        <span className="text-xs font-semibold">技术栈：</span>
-                                        <div className="mt-1 flex flex-wrap gap-1">
-                                            {latestResume.parsed_data.skills.slice(0, 10).map((skill, i) => (
-                                                <span key={i} className="rounded bg-indigo-100 px-2 py-0.5 text-xs text-indigo-700 dark:bg-indigo-900/50 dark:text-indigo-300">
-                                                    {skill}
-                                                </span>
-                                            ))}
-                                        </div>
+                            {latestResume.parsed_data.experiences && latestResume.parsed_data.experiences.length > 0 && (
+                                <div className="mb-2">
+                                    <span className="text-xs font-medium text-[#111111]">工作经历：</span>
+                                    <div className="mt-1 space-y-1">
+                                        {latestResume.parsed_data.experiences.slice(0, 3).map((exp, i) => (
+                                            <div key={i} className="text-xs text-[#666666]">
+                                                <span className="font-medium text-[#333333]">{exp.company}</span>
+                                                {exp.position && ` - ${exp.position}`}
+                                            </div>
+                                        ))}
                                     </div>
-                                )}
+                                </div>
+                            )}
 
-                                {latestResume.parsed_data.experiences && latestResume.parsed_data.experiences.length > 0 && (
-                                    <div className="mb-2">
-                                        <span className="text-xs font-semibold">工作经历：</span>
-                                        <div className="mt-1 space-y-1">
-                                            {latestResume.parsed_data.experiences.slice(0, 3).map((exp, i) => (
-                                                <div key={i} className="text-xs text-slate-600 dark:text-slate-400">
-                                                    <span className="font-medium">{exp.company}</span>
-                                                    {exp.position && ` - ${exp.position}`}
-                                                </div>
-                                            ))}
-                                        </div>
+                            {latestResume.parsed_data.projects && latestResume.parsed_data.projects.length > 0 && (
+                                <div>
+                                    <span className="text-xs font-medium text-[#111111]">项目经验：</span>
+                                    <div className="mt-1 space-y-1">
+                                        {latestResume.parsed_data.projects.slice(0, 3).map((proj, i) => (
+                                            <div key={i} className="text-xs text-[#666666]">
+                                                <span className="font-medium text-[#333333]">{proj.name}</span>
+                                            </div>
+                                        ))}
                                     </div>
-                                )}
+                                </div>
+                            )}
+                        </div>
+                    )}
+                </div>
+            </section>
 
-                                {latestResume.parsed_data.projects && latestResume.parsed_data.projects.length > 0 && (
-                                    <div>
-                                        <span className="text-xs font-semibold">项目经验：</span>
-                                        <div className="mt-1 space-y-1">
-                                            {latestResume.parsed_data.projects.slice(0, 3).map((proj, i) => (
-                                                <div key={i} className="text-xs text-slate-600 dark:text-slate-400">
-                                                    <span className="font-medium">{proj.name}</span>
-                                                </div>
-                                            ))}
-                                        </div>
-                                    </div>
-                                )}
-                            </div>
-                        )}
+            {uploadedResumes.length > 0 && (
+                <section className="mt-6 rounded-2xl border border-[#E5E5E5] bg-white p-6 shadow-sm">
+                    <h2 className="mb-4 text-xl text-[#111111]">简历历史</h2>
+                    <div className="overflow-x-auto">
+                        <table className="w-full text-sm">
+                            <thead>
+                                <tr className="border-b border-[#E5E5E5]">
+                                    <th className="py-2 text-left font-medium text-[#111111]">文件名</th>
+                                    <th className="py-2 text-left font-medium text-[#111111]">大小</th>
+                                    <th className="py-2 text-left font-medium text-[#111111]">状态</th>
+                                    <th className="py-2 text-left font-medium text-[#111111]">上传时间</th>
+                                    <th className="py-2 text-right font-medium text-[#111111]">操作</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {uploadedResumes.map((resume) => (
+                                    <tr key={resume.id} className="border-b border-[#ECEAE3] last:border-0">
+                                        <td className="py-3">
+                                            <div className="flex items-center gap-2">
+                                                {getStatusIcon(resume.status)}
+                                                <span className="font-medium text-[#111111]">{resume.file_name}</span>
+                                            </div>
+                                            {resume.error_message && (
+                                                <p className="mt-1 text-xs text-red-500">{resume.error_message}</p>
+                                            )}
+                                        </td>
+                                        <td className="py-3 text-[#666666]">
+                                            {(resume.file_size / (1024 * 1024)).toFixed(2)} MB
+                                        </td>
+                                        <td className="py-3">
+                                            <span className={`rounded px-2 py-0.5 text-xs ${
+                                                resume.status === 'parsed'
+                                                    ? 'bg-green-100 text-green-700'
+                                                    : resume.status === 'parsing'
+                                                        ? 'bg-[#F5F5F5] text-[#666666]'
+                                                        : 'bg-red-100 text-red-700'
+                                            }`}>
+                                                {getStatusText(resume.status)}
+                                            </span>
+                                        </td>
+                                        <td className="py-3 text-[#666666]">
+                                            {new Date(resume.created_at).toLocaleString('zh-CN')}
+                                        </td>
+                                        <td className="py-3">
+                                            <div className="flex justify-end gap-2">
+                                                <button
+                                                    onClick={() => handleReparse(resume.id)}
+                                                    className="rounded p-1 text-[#666666] hover:bg-[#F5F5F5] hover:text-[#111111]"
+                                                    title="重新解析"
+                                                >
+                                                    <RefreshCw className="h-4 w-4" />
+                                                </button>
+                                                <button
+                                                    onClick={() => handleDelete(resume.id)}
+                                                    className="rounded p-1 text-[#666666] hover:bg-[#F8EEEE] hover:text-[#8A3B3B]"
+                                                    title="删除"
+                                                >
+                                                    <Trash2 className="h-4 w-4" />
+                                                </button>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
                     </div>
                 </section>
-
-                {/* 简历历史列表 */}
-                {uploadedResumes.length > 0 && (
-                    <section className="mt-6 rounded-2xl border border-white/70 bg-white/85 p-6 shadow-xl backdrop-blur dark:border-slate-700 dark:bg-slate-900/70">
-                        <h2 className="mb-4 text-xl font-bold">简历历史</h2>
-                        <div className="overflow-x-auto">
-                            <table className="w-full text-sm">
-                                <thead>
-                                    <tr className="border-b border-slate-200 dark:border-slate-700">
-                                        <th className="py-2 text-left font-semibold">文件名</th>
-                                        <th className="py-2 text-left font-semibold">大小</th>
-                                        <th className="py-2 text-left font-semibold">状态</th>
-                                        <th className="py-2 text-left font-semibold">上传时间</th>
-                                        <th className="py-2 text-right font-semibold">操作</th>
-                                    </tr>
-                                </thead>
-                                <tbody>
-                                    {uploadedResumes.map((resume) => (
-                                        <tr key={resume.id} className="border-b border-slate-100 last:border-0 dark:border-slate-800">
-                                            <td className="py-3">
-                                                <div className="flex items-center gap-2">
-                                                    {getStatusIcon(resume.status)}
-                                                    <span className="font-medium">{resume.file_name}</span>
-                                                </div>
-                                                {resume.error_message && (
-                                                    <p className="mt-1 text-xs text-red-500">{resume.error_message}</p>
-                                                )}
-                                            </td>
-                                            <td className="py-3 text-slate-500">
-                                                {(resume.file_size / (1024 * 1024)).toFixed(2)} MB
-                                            </td>
-                                            <td className="py-3">
-                                                <span className={`rounded px-2 py-0.5 text-xs ${resume.status === 'parsed' ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300' :
-                                                        resume.status === 'parsing' ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300' :
-                                                            'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'
-                                                    }`}>
-                                                    {getStatusText(resume.status)}
-                                                </span>
-                                            </td>
-                                            <td className="py-3 text-slate-500">
-                                                {new Date(resume.created_at).toLocaleString('zh-CN')}
-                                            </td>
-                                            <td className="py-3">
-                                                <div className="flex justify-end gap-2">
-                                                    <button
-                                                        onClick={() => handleReparse(resume.id)}
-                                                        className="rounded p-1 text-slate-500 hover:bg-slate-100 hover:text-teal-600 dark:hover:bg-slate-800"
-                                                        title="重新解析"
-                                                    >
-                                                        <RefreshCw className="h-4 w-4" />
-                                                    </button>
-                                                    <button
-                                                        onClick={() => handleDelete(resume.id)}
-                                                        className="rounded p-1 text-slate-500 hover:bg-rose-50 hover:text-rose-600 dark:hover:bg-rose-900/30"
-                                                        title="删除"
-                                                    >
-                                                        <Trash2 className="h-4 w-4" />
-                                                    </button>
-                                                </div>
-                                            </td>
-                                        </tr>
-                                    ))}
-                                </tbody>
-                            </table>
-                        </div>
-                    </section>
-                )}
-            </div>
+            )}
         </main>
     )
 }
@@ -613,13 +598,13 @@ type FieldProps = {
 
 function Field({ label, value, onChange, placeholder }: FieldProps) {
     return (
-        <label className="grid gap-1.5 text-sm font-medium">
+        <label className="grid gap-1.5 text-sm font-medium text-[#111111]">
             <span>{label}</span>
             <input
                 value={value}
                 onChange={(e) => onChange(e.target.value)}
                 placeholder={placeholder}
-                className="rounded-lg border border-slate-300 bg-white px-3 py-2 outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-200 dark:border-slate-700 dark:bg-slate-900 dark:focus:border-teal-400 dark:focus:ring-teal-900"
+                className="rounded-lg border border-[#E5E5E5] bg-white px-3 py-2 text-[#111111] outline-none transition focus:border-[#111111]"
             />
         </label>
     )
@@ -634,14 +619,14 @@ type AreaFieldProps = {
 
 function AreaField({ label, value, onChange, placeholder }: AreaFieldProps) {
     return (
-        <label className="grid gap-1.5 text-sm font-medium">
+        <label className="grid gap-1.5 text-sm font-medium text-[#111111]">
             <span>{label}</span>
             <textarea
                 rows={5}
                 value={value}
                 onChange={(e) => onChange(e.target.value)}
                 placeholder={placeholder}
-                className="resize-y rounded-lg border border-slate-300 bg-white px-3 py-2 outline-none transition focus:border-teal-500 focus:ring-2 focus:ring-teal-200 dark:border-slate-700 dark:bg-slate-900 dark:focus:border-teal-400 dark:focus:ring-teal-900"
+                className="resize-y rounded-lg border border-[#E5E5E5] bg-white px-3 py-2 text-[#111111] outline-none transition focus:border-[#111111]"
             />
         </label>
     )

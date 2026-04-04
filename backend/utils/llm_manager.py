@@ -5,8 +5,9 @@
 """
 import os
 import json
+import time
 import dashscope
-from typing import Optional, Dict, List
+from typing import Any, Optional, Dict, List
 from dashscope import Generation
 from utils.config_loader import config
 from utils.logger import get_logger
@@ -203,6 +204,103 @@ class LLMManager:
             logger.warning("LLM 功能未启用或 API Key 未配置")
             return False
         return True
+
+    def warmup(self) -> Dict[str, Any]:
+        """执行一次轻量 LLM 预热请求，降低首轮调用冷启动延迟。"""
+        result: Dict[str, Any] = {
+            "enabled": bool(self.enabled),
+            "success": False,
+            "model": self.model,
+            "latency_ms": 0.0,
+            "error": "",
+        }
+        if not self.check_enabled():
+            result["error"] = "LLM not enabled"
+            return result
+
+        messages = [
+            {"role": "system", "content": "You are a health checker. Reply with OK only."},
+            {"role": "user", "content": "ping"},
+        ]
+        started_at = time.time()
+        try:
+            response = Generation.call(
+                model=self.model,
+                messages=messages,
+                top_p=0.1,
+                top_k=10,
+                temperature=0.0,
+                max_tokens=8,
+                timeout=min(float(self.timeout or 30), 15.0),
+            )
+            latency_ms = round((time.time() - started_at) * 1000.0, 2)
+            result["latency_ms"] = latency_ms
+            if getattr(response, "status_code", None) == 200:
+                reply_text = str(getattr(getattr(response, "output", None), "text", "") or "").strip()
+                result["success"] = True
+                result["reply_preview"] = reply_text[:48]
+                logger.info(f"[LLM] 预热完成 - latency={latency_ms}ms")
+                return result
+
+            result["error"] = str(getattr(response, "message", "") or getattr(response, "code", "") or "unknown_error")
+            logger.warning(f"[LLM] 预热失败 - {result['error']}")
+            return result
+        except Exception as exc:
+            result["latency_ms"] = round((time.time() - started_at) * 1000.0, 2)
+            result["error"] = str(exc)[:240]
+            logger.warning(f"[LLM] 预热异常 - {result['error']}")
+            return result
+
+    def generate_structured_json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        *,
+        model: Optional[str] = None,
+        top_p: float = 0.4,
+        top_k: int = 40,
+        temperature: float = 0.2,
+        max_tokens: int = 1800,
+        timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """通用结构化 JSON 生成接口（支持 model 覆盖用于复盘链路）。"""
+        if not self.check_enabled():
+            return {"success": False, "error": "LLM_NOT_READY", "message": "LLM not enabled"}
+
+        target_model = str(model or self.model or "").strip()
+        if not target_model:
+            return {"success": False, "error": "INVALID_MODEL", "message": "model is empty"}
+
+        try:
+            response = Generation.call(
+                model=target_model,
+                messages=[
+                    {"role": "system", "content": str(system_prompt or "")},
+                    {"role": "user", "content": str(user_prompt or "")},
+                ],
+                top_p=top_p,
+                top_k=top_k,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=(timeout if timeout is not None else self.timeout),
+            )
+            if getattr(response, "status_code", None) != 200:
+                return {
+                    "success": False,
+                    "error": "API_ERROR",
+                    "message": str(getattr(response, "message", "") or getattr(response, "code", "") or "unknown_error"),
+                }
+
+            raw_text = str(getattr(getattr(response, "output", None), "text", "") or "").strip()
+            import re
+            json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+            if not json_match:
+                return {"success": False, "error": "INVALID_JSON", "message": "json not found", "raw_text": raw_text}
+            parsed = json.loads(json_match.group())
+            return {"success": True, "model": target_model, "data": parsed, "raw_text": raw_text}
+        except Exception as e:
+            logger.error(f"结构化 JSON 生成失败: {e}")
+            return {"success": False, "error": "GENERATION_EXCEPTION", "message": str(e)}
     
     def generate_interview_question(
         self,
@@ -344,79 +442,6 @@ class LLMManager:
             logger.error(f"✗ 处理回答失败: {str(e)}")
             return ""
     
-    def evaluate_answer(
-        self,
-        user_answer: str,
-        question: str,
-        position: str
-    ) -> dict:
-        """
-        评估用户回答的质量
-        
-        Args:
-            user_answer: 用户的回答
-            question: 对应的问题
-            position: 职位名称
-        
-        Returns:
-            包含评分和评价的字典
-        """
-        if not self.check_enabled():
-            return {"score": 0, "feedback": "LLM 功能未启用"}
-        
-        try:
-            messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        "你是一位资深面试官，需要评估候选人的回答质量。"
-                        "请返回 JSON 格式的评估结果，包含: score(1-10分), strengths(优点), "
-                        "weaknesses(缺点), suggestions(建议)"
-                    )
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"职位: {position}\n"
-                        f"原问题: {question}\n"
-                        f"候选人回答: {user_answer}\n"
-                        f"\n请评估这个回答，返回 JSON 格式结果。"
-                    )
-                }
-            ]
-            
-            response = Generation.call(
-                model=self.model,
-                messages=messages,
-                top_p=0.5,
-                top_k=50,
-                temperature=0.3,  # 降低温度以获得更一致的评分
-                max_tokens=500,
-                timeout=self.timeout
-            )
-            
-            if response.status_code == 200:
-                try:
-                    # 尝试解析 JSON
-                    result_text = response.output.text
-                    # 查找 JSON 内容
-                    import re
-                    json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
-                    if json_match:
-                        return json.loads(json_match.group())
-                except:
-                    # 如果解析失败，返回原始文本
-                    return {
-                        "score": 5,
-                        "feedback": response.output.text
-                    }
-            
-            return {"score": 0, "error": f"API 错误: {response.message}"}
-        
-        except Exception as e:
-            logger.error(f"✗ 评估回答失败: {str(e)}")
-            return {"score": 0, "error": str(e)}
-
     def evaluate_answer_with_rubric(
         self,
         user_answer: str,

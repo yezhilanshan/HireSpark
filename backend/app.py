@@ -2,7 +2,7 @@
 Flask 主服务 - Socket.IO 实时通信
 AI 模拟面试与能力提升平台【改造进行中】
 """
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_socketio import SocketIO, emit
 from flask_cors import CORS # 跨域资源共享中间件
 import base64
@@ -12,6 +12,7 @@ import os
 import json
 import threading
 import uuid
+import re
 from datetime import datetime
 from pathlib import Path
 from collections import Counter
@@ -52,10 +53,13 @@ except Exception as e:
     evaluation_import_error = str(e)
 from utils.logger import get_logger
 from utils.performance_monitor import performance_monitor, measure_time
-from utils.answer_session import AnswerSession, LONG_PAUSE_SECONDS, SHORT_PAUSE_SECONDS
+from utils.answer_session import AnswerSession, LONG_PAUSE_SECONDS, SHORT_PAUSE_SECONDS, merge_answer_text
 from utils.session_orchestrator import SessionRegistry, StateOrchestrator
 from utils.speech_normalizer import SpeechTextNormalizer
 from utils.speech_metrics import compute_final_speech_metrics, aggregate_expression_metrics
+from utils.replay_service import ReplayService, ReplayTaskManager
+from utils.behavior_analysis_service import BehaviorAnalysisService, BehaviorAnalysisTaskManager
+from utils.video_upload_service import VideoUploadService
 from utils.security import (
     RateLimiter,
     rate_limit,
@@ -82,6 +86,39 @@ app.config['SECRET_KEY'] = SECRET_KEY
 FLASK_HOST = config.get('server.host', '0.0.0.0')# 监听地址
 FLASK_PORT = config.get('server.port', 5000)# 监听端口
 FLASK_DEBUG = config.get('system.debug', False)# 调试模式
+
+
+def _safe_int(value, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = str(os.environ.get(name, str(default))).strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
+
+
+ASR_SPEECH_END_GRACE_MS = max(
+    0,
+    min(
+        2000,
+        _safe_int(config.get('interview.asr_speech_end_grace_ms', 420), 420),
+    ),
+)
+ASR_SEGMENT_PREFER_FINAL_ONLY = _env_bool("ASR_SEGMENT_PREFER_FINAL_ONLY", True)
+ASR_FINAL_USE_HINT_PROMPT = _env_bool("ASR_FINAL_USE_HINT_PROMPT", False)
+ASR_DEBUG_STREAM_ENABLED = _env_bool("ASR_DEBUG_STREAM_ENABLED", True)
+ASR_PENDING_AUDIO_MAX_CHUNKS = max(4, min(240, _safe_int(os.environ.get("ASR_PENDING_AUDIO_MAX_CHUNKS", 80), 80)))
+ASR_PENDING_AUDIO_MAX_BYTES = max(
+    32000,
+    min(4 * 1024 * 1024, _safe_int(os.environ.get("ASR_PENDING_AUDIO_MAX_BYTES", 512000), 512000)),
+)
 
 
 def _parse_cors_origins():
@@ -172,6 +209,191 @@ if evaluation_service is None and evaluation_import_error:
     logger.error(f"评估服务初始化失败：{evaluation_import_error}")
 elif evaluation_service is not None:
     logger.info("三层评价服务初始化成功")
+
+video_upload_service = VideoUploadService(logger=logger)
+replay_service = ReplayService(
+    db_manager=db_manager,
+    llm_manager=llm_manager,
+    rag_service=rag_service,
+    logger=logger,
+)
+replay_task_manager = ReplayTaskManager(
+    replay_service=replay_service,
+    max_workers=int(config.get('replay.max_workers', 2)),
+    logger=logger,
+)
+behavior_analysis_service = BehaviorAnalysisService(
+    db_manager=db_manager,
+    logger=logger,
+)
+behavior_task_manager = BehaviorAnalysisTaskManager(
+    service=behavior_analysis_service,
+    max_workers=int(config.get('replay.behavior.max_workers', 1)),
+    logger=logger,
+)
+
+SERVICE_PREWARM_CACHE_SECONDS = 300.0
+_service_prewarm_lock = threading.RLock()
+_service_prewarm_thread: threading.Thread | None = None
+_service_prewarm_state = {
+    "status": "idle",  # idle | running | completed | partial | failed
+    "trigger": "",
+    "last_started_at": 0.0,
+    "last_finished_at": 0.0,
+    "duration_ms": 0.0,
+    "results": {},
+}
+
+
+def _snapshot_service_prewarm_state() -> dict:
+    with _service_prewarm_lock:
+        snapshot = dict(_service_prewarm_state)
+        snapshot["running"] = bool(_service_prewarm_thread and _service_prewarm_thread.is_alive())
+    snapshot["age_seconds"] = (
+        round(max(0.0, time.time() - float(snapshot.get("last_finished_at") or 0.0)), 2)
+        if snapshot.get("last_finished_at") else None
+    )
+    return snapshot
+
+
+def _run_service_prewarm(trigger: str = "api") -> None:
+    started_at = time.time()
+    results: dict = {}
+    any_failure = False
+
+    # LLM 预热
+    llm_started = time.time()
+    llm_result = {
+        "enabled": bool(llm_manager and getattr(llm_manager, "enabled", False)),
+        "success": True,
+        "latency_ms": 0.0,
+        "skipped": False,
+        "error": "",
+    }
+    try:
+        if llm_result["enabled"]:
+            if hasattr(llm_manager, "warmup"):
+                llm_result = dict(llm_manager.warmup() or llm_result)
+            else:
+                llm_result["success"] = bool(getattr(llm_manager, "check_enabled", lambda: False)())
+        else:
+            llm_result["skipped"] = True
+    except Exception as exc:
+        llm_result["success"] = False
+        llm_result["error"] = str(exc)[:240]
+    llm_result["latency_ms"] = round((time.time() - llm_started) * 1000.0, 2)
+    results["llm"] = llm_result
+    if llm_result.get("enabled") and not llm_result.get("success"):
+        any_failure = True
+
+    # RAG 预热
+    rag_started = time.time()
+    rag_result = {
+        "enabled": bool(rag_service and getattr(rag_service, "enabled", False)),
+        "success": True,
+        "latency_ms": 0.0,
+        "skipped": False,
+        "error": "",
+        "ready": False,
+    }
+    try:
+        if rag_result["enabled"]:
+            rag_ready = bool(getattr(rag_service, "ensure_ready", lambda: False)())
+            rag_result["ready"] = rag_ready
+            rag_result["success"] = rag_ready
+            if hasattr(rag_service, "status"):
+                status_payload = rag_service.status() or {}
+                rag_result["question_count"] = int(status_payload.get("question_count") or 0)
+                rag_result["rubric_count"] = int(status_payload.get("rubric_count") or 0)
+        else:
+            rag_result["skipped"] = True
+    except Exception as exc:
+        rag_result["success"] = False
+        rag_result["error"] = str(exc)[:240]
+    rag_result["latency_ms"] = round((time.time() - rag_started) * 1000.0, 2)
+    results["rag"] = rag_result
+    if rag_result.get("enabled") and not rag_result.get("success"):
+        any_failure = True
+
+    # ASR 预热
+    asr_started = time.time()
+    asr_result = {
+        "enabled": bool(asr_manager and getattr(asr_manager, "enabled", False)),
+        "success": True,
+        "latency_ms": 0.0,
+        "skipped": False,
+        "error": "",
+    }
+    prewarm_stream_id = f"asr_prewarm_{uuid.uuid4().hex[:10]}"
+    try:
+        if asr_result["enabled"]:
+            started = bool(
+                asr_manager.start_session(
+                    prewarm_stream_id,
+                    on_result=lambda _text: None,
+                    on_partial=lambda _text: None,
+                    on_error=lambda _error: None,
+                )
+            )
+            asr_result["success"] = started
+            if not started:
+                asr_result["error"] = "start_session returned false"
+        else:
+            asr_result["skipped"] = True
+    except Exception as exc:
+        asr_result["success"] = False
+        asr_result["error"] = str(exc)[:240]
+    finally:
+        try:
+            if asr_manager is not None:
+                asr_manager.stop_session(prewarm_stream_id)
+        except Exception:
+            pass
+    asr_result["latency_ms"] = round((time.time() - asr_started) * 1000.0, 2)
+    results["asr"] = asr_result
+    if asr_result.get("enabled") and not asr_result.get("success"):
+        any_failure = True
+
+    # TTS 预热
+    tts_started = time.time()
+    tts_result = {
+        "enabled": bool(tts_manager and getattr(tts_manager, "enabled", False)),
+        "success": True,
+        "latency_ms": 0.0,
+        "skipped": False,
+        "error": "",
+        "provider": "",
+    }
+    try:
+        if tts_result["enabled"]:
+            status_payload = tts_manager.get_status() or {}
+            remote_error = str(status_payload.get("remote_error") or "").strip()
+            remote_status = status_payload.get("remote") if isinstance(status_payload.get("remote"), dict) else {}
+            tts_result["provider"] = str(remote_status.get("active_provider") or "").strip()
+            tts_result["success"] = not remote_error
+            if remote_error:
+                tts_result["error"] = remote_error[:240]
+        else:
+            tts_result["skipped"] = True
+    except Exception as exc:
+        tts_result["success"] = False
+        tts_result["error"] = str(exc)[:240]
+    tts_result["latency_ms"] = round((time.time() - tts_started) * 1000.0, 2)
+    results["tts"] = tts_result
+    if tts_result.get("enabled") and not tts_result.get("success"):
+        any_failure = True
+
+    duration_ms = round((time.time() - started_at) * 1000.0, 2)
+    final_status = "failed" if all(
+        item.get("enabled") and not item.get("success") for item in results.values()
+    ) else ("partial" if any_failure else "completed")
+    with _service_prewarm_lock:
+        _service_prewarm_state["status"] = final_status
+        _service_prewarm_state["trigger"] = trigger
+        _service_prewarm_state["last_finished_at"] = time.time()
+        _service_prewarm_state["duration_ms"] = duration_ms
+        _service_prewarm_state["results"] = results
+    logger.info(f"[prewarm] completed status={final_status} trigger={trigger} duration_ms={duration_ms}")
 
 
 def _build_question_rag_context(
@@ -276,16 +498,42 @@ def _get_last_interviewer_question(chat_history):
 
 
 def _is_noise_text(text: str) -> bool:
-    normalized = (text or '').strip()
+    normalized = ' '.join(str(text or '').strip().split())
     if not normalized:
         return True
-    if len(normalized) < 2:
+
+    stripped = normalized.strip('，。！？,.!?、~…-— ')
+    if not stripped:
         return True
-    fillers = {'啊', '嗯', '呃', '哦', '哎', '额', '唉', '哈', '噢', '嘛', '呗', '咯'}
-    if normalized in fillers:
+
+    fillers = {
+        '啊', '嗯', '呃', '哦', '哎', '额', '唉', '哈', '噢', '欸', '嘛', '呗', '咯', '诶', '喔',
+    }
+    weak_phrases = {
+        '谢谢', '感谢', '好的', '好的呢', '然后', '还有', '那个', '这个', '就是', '然后呢',
+        '嗯嗯', '啊啊', '呃呃',
+    }
+    short_valid_answers = {
+        '对', '是', '有', '会', '能', '行', '好', '嗯', '可以', '知道', '记得', '不是', '不会',
+        '有的', '会的', '能的', '行的',
+    }
+
+    if stripped in fillers:
         return True
-    noise_phrases = {'谢谢', '感谢', '好的', '好的呢', '然后', '还有', '那个', '这个', '就是'}
-    return normalized in noise_phrases
+
+    if stripped in weak_phrases:
+        return True
+
+    if len(set(stripped)) == 1 and stripped[0] in fillers and len(stripped) <= 4:
+        return True
+
+    if len(stripped) == 1 and stripped not in short_valid_answers:
+        return True
+
+    if len(stripped) <= 3 and stripped in short_valid_answers:
+        return False
+
+    return False
 
 
 def _current_question_id(runtime) -> str:
@@ -361,14 +609,137 @@ def _emit_realtime_speech_metrics(
 
 
 def _consume_runtime_segment_text(runtime, asr_generation: int = 0) -> str:
-    final_text = ' '.join(runtime.pending_asr_finals).strip()
-    partial_text = ' '.join(runtime.pending_asr_partials).strip()
+    _final_text, _partial_text, merged_text = _build_pending_asr_text(runtime)
     runtime.pending_asr_partials.clear()
     runtime.pending_asr_finals.clear()
     if asr_generation and runtime.last_finalized_asr_generation == asr_generation:
         runtime.last_finalized_asr_generation = 0
         runtime.last_finalized_asr_speech_epoch = 0
-    return str(final_text or partial_text).strip()
+    return merged_text
+
+
+def _pending_asr_audio_lock(runtime):
+    lock = getattr(runtime, 'pending_asr_audio_lock', None)
+    if lock is None:
+        lock = threading.RLock()
+        setattr(runtime, 'pending_asr_audio_lock', lock)
+    return lock
+
+
+def _reset_pending_asr_audio(runtime) -> None:
+    lock = _pending_asr_audio_lock(runtime)
+    with lock:
+        runtime.pending_asr_audio_chunks.clear()
+        runtime.pending_asr_audio_bytes = 0
+
+
+def _enqueue_pending_asr_audio(runtime, audio_data: bytes) -> bool:
+    if not audio_data:
+        return False
+
+    lock = _pending_asr_audio_lock(runtime)
+    with lock:
+        queued = runtime.pending_asr_audio_chunks
+        queued.append(audio_data)
+        runtime.pending_asr_audio_bytes += len(audio_data)
+
+        while len(queued) > ASR_PENDING_AUDIO_MAX_CHUNKS:
+            dropped = queued.pop(0)
+            runtime.pending_asr_audio_bytes = max(0, runtime.pending_asr_audio_bytes - len(dropped))
+
+        while runtime.pending_asr_audio_bytes > ASR_PENDING_AUDIO_MAX_BYTES and queued:
+            dropped = queued.pop(0)
+            runtime.pending_asr_audio_bytes = max(0, runtime.pending_asr_audio_bytes - len(dropped))
+
+        return bool(queued)
+
+
+def _flush_pending_asr_audio(runtime, asr_generation: int = 0) -> int:
+    if asr_manager is None:
+        return 0
+
+    lock = _pending_asr_audio_lock(runtime)
+    with lock:
+        if asr_generation and runtime.active_asr_generation != asr_generation:
+            return 0
+        if not runtime.active_asr_stream_id or not asr_manager.is_available(runtime.active_asr_stream_id):
+            return 0
+
+        flushed = 0
+        while runtime.pending_asr_audio_chunks:
+            if asr_generation and runtime.active_asr_generation != asr_generation:
+                break
+            stream_id = runtime.active_asr_stream_id
+            if not stream_id or not asr_manager.is_available(stream_id):
+                break
+
+            chunk = runtime.pending_asr_audio_chunks[0]
+            try:
+                queued_ok = bool(asr_manager.send_audio(stream_id, chunk))
+            except Exception:
+                queued_ok = False
+            if not queued_ok:
+                break
+
+            runtime.pending_asr_audio_chunks.pop(0)
+            runtime.pending_asr_audio_bytes = max(0, runtime.pending_asr_audio_bytes - len(chunk))
+            flushed += 1
+
+        return flushed
+
+
+def _merge_asr_fragments(fragments: list[str]) -> str:
+    def _sanitize_fragment(value: str) -> str:
+        text = ' '.join(str(value or '').strip().split())
+        if not text:
+            return ''
+        return text.strip()
+
+    merged = ""
+    for fragment in fragments or []:
+        chunk = _sanitize_fragment(fragment)
+        if not chunk:
+            continue
+        if not merged:
+            merged = chunk
+            continue
+        if chunk.startswith(merged) or merged in chunk:
+            merged = chunk
+            continue
+        if merged.startswith(chunk):
+            continue
+        merged = merge_answer_text(merged, chunk)
+    return str(merged).strip()
+
+
+def _build_pending_asr_text(runtime) -> tuple[str, str, str]:
+    final_text = _merge_asr_fragments(runtime.pending_asr_finals)
+    partial_text = _merge_asr_fragments(runtime.pending_asr_partials)
+    if final_text and partial_text:
+        merged_text = merge_answer_text(final_text, partial_text)
+    else:
+        merged_text = final_text or partial_text
+    return final_text, partial_text, str(merged_text or "").strip()
+
+
+def _extract_technical_terms(*texts: str, limit: int = 20) -> list[str]:
+    # 抽取英文术语/缩写/CamelCase，增强 ASR 文件复写对技术词的保留能力。
+    pattern = re.compile(r"[A-Za-z][A-Za-z0-9_+.#/\-]{1,40}")
+    seen: set[str] = set()
+    terms: list[str] = []
+    for text in texts:
+        for match in pattern.findall(str(text or "")):
+            token = str(match).strip()
+            if len(token) < 2:
+                continue
+            lower = token.lower()
+            if lower in seen:
+                continue
+            seen.add(lower)
+            terms.append(token)
+            if len(terms) >= limit:
+                return terms
+    return terms
 
 
 def _persist_answer_audio(runtime, answer_session: AnswerSession) -> str:
@@ -407,29 +778,111 @@ def _estimate_answer_audio_duration_ms(answer_session: AnswerSession, audio_path
     return max(0.0, (float(answer_session.audio_bytes) / 2.0 / 16000.0) * 1000.0)
 
 
+def _count_text_units(text: str) -> int:
+    content = str(text or "").strip()
+    if not content:
+        return 0
+    return len(re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9]+", content))
+
+
+def _pick_segment_text(final_text: str, partial_text: str, merged_pending_text: str) -> str:
+    final_text = str(final_text or "").strip()
+    partial_text = str(partial_text or "").strip()
+    merged_pending_text = str(merged_pending_text or "").strip()
+
+    if not ASR_SEGMENT_PREFER_FINAL_ONLY:
+        return merged_pending_text or final_text or partial_text
+
+    if not final_text:
+        return merged_pending_text or partial_text
+    if not merged_pending_text:
+        return final_text
+
+    final_units = _count_text_units(final_text)
+    merged_units = _count_text_units(merged_pending_text)
+    if merged_units >= max(6, int(final_units * 1.25)):
+        return merged_pending_text
+    return final_text
+
+
+def _text_token_overlap_ratio(text_a: str, text_b: str) -> float:
+    tokens_a = set(re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9]+", str(text_a or "").lower()))
+    tokens_b = set(re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9]+", str(text_b or "").lower()))
+    if not tokens_a or not tokens_b:
+        return 0.0
+    intersection = len(tokens_a & tokens_b)
+    union = len(tokens_a | tokens_b)
+    if union <= 0:
+        return 0.0
+    return float(intersection) / float(union)
+
+
+def _reconcile_final_answer_text(draft_text: str, rewritten_text: str) -> tuple[str, str]:
+    draft = str(draft_text or "").strip()
+    rewritten = str(rewritten_text or "").strip()
+
+    if not rewritten:
+        return draft, 'fallback_empty_rewrite'
+    if not draft:
+        return rewritten, 'asr_final_rewrite_only'
+    if rewritten == draft:
+        return rewritten, 'asr_final_exact'
+    if draft in rewritten:
+        return rewritten, 'asr_final_superset'
+    if rewritten in draft:
+        return draft, 'draft_contains_rewrite'
+
+    draft_units = _count_text_units(draft)
+    rewritten_units = _count_text_units(rewritten)
+    if draft_units >= 8 and rewritten_units <= max(4, int(draft_units * 0.62)):
+        merged = merge_answer_text(draft, rewritten)
+        if merged and _count_text_units(merged) >= int(draft_units * 0.9):
+            return merged, 'merge_guard_short_rewrite'
+        return draft, 'fallback_short_rewrite'
+
+    overlap_ratio = _text_token_overlap_ratio(draft, rewritten)
+    if draft_units >= 8 and rewritten_units >= 8 and overlap_ratio < 0.35:
+        if rewritten_units >= max(8, int(draft_units * 0.92)):
+            return rewritten, 'asr_final_rewrite_low_overlap_preferred'
+        return draft, 'fallback_low_overlap_draft'
+
+    merged = merge_answer_text(draft, rewritten)
+    if merged and _count_text_units(merged) >= max(draft_units, rewritten_units):
+        return merged, 'merge_rewrite_and_draft'
+    if rewritten_units >= draft_units:
+        return rewritten, 'asr_final_rewrite_preferred'
+    return draft, 'fallback_draft_preferred'
+
+
 def _rewrite_answer_text(runtime, answer_session: AnswerSession, audio_path: str = "") -> dict:
     if not audio_path or asr_manager is None or not hasattr(asr_manager, 'transcribe_file'):
         return {'text': answer_session.merged_text_draft, 'word_timestamps': [], 'confidence': None, 'mode': 'fallback_no_file'}
 
-    prompt_parts = [
-        "这是一次中文技术面试回答的音频转写，请尽量准确保留技术术语、英文缩写、数字和项目名称。",
-        "只输出转写后的正文，不要补充解释，不要改写成总结。",
-    ]
-    if runtime.current_question:
-        prompt_parts.append(f"当前题目：{runtime.current_question}")
-    if answer_session.merged_text_draft:
-        prompt_parts.append(f"实时草稿：{answer_session.merged_text_draft}")
+    prompt_parts = []
+    if ASR_FINAL_USE_HINT_PROMPT:
+        prompt_parts = [
+            "这是一次中文技术面试回答的音频转写，请尽量准确保留技术术语、英文缩写、数字和项目名称。",
+            "只输出转写后的正文，不要补充解释，不要改写成总结。",
+        ]
+        if runtime.current_question:
+            prompt_parts.append(f"当前题目：{runtime.current_question}")
+        technical_terms = _extract_technical_terms(runtime.current_question, answer_session.merged_text_draft)
+        if technical_terms:
+            prompt_parts.append(
+                "术语词表（若音频中出现，请优先按下列写法输出，保持大小写）："
+                + "、".join(technical_terms)
+            )
 
     rewrite_payload = {}
     if hasattr(asr_manager, 'transcribe_file_with_meta'):
         rewrite_payload = asr_manager.transcribe_file_with_meta(
             audio_path=audio_path,
-            prompt="\n".join(part for part in prompt_parts if part),
+            prompt="\n".join(part for part in prompt_parts if part) if prompt_parts else "",
         ) or {}
     else:
         rewrite_text = asr_manager.transcribe_file(
             audio_path=audio_path,
-            prompt="\n".join(part for part in prompt_parts if part),
+            prompt="\n".join(part for part in prompt_parts if part) if prompt_parts else "",
         )
         rewrite_payload = {'text': rewrite_text}
 
@@ -523,7 +976,22 @@ def _finalize_answer_session(runtime, reason: str = "long_pause") -> None:
 
     audio_path = _persist_answer_audio(current, answer_session)
     rewrite_payload = _rewrite_answer_text(current, answer_session, audio_path=audio_path)
-    final_text = str(rewrite_payload.get('text') or '').strip() or final_candidate
+    final_text, final_text_mode = _reconcile_final_answer_text(
+        answer_session.merged_text_draft,
+        rewrite_payload.get('text') or '',
+    )
+    final_text = final_text or final_candidate
+    _log_runtime_event(
+        current,
+        'answer_session_final_text_selected',
+        level='debug',
+        answer_session_id=answer_session.answer_session_id,
+        final_text_mode=final_text_mode,
+        rewrite_mode=str(rewrite_payload.get('mode') or ''),
+        draft_units=_count_text_units(answer_session.merged_text_draft),
+        rewrite_units=_count_text_units(str(rewrite_payload.get('text') or '')),
+        final_units=_count_text_units(final_text),
+    )
     answer_session.mark_final(final_text, reason=reason, exported_audio_path=audio_path)
     _build_answer_session_final_metrics(current, answer_session, audio_path=audio_path, final_text=final_text)
     _emit_realtime_speech_metrics(
@@ -667,7 +1135,13 @@ def _finalize_answer_segment(
     if not answer_session or answer_session.turn_id != current.turn_id:
         return ""
 
-    segment_text = _consume_runtime_segment_text(current, asr_generation=asr_generation)
+    final_text, partial_text, merged_pending_text = _build_pending_asr_text(current)
+    segment_text = _pick_segment_text(final_text, partial_text, merged_pending_text)
+    current.pending_asr_partials.clear()
+    current.pending_asr_finals.clear()
+    if asr_generation and current.last_finalized_asr_generation == asr_generation:
+        current.last_finalized_asr_generation = 0
+        current.last_finalized_asr_speech_epoch = 0
     if segment_text:
         answer_session.finalize_segment(segment_text)
     if speech_epoch and speech_epoch >= getattr(answer_session, 'last_speech_epoch', 0):
@@ -843,8 +1317,10 @@ def _disable_runtime_asr(runtime, code: str, error: str, details: str = "", asr_
     _cancel_answer_finalize_timer(current)
     current.pending_asr_partials.clear()
     current.pending_asr_finals.clear()
+    _reset_pending_asr_audio(current)
     current.active_asr_generation = 0
     current.active_asr_speech_epoch = 0
+    current.active_client_speech_epoch = 0
     current.finalizing_asr_generation = 0
     current.last_finalized_asr_generation = 0
     current.last_finalized_asr_speech_epoch = 0
@@ -916,11 +1392,62 @@ def _runtime_log_fields(runtime, **fields):
     return payload
 
 
+def _emit_asr_debug_event(runtime, event: str, level: str = "info", **fields) -> None:
+    if not ASR_DEBUG_STREAM_ENABLED:
+        return
+    if not runtime or not getattr(runtime, "client_id", ""):
+        return
+
+    payload = _runtime_log_fields(
+        runtime,
+        event=str(event or "").strip(),
+        level=str(level or "info").strip() or "info",
+        timestamp=time.time(),
+        **fields,
+    )
+
+    clip_fields = {
+        "details",
+        "partial_preview",
+        "final_preview",
+        "segment_preview",
+        "answer_preview",
+        "text_snapshot",
+        "question_preview",
+    }
+    for field in clip_fields:
+        value = payload.get(field)
+        if isinstance(value, str):
+            normalized = " ".join(value.split())
+            payload[field] = (normalized[:280] + "...") if len(normalized) > 280 else normalized
+
+    try:
+        socketio.emit("asr_debug", payload, to=runtime.client_id)
+    except Exception as exc:
+        logger.debug(f"[runtime] asr_debug emit failed: {exc}")
+
+
 def _log_runtime_event(runtime, event: str, level: str = 'info', **fields):
     payload = _runtime_log_fields(runtime, event=event, **fields)
     log_fn = getattr(logger, level, logger.info)
     details = ' '.join(f"{key}={payload[key]!r}" for key in sorted(payload))
     log_fn(f"[runtime] {details}")
+
+    normalized_event = str(event or "").strip().lower()
+    should_emit_debug = (
+        normalized_event.startswith("asr_")
+        or normalized_event.startswith("speech_")
+        or normalized_event.startswith("answer_session_")
+        or normalized_event in {
+            "utterance_commit_request",
+            "commit_scheduled",
+            "commit_dropped",
+            "commit_ignored",
+            "commit_accepted",
+        }
+    )
+    if should_emit_debug:
+        _emit_asr_debug_event(runtime, normalized_event, level=level, **fields)
 
 
 def _print_asr_console(runtime, phase: str, text: str, asr_generation: int):
@@ -933,6 +1460,133 @@ def _print_asr_console(runtime, phase: str, text: str, asr_generation: int):
         f"gen={asr_generation} text={content}",
         flush=True,
     )
+
+
+def _estimate_spoken_duration_ms(text: str) -> float:
+    content = str(text or '').strip()
+    if not content:
+        return 1200.0
+    token_count = len([ch for ch in content if ch.strip()])
+    return max(1200.0, float(token_count) * 260.0)
+
+
+def _track_question_timeline(runtime, turn_id: str, question_text: str) -> None:
+    if not runtime or not runtime.started_at:
+        return
+    now = time.time()
+    runtime.current_question_started_at = now
+    runtime.current_question_estimated_end_at = now + (_estimate_spoken_duration_ms(question_text) / 1000.0)
+    runtime.current_answer_started_at = None
+
+    if not hasattr(db_manager, 'save_or_update_turn_timeline'):
+        return
+    question_start_ms = max(0.0, (runtime.current_question_started_at - runtime.started_at) * 1000.0)
+    question_end_ms = max(question_start_ms, (runtime.current_question_estimated_end_at - runtime.started_at) * 1000.0)
+    db_manager.save_or_update_turn_timeline({
+        'interview_id': runtime.interview_id,
+        'turn_id': str(turn_id or runtime.turn_id or '').strip(),
+        'question_start_ms': round(question_start_ms, 2),
+        'question_end_ms': round(question_end_ms, 2),
+        'source': 'runtime',
+    })
+
+
+def _track_answer_timeline(runtime, turn_id: str) -> None:
+    if not runtime or not runtime.started_at or not hasattr(db_manager, 'save_or_update_turn_timeline'):
+        return
+    now = time.time()
+    answer_start_at = runtime.current_answer_started_at or now
+    answer_end_at = now
+    question_end_at = runtime.current_question_estimated_end_at or runtime.current_question_started_at or answer_start_at
+    latency_ms = max(0.0, (answer_start_at - question_end_at) * 1000.0)
+    db_manager.save_or_update_turn_timeline({
+        'interview_id': runtime.interview_id,
+        'turn_id': str(turn_id or runtime.turn_id or '').strip(),
+        'answer_start_ms': round(max(0.0, (answer_start_at - runtime.started_at) * 1000.0), 2),
+        'answer_end_ms': round(max(0.0, (answer_end_at - runtime.started_at) * 1000.0), 2),
+        'latency_ms': round(latency_ms, 2),
+        'source': 'runtime',
+    })
+
+
+def _maybe_enqueue_replay_generation(interview_id: str, force: bool = False) -> None:
+    normalized_id = str(interview_id or '').strip()
+    if not normalized_id:
+        return
+    try:
+        replay_task_manager.enqueue(normalized_id, force=force)
+    except Exception as exc:
+        logger.warning(f"投递复盘任务失败：{exc}")
+
+
+def _maybe_enqueue_behavior_analysis(interview_id: str, force: bool = False) -> None:
+    normalized_id = str(interview_id or '').strip()
+    if not normalized_id:
+        return
+    if not bool(config.get('replay.behavior.auto_trigger', True)):
+        return
+    try:
+        behavior_task_manager.enqueue(normalized_id, force=force)
+    except Exception as exc:
+        logger.warning(f"投递行为分析任务失败：{exc}")
+
+
+def _derive_detection_events_and_stats(report_data: dict) -> tuple[list[dict], dict]:
+    timeline = (report_data or {}).get('timeline') or []
+    events: list[dict] = []
+    total_deviations = 0
+    total_mouth_open = 0
+    total_multi_person = 0
+    offscreen_values: list[float] = []
+
+    for item in timeline:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get('type') or '').strip() != 'detection_state':
+            continue
+        timestamp = float(item.get('timestamp') or 0.0)
+        risk_score = float(item.get('probability') or item.get('risk_score') or 0.0)
+        score = int(max(0.0, min(100.0, risk_score * 100.0 if risk_score <= 1.0 else risk_score)))
+        has_face = bool(item.get('has_face', True))
+        face_count = int(item.get('face_count', 1) or 1)
+        off_screen_ratio = float(item.get('off_screen_ratio') or 0.0)
+        flags = [str(flag).strip().lower() for flag in (item.get('flags') or []) if str(flag).strip()]
+        offscreen_values.append(off_screen_ratio)
+
+        if face_count > 1 or 'multi_person' in flags:
+            total_multi_person += 1
+            events.append({
+                'type': 'multi_person',
+                'timestamp': timestamp,
+                'score': score,
+                'description': '检测到多张人脸或环境人员波动',
+                'face_count': face_count,
+                'flags': flags,
+                'off_screen_ratio': off_screen_ratio,
+            })
+
+        if (not has_face) or off_screen_ratio >= 30.0 or ('no_face_long' in flags):
+            total_deviations += 1
+            events.append({
+                'type': 'gaze_deviation',
+                'timestamp': timestamp,
+                'score': score,
+                'description': '出现离屏/离镜头行为',
+                'has_face': has_face,
+                'face_count': face_count,
+                'flags': flags,
+                'off_screen_ratio': off_screen_ratio,
+            })
+
+    avg_off_screen_ratio = (sum(offscreen_values) / len(offscreen_values)) if offscreen_values else 0.0
+    stats = {
+        'total_deviations': int(total_deviations),
+        'total_mouth_open': int(total_mouth_open),
+        'total_multi_person': int(total_multi_person),
+        'off_screen_ratio': round(avg_off_screen_ratio, 4),
+        'frames_processed': int((report_data or {}).get('summary', {}).get('frames_processed', 0) or len(timeline)),
+    }
+    return events, stats
 
 
 def _interrupt_runtime(runtime, reason: str):
@@ -957,6 +1611,7 @@ def _record_runtime_dialogue(
     turn_id: str = "",
     question_id: str = "",
 ):
+    normalized_turn_id = str(turn_id or runtime.turn_id or '').strip() or f"turn_{runtime.turn_index}"
     if runtime.data_manager:
         runtime.data_manager.add_frame_data({
             'type': 'interview_dialogue',
@@ -970,6 +1625,7 @@ def _record_runtime_dialogue(
 
     db_manager.save_interview_dialogue({
         'interview_id': runtime.interview_id,
+        'turn_id': normalized_turn_id,
         'round_type': runtime.round_type,
         'question': question,
         'answer': answer,
@@ -978,7 +1634,6 @@ def _record_runtime_dialogue(
 
     answer_session = runtime.current_answer_session
     if answer_session and hasattr(db_manager, 'save_or_update_speech_evaluation'):
-        normalized_turn_id = str(turn_id or runtime.turn_id or '').strip() or f"turn_{runtime.turn_index}"
         try:
             db_manager.save_or_update_speech_evaluation({
                 'interview_id': runtime.interview_id,
@@ -995,11 +1650,13 @@ def _record_runtime_dialogue(
         except Exception as exc:
             logger.warning(f"保存语音表达评估失败：{exc}")
 
+    _track_answer_timeline(runtime, normalized_turn_id)
+
     if evaluation_service is not None:
         try:
             enqueue_result = evaluation_service.enqueue_evaluation(
                 interview_id=runtime.interview_id,
-                turn_id=str(turn_id or runtime.turn_id or "").strip() or f"turn_{runtime.turn_index}",
+                turn_id=normalized_turn_id,
                 question_id=str(question_id or "").strip() or _extract_question_id_from_plan(runtime.last_question_plan),
                 user_id=runtime.user_id,
                 round_type=runtime.round_type,
@@ -1119,7 +1776,12 @@ def _start_runtime_tts(runtime, spoken_text: str, turn_id: str, source: str = 'r
                         'timestamp': time.time()
                     }, to=runtime.client_id)
 
-                ok = tts_manager.synthesize(sentence, callback=send_audio_chunk)
+                ok = tts_manager.synthesize(
+                    sentence,
+                    callback=send_audio_chunk,
+                    interview_id=runtime.interview_id,
+                    session_id=runtime.session_id,
+                )
                 if not _current_runtime_matches(runtime.client_id, runtime.session_id, tts_job_id, interrupt_epoch):
                     return
                 if not ok or not emitted['ok']:
@@ -1196,33 +1858,40 @@ def _start_runtime_asr(runtime, reason: str = "speech_start") -> bool:
                     lock_reason=live_runtime.asr_lock_reason,
                 )
                 return
-            live_runtime.pending_asr_partials = [text]
+            partial_text = str(text or '').strip()
+            if not partial_text:
+                return
+            # partial 只保留最新快照，避免 revision 抖动导致重复累积。
+            live_runtime.pending_asr_partials = [partial_text]
+            _final_text, _partial_text, preview_text = _build_pending_asr_text(live_runtime)
             answer_session = _ensure_answer_session(live_runtime)
-            preview_text = ' '.join(live_runtime.pending_asr_finals + [text]).strip()
             answer_session.mark_status('recording')
             answer_session.update_partial(preview_text)
             _emit_realtime_speech_metrics(
                 live_runtime,
                 answer_session,
                 is_speaking=True,
-                text_snapshot=preview_text or text,
+                text_snapshot=preview_text or partial_text,
                 source='asr_partial',
             )
-            _print_asr_console(live_runtime, 'partial', text, asr_generation)
+            _print_asr_console(live_runtime, 'partial', partial_text, asr_generation)
             _log_runtime_event(
                 live_runtime,
                 'asr_partial',
                 level='debug',
                 stream_id=live_runtime.active_asr_stream_id,
                 asr_generation=asr_generation,
-                partial_preview=text[:120],
+                partial_preview=partial_text[:120],
             )
             _emit_answer_session_update(live_runtime, source='asr_partial')
             socketio.emit('asr_partial', {
                 'session_id': live_runtime.session_id,
                 'turn_id': live_runtime.turn_id,
                 'stream_id': live_runtime.active_asr_stream_id,
-                'text': text,
+                'speech_epoch': live_runtime.active_asr_speech_epoch or live_runtime.speech_epoch,
+                'asr_generation': asr_generation,
+                'text': partial_text,
+                'full_text': preview_text,
                 'interrupt_epoch': live_runtime.interrupt_epoch,
                 'timestamp': time.time()
             }, to=live_runtime.client_id)
@@ -1250,25 +1919,30 @@ def _start_runtime_asr(runtime, reason: str = "speech_start") -> bool:
                     lock_reason=live_runtime.asr_lock_reason,
                 )
                 return
-            if not live_runtime.pending_asr_finals or live_runtime.pending_asr_finals[-1] != text:
-                live_runtime.pending_asr_finals.append(text)
+            final_text = str(text or '').strip()
+            if not final_text:
+                return
+            merged_final = _merge_asr_fragments(live_runtime.pending_asr_finals)
+            merged_final = merge_answer_text(merged_final, final_text) if merged_final else final_text
+            live_runtime.pending_asr_finals = [merged_final]
+            _merged_final, _merged_partial, preview_text = _build_pending_asr_text(live_runtime)
             answer_session = _ensure_answer_session(live_runtime)
             answer_session.mark_status('recording')
-            answer_session.update_partial(' '.join(live_runtime.pending_asr_finals).strip())
+            answer_session.update_partial(preview_text)
             _emit_realtime_speech_metrics(
                 live_runtime,
                 answer_session,
                 is_speaking=True,
-                text_snapshot=' '.join(live_runtime.pending_asr_finals).strip(),
+                text_snapshot=preview_text or merged_final,
                 source='asr_final',
             )
-            _print_asr_console(live_runtime, 'final', text, asr_generation)
+            _print_asr_console(live_runtime, 'final', final_text, asr_generation)
             _log_runtime_event(
                 live_runtime,
                 'asr_final',
                 stream_id=live_runtime.active_asr_stream_id,
                 asr_generation=asr_generation,
-                final_preview=text[:160],
+                final_preview=final_text[:160],
                 final_count=len(live_runtime.pending_asr_finals),
             )
             _emit_answer_session_update(live_runtime, source='asr_sentence_final')
@@ -1276,8 +1950,11 @@ def _start_runtime_asr(runtime, reason: str = "speech_start") -> bool:
                 'session_id': live_runtime.session_id,
                 'turn_id': live_runtime.turn_id,
                 'stream_id': live_runtime.active_asr_stream_id,
-                'text': text,
-                'full_text': ' '.join(live_runtime.pending_asr_finals).strip(),
+                'speech_epoch': live_runtime.active_asr_speech_epoch or live_runtime.speech_epoch,
+                'asr_generation': asr_generation,
+                'text': final_text,
+                'full_text': merged_final,
+                'preview_text': preview_text,
                 'interrupt_epoch': live_runtime.interrupt_epoch,
                 'timestamp': time.time()
             }, to=live_runtime.client_id)
@@ -1315,6 +1992,7 @@ def _start_runtime_asr(runtime, reason: str = "speech_start") -> bool:
             on_error=on_error
         )
         if started:
+            flushed = _flush_pending_asr_audio(current, asr_generation=asr_generation)
             _set_runtime_asr_status(current, True)
             _log_runtime_event(
                 current,
@@ -1323,6 +2001,7 @@ def _start_runtime_asr(runtime, reason: str = "speech_start") -> bool:
                 asr_generation=asr_generation,
                 speech_epoch=current.active_asr_speech_epoch,
                 reason=reason,
+                pending_audio_flushed=flushed,
             )
             return True
 
@@ -1350,6 +2029,7 @@ def _finalize_runtime_asr(runtime, reason: str = "speech_end") -> tuple[int, int
             return current.last_finalized_asr_generation, current.last_finalized_asr_speech_epoch
 
         speech_epoch = current.active_asr_speech_epoch
+        pending_audio_flushed = _flush_pending_asr_audio(current, asr_generation=asr_generation)
 
         current.finalizing_asr_generation = asr_generation
         current.active_asr_generation = 0
@@ -1365,10 +2045,15 @@ def _finalize_runtime_asr(runtime, reason: str = "speech_end") -> tuple[int, int
                 asr_generation=asr_generation,
                 speech_epoch=speech_epoch,
                 reason=reason,
+                pending_audio_flushed=pending_audio_flushed,
             )
+            grace_ms = ASR_SPEECH_END_GRACE_MS if reason == 'speech_end' else 0
+            if grace_ms > 0:
+                time.sleep(grace_ms / 1000.0)
         except Exception as e:
             logger.warning(f"[ASR] 结束识别流失败 - stream={current.active_asr_stream_id}: {e}")
         finally:
+            _reset_pending_asr_audio(current)
             current.finalizing_asr_generation = 0
             current.last_finalized_asr_generation = asr_generation
             current.last_finalized_asr_speech_epoch = speech_epoch
@@ -1403,19 +2088,21 @@ def _schedule_runtime_commit(
                 reason='stale_asr_generation',
             )
             return
-        final_text = ' '.join(current.pending_asr_finals).strip()
-        partial_text = ' '.join(current.pending_asr_partials).strip()
+        final_text, partial_text, merged_pending_text = _build_pending_asr_text(current)
         stream_active = bool(
             asr_manager
             and current.active_asr_stream_id
             and current.active_asr_generation == asr_generation
             and asr_manager.is_available(current.active_asr_stream_id)
         )
-        answer_text = str(
-            text_override
-            or final_text
-            or (partial_text if asr_generation and not stream_active else '')
-        ).strip()
+        if text_override:
+            answer_text = str(text_override).strip()
+        elif final_text:
+            answer_text = final_text if ASR_SEGMENT_PREFER_FINAL_ONLY else (merged_pending_text or final_text)
+        elif asr_generation and not stream_active:
+            answer_text = partial_text
+        else:
+            answer_text = ''
         current.pending_asr_partials.clear()
         current.pending_asr_finals.clear()
         if asr_generation and current.last_finalized_asr_generation == asr_generation:
@@ -1536,6 +2223,7 @@ def _process_runtime_commit(runtime, answer_text: str, turn_id: str, source: str
             next_turn_id = current.next_turn()
             _set_runtime_asr_lock(current, False)
             current.current_question = normalized_reply['display_text']
+            _track_question_timeline(current, next_turn_id, normalized_reply['spoken_text'] or normalized_reply['display_text'])
             current.chat_history.append({
                 'role': 'interviewer',
                 'content': current.current_question
@@ -1655,6 +2343,58 @@ def health():
     })
 
 
+@app.route('/api/prewarm', methods=['GET', 'POST'])
+def api_prewarm():
+    """后台预热 LLM/RAG/ASR/TTS，减少首次进入面试的冷启动等待。"""
+    payload = request.get_json(silent=True) or {}
+    source = str(payload.get('source') or request.args.get('source') or 'api').strip() or 'api'
+    force_raw = payload.get('force', request.args.get('force', '0'))
+    wait_raw = payload.get('wait', request.args.get('wait', '0'))
+    wait_timeout_raw = payload.get('wait_timeout', request.args.get('wait_timeout', 2.5))
+
+    force = str(force_raw).strip().lower() in {'1', 'true', 'yes', 'on'}
+    wait = str(wait_raw).strip().lower() in {'1', 'true', 'yes', 'on'}
+    try:
+        wait_timeout = max(0.0, min(float(wait_timeout_raw), 8.0))
+    except Exception:
+        wait_timeout = 2.5
+
+    global _service_prewarm_thread
+    now = time.time()
+    with _service_prewarm_lock:
+        running = bool(_service_prewarm_thread and _service_prewarm_thread.is_alive())
+        last_finished_at = float(_service_prewarm_state.get('last_finished_at') or 0.0)
+        cached_recent = bool(
+            last_finished_at > 0.0
+            and (now - last_finished_at) < SERVICE_PREWARM_CACHE_SECONDS
+            and _service_prewarm_state.get('status') in {'completed', 'partial'}
+        )
+
+        if not running and (force or not cached_recent):
+            _service_prewarm_state['status'] = 'running'
+            _service_prewarm_state['trigger'] = source
+            _service_prewarm_state['last_started_at'] = now
+            _service_prewarm_state['results'] = {}
+            _service_prewarm_state['duration_ms'] = 0.0
+            _service_prewarm_thread = threading.Thread(
+                target=_run_service_prewarm,
+                args=(source,),
+                daemon=True,
+            )
+            _service_prewarm_thread.start()
+            running = True
+
+        worker = _service_prewarm_thread
+
+    if wait and worker and worker.is_alive():
+        worker.join(timeout=wait_timeout)
+
+    return jsonify({
+        'success': True,
+        'data': _snapshot_service_prewarm_state(),
+    })
+
+
 @app.route('/api/performance')
 def get_performance():
     """获取性能统计"""
@@ -1674,6 +2414,68 @@ def get_bottlenecks():
         'success': True,
         'data': bottlenecks
     })
+
+
+@app.route('/api/question-bank')
+def get_question_bank():
+    """读取数据库题库（interview_rounds.questions）"""
+    try:
+        round_type = str(request.args.get('round_type', '') or '').strip()
+        position = str(request.args.get('position', '') or '').strip()
+        difficulty = str(request.args.get('difficulty', '') or '').strip()
+        keyword = str(request.args.get('keyword', '') or '').strip().lower()
+        limit = request.args.get('limit', 500, type=int) or 500
+        limit = max(1, min(limit, 2000))
+
+        question_bank = db_manager.get_question_bank(
+            round_type=round_type or None,
+            position=position or None,
+            difficulty=difficulty or None,
+        )
+
+        if keyword:
+            question_bank = [
+                item for item in question_bank
+                if keyword in str(item.get('question', '')).lower()
+                or keyword in str(item.get('category', '')).lower()
+                or keyword in str(item.get('round_type', '')).lower()
+                or keyword in str(item.get('position', '')).lower()
+                or keyword in str(item.get('description', '')).lower()
+            ]
+
+        total = len(question_bank)
+        truncated = question_bank[:limit]
+        categories = sorted({
+            str(item.get('category', '')).strip()
+            for item in question_bank
+            if str(item.get('category', '')).strip()
+        })
+        facets = db_manager.get_question_bank_facets()
+
+        return jsonify({
+            'success': True,
+            'count': len(truncated),
+            'total': total,
+            'limit': limit,
+            'question_bank': truncated,
+            'categories': categories,
+            'facets': facets,
+            'message': '' if total > 0 else 'question bank is empty',
+        })
+
+    except Exception as e:
+        logger.error(f"获取题库失败：{e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'question_bank': [],
+            'categories': [],
+            'facets': {
+                'round_types': [],
+                'positions': [],
+                'difficulties': [],
+            }
+        }), 500
 
 
 # ==================== Socket.IO 事件 ====================
@@ -1700,6 +2502,7 @@ def handle_disconnect():
         if runtime.pending_commit_timer:
             runtime.pending_commit_timer.cancel()
         _cancel_answer_finalize_timer(runtime)
+        _reset_pending_asr_audio(runtime)
         if asr_manager and runtime.active_asr_stream_id:
             asr_manager.stop_session(runtime.active_asr_stream_id)
         _log_runtime_event(runtime, 'disconnect_cleanup')
@@ -1714,9 +2517,11 @@ def handle_session_start(data=None):
     try:
         existing = session_registry.remove(client_id)
         if existing:
+            existing.ended = True
             if existing.pending_commit_timer:
                 existing.pending_commit_timer.cancel()
             _cancel_answer_finalize_timer(existing)
+            _reset_pending_asr_audio(existing)
             if asr_manager and existing.active_asr_stream_id:
                 asr_manager.stop_session(existing.active_asr_stream_id)
 
@@ -1736,10 +2541,35 @@ def handle_session_start(data=None):
             position=position,
             difficulty=difficulty,
         )
+        target_session_id = runtime.session_id
+
+        def runtime_stale() -> bool:
+            live_runtime = session_registry.get(client_id)
+            return bool(
+                not live_runtime
+                or live_runtime.session_id != target_session_id
+                or live_runtime.ended
+            )
+
         runtime.started_at = time.time()
         runtime.active_asr_stream_id = f"asr_{session_id}"
         runtime.short_pause_threshold_seconds = SHORT_PAUSE_SECONDS
         runtime.long_pause_threshold_seconds = LONG_PAUSE_SECONDS
+        # 先创建会话主记录，确保后续结构化评估入库不会触发外键失败
+        try:
+            db_manager.save_interview({
+                'interview_id': runtime.interview_id,
+                'start_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'end_time': None,
+                'duration': 0,
+                'max_probability': None,
+                'avg_probability': None,
+                'risk_level': 'LOW',
+                'events_count': 0,
+                'report_path': ''
+            })
+        except Exception as e:
+            logger.warning(f"会话主记录预创建失败：{e}")
         _log_runtime_event(
             runtime,
             'session_start',
@@ -1770,6 +2600,15 @@ def handle_session_start(data=None):
                     runtime.resume_data
                 )
 
+        if runtime_stale():
+            _log_runtime_event(
+                runtime,
+                'session_start_aborted',
+                level='debug',
+                reason='runtime_replaced_before_initial_question',
+            )
+            return
+
         _emit_orchestrator_state(runtime)
 
         initial_question = ""
@@ -1794,10 +2633,22 @@ def handle_session_start(data=None):
                 )
                 runtime.last_answer_analysis = None
 
+        if runtime_stale():
+            _log_runtime_event(
+                runtime,
+                'session_start_aborted',
+                level='debug',
+                reason='runtime_replaced_after_initial_question',
+            )
+            return
+
+        runtime = session_registry.get(client_id) or runtime
+
         normalized_question = speech_normalizer.normalize(initial_question)
         runtime.next_turn()
         _set_runtime_asr_lock(runtime, False)
         runtime.current_question = normalized_question['display_text']
+        _track_question_timeline(runtime, runtime.turn_id, normalized_question['spoken_text'] or normalized_question['display_text'])
         runtime.chat_history.append({
             'role': 'interviewer',
             'content': runtime.current_question
@@ -1824,6 +2675,15 @@ def handle_session_start(data=None):
             'timestamp': time.time()
         }, to=client_id)
 
+        if runtime_stale():
+            _log_runtime_event(
+                runtime,
+                'session_start_aborted',
+                level='debug',
+                reason='runtime_replaced_before_tts_start',
+            )
+            return
+
         _start_runtime_tts(runtime, normalized_question['spoken_text'], runtime.turn_id, source='session_start')
         logger.info(f"✓ 新会话已启动 - session_id={runtime.session_id}, client_id={client_id}")
     except Exception as e:
@@ -1841,11 +2701,35 @@ def handle_session_end(data=None):
 
     try:
         _log_runtime_event(runtime, 'session_end_requested')
+        upload_id = str((data or {}).get('video_upload_id', '')).strip()
+        if upload_id:
+            finalize_payload = video_upload_service.finalize_upload(
+                upload_id=upload_id,
+                interview_id=runtime.interview_id,
+            )
+            if finalize_payload.get('success'):
+                db_manager.save_or_update_interview_asset({
+                    'interview_id': runtime.interview_id,
+                    'upload_id': upload_id,
+                    'storage_key': Path(finalize_payload.get('final_path', '')).name,
+                    'video_url': '',
+                    'local_path': finalize_payload.get('final_path', ''),
+                    'duration_ms': finalize_payload.get('duration_ms', 0),
+                    'codec': finalize_payload.get('codec', ''),
+                    'status': finalize_payload.get('status', 'uploaded'),
+                    'metadata_json': json.dumps({
+                        'raw_path': finalize_payload.get('raw_path', ''),
+                    }, ensure_ascii=False),
+                })
+            else:
+                logger.warning(f"会话结束时自动 finalize 视频失败：{finalize_payload.get('error', '')}")
+
         runtime.ended = True
         if runtime.pending_commit_timer:
             runtime.pending_commit_timer.cancel()
             runtime.pending_commit_timer = None
         _cancel_answer_finalize_timer(runtime)
+        _reset_pending_asr_audio(runtime)
         if asr_manager and runtime.active_asr_stream_id:
             asr_manager.stop_session(runtime.active_asr_stream_id)
 
@@ -1857,22 +2741,32 @@ def handle_session_end(data=None):
 
         report_path = report_generator.generate_report(report_data) if report_data else ""
         if report_data:
+            derived_events, derived_stats = _derive_detection_events_and_stats(report_data)
             db_manager.save_interview({
                 'interview_id': runtime.interview_id,
                 'start_time': report_data.get('summary', {}).get('start_time'),
                 'end_time': report_data.get('summary', {}).get('end_time'),
                 'duration': report_data.get('summary', {}).get('duration', 0),
+                'risk_level': report_data.get('summary', {}).get('risk_level', 'LOW'),
+                'events_count': len(derived_events),
                 'report_path': report_path
             })
+            if derived_events:
+                db_manager.save_events(runtime.interview_id, derived_events)
+            if derived_stats:
+                db_manager.save_statistics(runtime.interview_id, derived_stats)
 
         state_orchestrator.begin_listening(runtime)
         runtime.mode = 'ended'
         _log_runtime_event(runtime, 'session_end_completed', report_path=report_path)
+        _maybe_enqueue_replay_generation(runtime.interview_id, force=False)
+        _maybe_enqueue_behavior_analysis(runtime.interview_id, force=False)
         _emit_orchestrator_state(runtime)
         emit('interview_ended', {
             'message': 'Interview session ended',
             'report_path': report_path,
             'session_id': runtime.session_id,
+            'interview_id': runtime.interview_id,
             'timestamp': time.time(),
             'success': True
         })
@@ -1901,29 +2795,52 @@ def handle_speech_start(data=None):
         )
         return
 
-    if (
-        asr_manager is not None
-        and runtime.active_asr_generation
-    ):
+    raw_client_speech_epoch = (data or {}).get('speech_epoch', 0)
+    try:
+        client_speech_epoch = int(raw_client_speech_epoch or 0)
+    except Exception:
+        client_speech_epoch = 0
+
+    if client_speech_epoch > 0:
+        if client_speech_epoch <= int(getattr(runtime, 'client_speech_epoch', 0) or 0):
+            _log_runtime_event(
+                runtime,
+                'speech_start_ignored',
+                level='debug',
+                requested_turn_id=str((data or {}).get('turn_id', '')).strip(),
+                client_speech_epoch=client_speech_epoch,
+                latest_client_speech_epoch=runtime.client_speech_epoch,
+                reason='stale_or_duplicate_client_speech_epoch',
+            )
+            return
+        runtime.client_speech_epoch = client_speech_epoch
+        runtime.active_client_speech_epoch = client_speech_epoch
+
+    if runtime.active_asr_generation:
         _log_runtime_event(
             runtime,
             'speech_start_ignored',
             level='debug',
             requested_turn_id=str((data or {}).get('turn_id', '')).strip(),
+            speech_epoch=runtime.speech_epoch,
             asr_generation=runtime.active_asr_generation,
-            reason='asr_already_running_or_starting',
+            reason='asr_generation_active',
         )
         return
 
     runtime.speech_epoch += 1
+    if runtime.current_answer_started_at is None:
+        runtime.current_answer_started_at = time.time()
     _log_runtime_event(
         runtime,
         'speech_start',
         requested_turn_id=str((data or {}).get('turn_id', '')).strip(),
         speech_epoch=runtime.speech_epoch,
+        client_speech_epoch=client_speech_epoch or '',
     )
     _interrupt_runtime(runtime, 'speech_start')
     _cancel_answer_finalize_timer(runtime)
+    _reset_pending_asr_audio(runtime)
     answer_session = _ensure_answer_session(runtime)
     answer_session.last_speech_epoch = runtime.speech_epoch
     answer_session.mark_status('recording')
@@ -1969,7 +2886,6 @@ def handle_audio_chunk(data):
         if (
             not runtime.active_asr_generation
             or not runtime.active_asr_stream_id
-            or not asr_manager.is_available(runtime.active_asr_stream_id)
         ):
             return
 
@@ -1979,7 +2895,13 @@ def handle_audio_chunk(data):
             answer_session = runtime.current_answer_session
             if answer_session and answer_session.turn_id == runtime.turn_id and answer_session.status != 'finalized':
                 answer_session.add_audio_chunk(audio_data)
-            asr_manager.send_audio(runtime.active_asr_stream_id, audio_data)
+
+            if asr_manager.is_available(runtime.active_asr_stream_id):
+                _flush_pending_asr_audio(runtime, asr_generation=runtime.active_asr_generation)
+                if not asr_manager.send_audio(runtime.active_asr_stream_id, audio_data):
+                    _enqueue_pending_asr_audio(runtime, audio_data)
+            else:
+                _enqueue_pending_asr_audio(runtime, audio_data)
     except Exception as e:
         logger.error(f"处理 audio_chunk 错误：{e}", exc_info=True)
         _emit_pipeline_error(client_id, runtime.session_id, 'AUDIO_CHUNK_ERROR', 'Failed to process audio chunk', str(e))
@@ -1992,7 +2914,32 @@ def handle_speech_end(data=None):
     if not runtime:
         return
 
+    raw_client_speech_epoch = (data or {}).get('speech_epoch', 0)
+    try:
+        client_speech_epoch = int(raw_client_speech_epoch or 0)
+    except Exception:
+        client_speech_epoch = 0
+
+    active_client_speech_epoch = int(getattr(runtime, 'active_client_speech_epoch', 0) or 0)
+    if (
+        client_speech_epoch > 0
+        and active_client_speech_epoch > 0
+        and client_speech_epoch != active_client_speech_epoch
+    ):
+        _log_runtime_event(
+            runtime,
+            'speech_end_ignored',
+            level='debug',
+            requested_turn_id=str((data or {}).get('turn_id', '')).strip(),
+            client_speech_epoch=client_speech_epoch,
+            active_client_speech_epoch=active_client_speech_epoch,
+            reason='stale_client_speech_epoch',
+        )
+        return
+
     asr_generation, speech_epoch = _finalize_runtime_asr(runtime, reason='speech_end')
+    if client_speech_epoch > 0 and active_client_speech_epoch == client_speech_epoch:
+        runtime.active_client_speech_epoch = 0
     _finalize_answer_segment(
         runtime,
         asr_generation=asr_generation,
@@ -2012,6 +2959,7 @@ def handle_speech_end(data=None):
         requested_turn_id=str((data or {}).get('turn_id', '')).strip(),
         asr_generation=asr_generation or '',
         speech_epoch=speech_epoch or '',
+        client_speech_epoch=client_speech_epoch or '',
     )
     _emit_orchestrator_state(runtime)
 
@@ -2189,112 +3137,6 @@ def handle_llm_generate_question(data):
         })
 
 
-@socketio.on('llm_evaluate_answer')
-@rate_limit(answer_rate_limiter)
-def handle_llm_evaluate_answer(data):
-    client_id = request.sid
-
-    try:
-        if llm_manager is None:
-            emit('error', {
-                'error': 'LLM is not initialized on server',
-                'code': 'LLM_NOT_READY',
-                'details': llm_import_error
-            })
-            return
-
-        runtime = _get_runtime(client_id, str((data or {}).get('session_id', '')).strip())
-        if not runtime:
-            emit('error', {
-                'error': 'Session runtime not found',
-                'code': 'SESSION_NOT_FOUND'
-            })
-            return
-
-        user_answer = str((data or {}).get('user_answer', '')).strip()
-        if not user_answer:
-            emit('error', {
-                'error': 'Missing required fields',
-                'code': 'MISSING_FIELD'
-            })
-            return
-        question = str((data or {}).get('question', runtime.current_question)).strip() or runtime.current_question
-        position = str((data or {}).get('position', runtime.position)).strip() or runtime.position
-        round_type = runtime.round_type
-        question_id = str(data.get('question_id', '')).strip() or _extract_question_id_from_plan(
-            runtime.last_question_plan
-        )
-
-        _log_runtime_event(runtime, 'llm_evaluate_answer', question_preview=question[:120], answer_preview=user_answer[:120])
-
-        emit('llm_evaluating', {
-            'message': '正在评估回答质量...',
-            'status': 'evaluating'
-        })
-
-        evaluation = llm_manager.evaluate_answer(
-            user_answer=user_answer,
-            question=question,
-            position=position
-        )
-        analysis_result = None
-        followup_decision = None
-        if rag_service is not None and getattr(rag_service, 'enabled', False):
-            analysis_result = rag_service.analyze_answer(
-                question_id=question_id,
-                candidate_answer=user_answer,
-                session_state=runtime.interview_state,
-                current_question=question,
-                position=position,
-                round_type=round_type
-            )
-            runtime.last_answer_analysis = analysis_result
-            runtime.interview_state = rag_service.update_interview_state_from_analysis(
-                runtime.interview_state,
-                analysis_result
-            )
-            followup_decision = rag_service.decide_followup(
-                question_id=question_id,
-                analysis_result=analysis_result,
-                session_state=runtime.interview_state
-            )
-            evaluation = {
-                **(evaluation or {}),
-                'rag_analysis': analysis_result,
-                'followup_decision': followup_decision
-            }
-
-        if runtime.data_manager:
-            runtime.data_manager.add_frame_data({
-                'type': 'answer_evaluation',
-                'question': question,
-                'answer': user_answer,
-                'evaluation': evaluation,
-                'rag_analysis': analysis_result,
-                'followup_decision': followup_decision,
-                'timestamp': time.time()
-            })
-
-        emit('llm_evaluation', {
-            'success': True,
-            'session_id': runtime.session_id,
-            'evaluation': evaluation,
-            'analysis': analysis_result,
-            'followup_decision': followup_decision,
-            'timestamp': time.time()
-        })
-
-        _log_runtime_event(runtime, 'llm_evaluation_emitted', question_preview=question[:120], answer_preview=user_answer[:120])
-
-    except Exception as e:
-        logger.error(f"评估回答错误：{e}", exc_info=True)
-        emit('error', {
-            'error': 'Internal server error',
-            'code': 'SERVER_ERROR',
-            'details': str(e)
-        })
-
-
 @socketio.on('get_performance')
 def handle_get_performance(data=None):
     """获取实时性能统计"""
@@ -2376,35 +3218,22 @@ def _safe_avg(values):
     return (sum(valid) / len(valid)) if valid else 0.0
 
 
-def _normalize_dimension_items(score_map):
-    label_map = {
-        'technical_correctness': '技术准确性',
-        'knowledge_depth': '知识深度',
-        'logical_rigor': '逻辑严谨性',
-        'expression_clarity': '表达清晰度',
-        'job_match': '岗位匹配度',
-        'adaptability': '应变与稳定性',
-    }
-    items = []
-    for key, label in label_map.items():
-        items.append({
-            'key': key,
-            'label': label,
-            'score': round(float(score_map.get(key, 0.0) or 0.0), 1),
-            'source': 'heuristic'
-        })
-    return items
-
-
 def _build_legacy_score_breakdown_from_dimensions(dimension_items):
     score_map = {item.get('key'): float(item.get('score', 0.0) or 0.0) for item in (dimension_items or [])}
+
+    def _pick_score(*keys):
+        for key in keys:
+            if key in score_map:
+                return round(float(score_map.get(key, 0.0) or 0.0), 1)
+        return 0.0
+
     return {
-        'technical_correctness': round(score_map.get('technical_correctness', 0.0), 1),
-        'knowledge_depth': round(score_map.get('knowledge_depth', 0.0), 1),
-        'logical_rigor': round(score_map.get('logical_rigor', 0.0), 1),
-        'expression_clarity': round(score_map.get('expression_clarity', 0.0), 1),
-        'job_match': round(score_map.get('job_match', 0.0), 1),
-        'adaptability': round(score_map.get('adaptability', 0.0), 1),
+        'technical_correctness': _pick_score('technical_accuracy', 'technical_correctness'),
+        'knowledge_depth': _pick_score('knowledge_depth'),
+        'logical_rigor': _pick_score('logic', 'logical_rigor'),
+        'expression_clarity': _pick_score('clarity', 'communication', 'expression_clarity'),
+        'job_match': _pick_score('job_match'),
+        'adaptability': _pick_score('reflection', 'tradeoff_awareness', 'adaptability'),
     }
 
 
@@ -2418,9 +3247,7 @@ def _build_growth_report_v2(dialogues, evaluation_rows=None, speech_rows=None):
     duration_seconds = int((ended_at - started_at).total_seconds()) if started_at and ended_at else 0
     dominant_round = round_counter.most_common(1)[0][0] if round_counter else 'technical'
 
-    legacy_scores = _calc_dimension_scores(dialogues, speech_summary=speech_summary)
-    legacy_strengths = []
-    legacy_weaknesses = []
+    score_transparency = {}
 
     if decoded_evaluations:
         dimension_labels = {
@@ -2443,19 +3270,28 @@ def _build_growth_report_v2(dialogues, evaluation_rows=None, speech_rows=None):
         }
 
         aggregated_dimension_scores = {}
+        dimension_samples = {}
         round_score_values = {}
         strengths = []
         weaknesses = []
         next_actions = []
         question_reviews = []
+        overall_components = []
+        missing_point_counter = Counter()
+        red_flag_counter = Counter()
+        speech_used_count = 0
+        speech_expression_values = []
+        speech_adjustment_values = []
 
         for row in decoded_evaluations:
+            layer1 = row.get('layer1') or {}
             layer2 = row.get('layer2') or {}
             text_base_dim_scores = (layer2.get('text_base_dimension_scores') or {})
             dim_scores = (layer2.get('final_dimension_scores') or layer2.get('dimension_scores') or {})
             speech_adjustments = (layer2.get('speech_adjustments') or {})
             summary = (layer2.get('summary') or {})
             round_type = str(row.get('round_type') or 'technical')
+            turn_id = str(row.get('turn_id') or '').strip()
             overall_score = float(
                 layer2.get('overall_score_final')
                 or row.get('overall_score')
@@ -2464,6 +3300,38 @@ def _build_growth_report_v2(dialogues, evaluation_rows=None, speech_rows=None):
             )
             round_score_values.setdefault(round_type, []).append(overall_score)
             speech_used = bool(layer2.get('speech_used'))
+            speech_expression_score = (
+                round(float(layer2.get('speech_expression_score') or 0.0), 1)
+                if layer2.get('speech_expression_score') is not None else None
+            )
+            if speech_used:
+                speech_used_count += 1
+            if speech_expression_score is not None:
+                speech_expression_values.append(float(speech_expression_score))
+
+            layer1_key_points = layer1.get('key_points') or {}
+            covered_points = layer1_key_points.get('covered') or []
+            missing_points = [
+                str(item).strip()
+                for item in (layer1_key_points.get('missing') or [])
+                if str(item).strip()
+            ]
+            for point in missing_points:
+                missing_point_counter[point] += 1
+
+            layer1_signals = layer1.get('signals') or {}
+            hit_signals = [
+                str(item).strip()
+                for item in (layer1_signals.get('hit') or [])
+                if str(item).strip()
+            ]
+            red_flags = [
+                str(item).strip()
+                for item in (layer1_signals.get('red_flags') or [])
+                if str(item).strip()
+            ]
+            for flag in red_flags:
+                red_flag_counter[flag] += 1
 
             normalized_dims = []
             for dim_key, dim_payload in dim_scores.items():
@@ -2471,7 +3339,8 @@ def _build_growth_report_v2(dialogues, evaluation_rows=None, speech_rows=None):
                 text_base_score = float(((text_base_dim_scores.get(dim_key) or {}).get('score')) or score)
                 speech_adjustment = speech_adjustments.get(dim_key, score - text_base_score)
                 aggregated_dimension_scores.setdefault(dim_key, []).append(score)
-                normalized_dims.append({
+                reason = str((dim_payload or {}).get('reason') or '').strip()
+                normalized_dim = {
                     'key': dim_key,
                     'label': dimension_labels.get(dim_key, dim_key),
                     'score': round(score, 1),
@@ -2479,15 +3348,47 @@ def _build_growth_report_v2(dialogues, evaluation_rows=None, speech_rows=None):
                     'text_base_score': round(text_base_score, 1),
                     'speech_adjustment': round(float(speech_adjustment or 0.0), 1),
                     'speech_used': speech_used,
-                    'reason': str((dim_payload or {}).get('reason') or '').strip(),
+                    'reason': reason,
+                }
+                normalized_dims.append(normalized_dim)
+                dimension_samples.setdefault(dim_key, []).append({
+                    'turn_id': turn_id,
+                    'question': str(row.get('question') or ''),
+                    'score': float(score),
+                    'text_base_score': float(text_base_score),
+                    'speech_adjustment': float(speech_adjustment or 0.0),
+                    'reason': reason,
                 })
+                if speech_used:
+                    speech_adjustment_values.append(abs(float(speech_adjustment or 0.0)))
+
+            weakest_dimensions = sorted(
+                [
+                    {
+                        'key': item.get('key'),
+                        'label': item.get('label'),
+                        'score': float(item.get('final_score') or item.get('score') or 0.0),
+                    }
+                    for item in normalized_dims
+                ],
+                key=lambda item: item['score']
+            )[:2]
 
             strengths.extend([str(x).strip() for x in (summary.get('strengths') or []) if str(x).strip()])
             weaknesses.extend([str(x).strip() for x in (summary.get('weaknesses') or []) if str(x).strip()])
             next_actions.extend([str(x).strip() for x in (summary.get('next_actions') or []) if str(x).strip()])
 
+            overall_components.append({
+                'turn_id': turn_id,
+                'round_type': round_type,
+                'question': str(row.get('question') or ''),
+                'overall_score_final': round(overall_score, 1),
+                'status': str(row.get('status') or ''),
+                'weight': 1.0,
+            })
+
             question_reviews.append({
-                'turn_id': row.get('turn_id', ''),
+                'turn_id': turn_id,
                 'question_id': row.get('question_id', ''),
                 'round_type': round_type,
                 'question': row.get('question', ''),
@@ -2500,8 +3401,23 @@ def _build_growth_report_v2(dialogues, evaluation_rows=None, speech_rows=None):
                 'status': row.get('status', ''),
                 'speech_used': speech_used,
                 'speech_fusion_version': layer2.get('speech_fusion_version', ''),
-                'speech_expression_score': round(float(layer2.get('speech_expression_score') or 0.0), 1) if layer2.get('speech_expression_score') is not None else None,
+                'speech_expression_score': speech_expression_score,
                 'dimensions': normalized_dims,
+                'evidence': {
+                    'key_point_coverage_ratio': round(float(layer1_key_points.get('coverage_ratio') or 0.0), 4),
+                    'covered_key_points': len(covered_points),
+                    'total_key_points': len(covered_points) + len(missing_points),
+                    'missing_key_points': missing_points[:5],
+                    'hit_signals': hit_signals[:5],
+                    'red_flags': red_flags[:4],
+                    'rubric_match': layer1.get('rubric_match') or {},
+                },
+                'score_transparency': {
+                    'formula': 'overall_score_final = mean(final_dimension_scores)',
+                    'overall_score_base': round(float(layer2.get('overall_score_base') or overall_score), 1),
+                    'overall_score_final': round(float(layer2.get('overall_score_final') or overall_score), 1),
+                    'weakest_dimensions': weakest_dimensions,
+                },
                 'summary': {
                     'strengths': [str(x) for x in (summary.get('strengths') or [])][:3],
                     'weaknesses': [str(x) for x in (summary.get('weaknesses') or [])][:3],
@@ -2525,21 +3441,31 @@ def _build_growth_report_v2(dialogues, evaluation_rows=None, speech_rows=None):
             for dim_key, values in sorted(aggregated_dimension_scores.items())
         ]
 
-        legacy_scores = {
-            'technical_correctness': round(_safe_avg(aggregated_dimension_scores.get('technical_accuracy', [])) or 60.0, 1),
-            'knowledge_depth': round(_safe_avg(aggregated_dimension_scores.get('knowledge_depth', [])) or 60.0, 1),
-            'logical_rigor': round(_safe_avg(aggregated_dimension_scores.get('logic', [])) or 60.0, 1),
-            'expression_clarity': round(_safe_avg(
-                aggregated_dimension_scores.get('clarity', []) or aggregated_dimension_scores.get('communication', [])
-            ) or 60.0, 1),
-            'job_match': round(_safe_avg(aggregated_dimension_scores.get('job_match', [])) or 60.0, 1),
-            'adaptability': round(_safe_avg(
-                aggregated_dimension_scores.get('reflection', []) or aggregated_dimension_scores.get('tradeoff_awareness', [])
-            ) or 60.0, 1),
-        }
+        dimension_aggregation = []
+        for dim_key, values in sorted(aggregated_dimension_scores.items()):
+            samples = sorted(
+                dimension_samples.get(dim_key, []),
+                key=lambda item: float(item.get('score') or 0.0)
+            )
+            dimension_aggregation.append({
+                'key': dim_key,
+                'label': dimension_labels.get(dim_key, dim_key),
+                'avg_score': round(_safe_avg(values), 1),
+                'avg_text_base_score': round(_safe_avg([item.get('text_base_score') for item in samples]), 1),
+                'avg_speech_adjustment': round(_safe_avg([item.get('speech_adjustment') for item in samples]), 2),
+                'sample_count': len(samples),
+                'lowest_questions': [
+                    {
+                        'turn_id': item.get('turn_id', ''),
+                        'question': str(item.get('question') or ''),
+                        'score': round(float(item.get('score') or 0.0), 1),
+                        'reason': str(item.get('reason') or ''),
+                    }
+                    for item in samples[:2]
+                ],
+            })
 
-        legacy_strengths = strengths[:]
-        legacy_weaknesses = weaknesses[:]
+        score_breakdown = _build_legacy_score_breakdown_from_dimensions(dimension_items)
 
         round_breakdown = [
             {
@@ -2555,46 +3481,47 @@ def _build_growth_report_v2(dialogues, evaluation_rows=None, speech_rows=None):
             'weaknesses': list(dict.fromkeys(weaknesses))[:6],
             'next_actions': list(dict.fromkeys(next_actions))[:6],
         }
+        score_transparency = {
+            'mode': 'structured_evaluation',
+            'overall_formula': 'session_overall_score = mean(question.overall_score_final)',
+            'question_formula': 'question.overall_score_final = mean(final_dimension_scores)',
+            'overall_components': overall_components,
+            'dimension_aggregation': sorted(dimension_aggregation, key=lambda item: float(item.get('avg_score') or 0.0)),
+            'gap_signals': {
+                'missing_key_points': [
+                    {'point': point, 'count': int(count)}
+                    for point, count in missing_point_counter.most_common(8)
+                ],
+                'red_flags': [
+                    {'signal': signal, 'count': int(count)}
+                    for signal, count in red_flag_counter.most_common(8)
+                ],
+            },
+            'speech_fusion_summary': {
+                'speech_used_questions': speech_used_count,
+                'total_questions': len(question_reviews),
+                'avg_expression_score': round(_safe_avg(speech_expression_values), 1) if speech_expression_values else None,
+                'avg_abs_dimension_adjustment': round(_safe_avg(speech_adjustment_values), 2) if speech_adjustment_values else 0.0,
+            },
+        }
         report_mode = 'structured_evaluation'
         has_structured = True
     else:
-        overall_score = round(
-            legacy_scores['technical_correctness'] * 0.30
-            + legacy_scores['knowledge_depth'] * 0.15
-            + legacy_scores['logical_rigor'] * 0.15
-            + legacy_scores['expression_clarity'] * 0.15
-            + legacy_scores['job_match'] * 0.15
-            + legacy_scores['adaptability'] * 0.10,
-            1
-        )
-
-        if legacy_scores['technical_correctness'] >= 75:
-            legacy_strengths.append('技术回答整体较准确，基础知识掌握相对扎实。')
-        if legacy_scores['logical_rigor'] >= 75:
-            legacy_strengths.append('回答结构较清晰，能够体现一定的逻辑组织能力。')
-        if legacy_scores['job_match'] >= 72:
-            legacy_strengths.append('回答内容与目标岗位方向较匹配。')
-        if legacy_scores['adaptability'] >= 70:
-            legacy_strengths.append('在追问或上下文变化下表现出一定稳定性。')
-        if legacy_scores['knowledge_depth'] < 65:
-            legacy_weaknesses.append('部分回答停留在表层，缺少更深入的技术展开。')
-        if legacy_scores['expression_clarity'] < 65:
-            legacy_weaknesses.append('表达不够紧凑，重点提炼和结构化能力仍可提升。')
-        if legacy_scores['job_match'] < 65:
-            legacy_weaknesses.append('岗位相关关键词和项目联系体现不足。')
-        if legacy_scores['adaptability'] < 65:
-            legacy_weaknesses.append('面对追问时的稳定性和灵活性还有提升空间。')
-        if not legacy_strengths:
-            legacy_strengths.append('整体作答完成度尚可，具备继续提升的基础。')
-        if not legacy_weaknesses:
-            legacy_weaknesses.append('当前样本未暴露明显短板，但仍建议继续做专项训练。')
-
-        dimension_items = _normalize_dimension_items(legacy_scores)
+        overall_score = 0.0
+        dimension_items = []
+        score_breakdown = {
+            'technical_correctness': 0.0,
+            'knowledge_depth': 0.0,
+            'logical_rigor': 0.0,
+            'expression_clarity': 0.0,
+            'job_match': 0.0,
+            'adaptability': 0.0,
+        }
         round_breakdown = [
             {
                 'round_type': round_type,
                 'count': count,
-                'avg_score': round(overall_score, 1),
+                'avg_score': 0.0,
             }
             for round_type, count in sorted(round_counter.items())
         ]
@@ -2606,9 +3533,9 @@ def _build_growth_report_v2(dialogues, evaluation_rows=None, speech_rows=None):
                 'question': item.get('question', ''),
                 'answer': item.get('answer', ''),
                 'rubric_level': '',
-                'overall_score': round(overall_score, 1),
+                'overall_score': 0.0,
                 'confidence': 0.0,
-                'status': 'legacy',
+                'status': 'pending_structured_evaluation',
                 'dimensions': [],
                 'summary': {
                     'strengths': [],
@@ -2619,15 +3546,20 @@ def _build_growth_report_v2(dialogues, evaluation_rows=None, speech_rows=None):
             for item in dialogues[-6:]
         ]
         coaching = {
-            'strengths': legacy_strengths[:6],
-            'weaknesses': legacy_weaknesses[:6],
+            'strengths': [],
+            'weaknesses': [],
             'next_actions': [
-                '围绕高频题建立标准化答题结构，并增加项目细节表达。',
-                '针对当前目标岗位补齐关键技术点和典型场景表述。',
-                '结合录音或转写结果复盘语速、停顿和冗余表达。'
+                '当前会话暂无结构化评分结果，请稍后刷新报告。',
+                '确认评估服务已启用（RAG + LLM）并完成异步落库。',
+                '若长期无分数，请检查 interview_evaluations 表中的任务状态。'
             ],
         }
-        report_mode = 'heuristic_fallback'
+        score_transparency = {
+            'mode': 'structured_evaluation_only',
+            'overall_formula': 'session_overall_score = mean(question.overall_score_final)',
+            'limitations': '未检索到可用结构化评估记录，本次未进行启发式兜底评分。',
+        }
+        report_mode = 'structured_pending'
         has_structured = False
 
     expression_detail = {
@@ -2652,6 +3584,7 @@ def _build_growth_report_v2(dialogues, evaluation_rows=None, speech_rows=None):
             'interview_id': str(dialogues[0].get('interview_id') or '').strip() if dialogues else '',
             'report_mode': report_mode,
             'has_structured_evaluations': has_structured,
+            'transparency_version': 'score_transparency_v1',
             'dialogue_count': len(dialogues),
             'evaluation_count': len(decoded_evaluations),
         },
@@ -2668,9 +3601,10 @@ def _build_growth_report_v2(dialogues, evaluation_rows=None, speech_rows=None):
         'round_breakdown': round_breakdown,
         'expression': expression_detail,
         'coaching': coaching,
+        'score_transparency': score_transparency,
         'question_reviews': question_reviews,
         # legacy fields kept for current frontend compatibility
-        'score_breakdown': _build_legacy_score_breakdown_from_dimensions(_normalize_dimension_items(legacy_scores)),
+        'score_breakdown': score_breakdown,
         'expression_detail': expression_detail,
         'strengths': coaching['strengths'],
         'weaknesses': coaching['weaknesses'],
@@ -2687,172 +3621,251 @@ def _build_growth_report_v2(dialogues, evaluation_rows=None, speech_rows=None):
     return report
 
 
-def _calc_dimension_scores(dialogues, speech_summary=None):
-    """基于问答过程做启发式多维评分，并融合语音表达指标。"""
-    if not dialogues:
-        return {
-            'technical_correctness': 60.0,
-            'knowledge_depth': 60.0,
-            'logical_rigor': 60.0,
-            'expression_clarity': 60.0,
-            'job_match': 60.0,
-            'adaptability': 60.0
-        }
-
-    answers = [str(d.get('answer') or '').strip() for d in dialogues]
-    feedbacks = [str(d.get('llm_feedback') or '').strip() for d in dialogues]
-    answer_lengths = [len(a) for a in answers if a]
-    avg_answer_len = (sum(answer_lengths) / len(answer_lengths)) if answer_lengths else 0
-
-    bad_markers = ['不完整', '偏离', '混淆', '误输入', '再来一次', '不清楚', '截断', '不准确']
-    good_markers = ['很好', '不错', '准确', '清晰', '正确', '完整', '深入', '有条理']
-
-    bad_hits = sum(sum(1 for m in bad_markers if m in fb) for fb in feedbacks)
-    good_hits = sum(sum(1 for m in good_markers if m in fb) for fb in feedbacks)
-
-    logic_words = ['首先', '其次', '然后', '最后', '因为', '所以', '例如', '总结']
-    logic_hits = sum(sum(1 for w in logic_words if w in a) for a in answers)
-
-    job_keywords = ['java', 'spring', 'redis', 'mysql', '并发', '线程', 'jvm', '前端', 'react', 'vue']
-    match_hits = sum(sum(1 for k in job_keywords if k.lower() in a.lower()) for a in answers)
-
-    first_half = feedbacks[:max(1, len(feedbacks)//2)]
-    second_half = feedbacks[max(1, len(feedbacks)//2):]
-    first_bad = sum(sum(1 for m in bad_markers if m in fb) for fb in first_half)
-    second_bad = sum(sum(1 for m in bad_markers if m in fb) for fb in second_half)
-
-    technical_correctness = _clamp_score(74 + good_hits * 3.5 - bad_hits * 4.5)
-    knowledge_depth = _clamp_score(58 + min(28, avg_answer_len / 9) + good_hits * 1.2 - bad_hits * 1.4)
-    logical_rigor = _clamp_score(60 + logic_hits * 2.8 - bad_hits * 1.2)
-    expression_clarity = _clamp_score(62 + min(18, avg_answer_len / 12) + logic_hits * 1.2 - bad_hits * 1.3)
-    job_match = _clamp_score(56 + min(30, match_hits * 2.6) + good_hits * 0.8)
-    adaptability = _clamp_score(62 + (6 if second_bad <= first_bad else -6) - max(0, bad_hits - good_hits) * 0.6)
-
-    speech_dims = (speech_summary or {}).get('dimensions') or {}
-    if speech_dims:
-        clarity_from_speech = float(speech_dims.get('clarity_score', expression_clarity))
-        fluency_from_speech = float(speech_dims.get('fluency_score', adaptability))
-        expression_clarity = _clamp_score(expression_clarity * 0.35 + clarity_from_speech * 0.65)
-        adaptability = _clamp_score(adaptability * 0.65 + fluency_from_speech * 0.35)
-
-    return {
-        'technical_correctness': round(technical_correctness, 1),
-        'knowledge_depth': round(knowledge_depth, 1),
-        'logical_rigor': round(logical_rigor, 1),
-        'expression_clarity': round(expression_clarity, 1),
-        'job_match': round(job_match, 1),
-        'adaptability': round(adaptability, 1)
-    }
-
-
 def _build_growth_report(dialogues, speech_rows=None):
     evaluation_rows = []
     try:
         interview_id = str(dialogues[0].get('interview_id') or '').strip() if dialogues else ''
         if interview_id and hasattr(db_manager, 'get_interview_evaluations'):
-            evaluation_rows = db_manager.get_interview_evaluations(interview_id=interview_id)
+            raw_rows = db_manager.get_interview_evaluations(interview_id=interview_id) or []
+            evaluation_rows = [
+                row for row in raw_rows
+                if str((row or {}).get('status') or '').strip().lower() in {'ok', 'partial_ok'}
+            ]
     except Exception:
         evaluation_rows = []
     return _build_growth_report_v2(dialogues, evaluation_rows=evaluation_rows, speech_rows=speech_rows)
 
 
-def _build_legacy_growth_report(dialogues, speech_rows=None):
-    speech_summary = aggregate_expression_metrics(speech_rows or [])
-    scores = _calc_dimension_scores(dialogues, speech_summary=speech_summary)
-    overall = round(
-        scores['technical_correctness'] * 0.30
-        + scores['knowledge_depth'] * 0.15
-        + scores['logical_rigor'] * 0.15
-        + scores['expression_clarity'] * 0.15
-        + scores['job_match'] * 0.15
-        + scores['adaptability'] * 0.10,
-        1
-    )
-
-    answers = [str(d.get('answer') or '').strip() for d in dialogues]
-    feedbacks = [str(d.get('llm_feedback') or '').strip() for d in dialogues]
-    rounds = [str(d.get('round_type') or 'unknown') for d in dialogues]
-    round_counter = Counter(rounds)
-
-    strengths = []
-    weaknesses = []
-
-    if scores['technical_correctness'] >= 75:
-        strengths.append('技术回答整体正确，关键概念覆盖较完整。')
-    if scores['logical_rigor'] >= 75:
-        strengths.append('回答结构较清晰，具备较好的论证顺序。')
-    if scores['job_match'] >= 72:
-        strengths.append('回答与目标岗位技术栈关联度较高。')
-    if scores['adaptability'] >= 70:
-        strengths.append('面对追问时能够持续作答，临场应变较稳定。')
-
-    if scores['knowledge_depth'] < 65:
-        weaknesses.append('知识点解释偏表层，深挖时细节支撑不足。')
-    if scores['expression_clarity'] < 65:
-        weaknesses.append('表达存在停顿与重复，建议优化回答结构。')
-    if scores['job_match'] < 65:
-        weaknesses.append('岗位关键词覆盖不足，回答与岗位场景结合不够。')
-    if scores['adaptability'] < 65:
-        weaknesses.append('连续追问下稳定性一般，建议进行高压追问训练。')
-
-    if not strengths:
-        strengths.append('完成了多轮问答，具备持续输出和沟通基础。')
-    if not weaknesses:
-        weaknesses.append('整体表现较均衡，下一步可重点冲刺高频深挖题。')
-
-    improvement_plan = [
-        {
-            'focus': '技术正确性与知识深度',
-            'action': '围绕本次追问点做二次复盘，每题补充“原理+场景+权衡”。',
-            'target': '下一次技术正确性提升至 80+'
-        },
-        {
-            'focus': '逻辑表达',
-            'action': '采用“结论先行 + 3点展开 + 小结”的口头模板进行训练。',
-            'target': '将表达清晰度提升到 75+'
-        },
-        {
-            'focus': '岗位匹配',
-            'action': '回答中主动加入岗位高频关键词（如并发、缓存、事务、性能优化等）。',
-            'target': '岗位匹配度提升到 75+'
+def _build_structured_snapshot(interview_id: str, dialogues=None):
+    """构建即时报告用的结构化评分快照。"""
+    total_questions = len(dialogues or [])
+    if not hasattr(db_manager, 'get_interview_evaluations'):
+        return {
+            'status': 'unavailable',
+            'status_message': '评估能力未启用',
+            'total_questions': total_questions,
+            'evaluated_questions': 0,
+            'overall_score': None,
+            'level': None,
+            'round_breakdown': [],
+            'dimension_scores': [],
+            'status_counts': {},
         }
+
+    raw_rows = db_manager.get_interview_evaluations(interview_id=interview_id) or []
+    decoded_rows = _decode_evaluation_rows(raw_rows)
+
+    valid_turn_ids = {
+        str(item.get('turn_id') or '').strip()
+        for item in (dialogues or [])
+        if str(item.get('turn_id') or '').strip()
+    }
+    if valid_turn_ids:
+        decoded_rows = [
+            row for row in decoded_rows
+            if str(row.get('turn_id') or '').strip() in valid_turn_ids
+        ]
+
+    if not decoded_rows:
+        pending_message = '结构化评分处理中，请稍后刷新。' if total_questions > 0 else '暂无可评分题目。'
+        return {
+            'status': 'processing' if total_questions > 0 else 'empty',
+            'status_message': pending_message,
+            'total_questions': total_questions,
+            'evaluated_questions': 0,
+            'overall_score': None,
+            'level': None,
+            'round_breakdown': [],
+            'dimension_scores': [],
+            'status_counts': {},
+        }
+
+    status_counts = Counter()
+    round_scores = {}
+    all_scores = []
+    dim_scores = {}
+    scored_turns = set()
+
+    dimension_labels = {
+        'technical_accuracy': '技术准确性',
+        'knowledge_depth': '知识深度',
+        'completeness': '回答完整度',
+        'logic': '逻辑严谨性',
+        'job_match': '岗位匹配度',
+        'authenticity': '项目真实性',
+        'ownership': '项目 ownership',
+        'technical_depth': '项目技术深度',
+        'reflection': '复盘反思',
+        'architecture_reasoning': '架构推理',
+        'tradeoff_awareness': '权衡意识',
+        'scalability': '扩展性设计',
+        'clarity': '表达清晰度',
+        'relevance': '回答相关性',
+        'self_awareness': '自我认知',
+        'communication': '沟通表现',
+    }
+
+    valid_score_status = {'ok', 'partial_ok'}
+
+    for row in decoded_rows:
+        status = str(row.get('status') or 'unknown').strip().lower() or 'unknown'
+        status_counts[status] += 1
+        turn_id = str(row.get('turn_id') or '').strip()
+
+        layer2 = row.get('layer2') or {}
+        score_value = (
+            layer2.get('overall_score_final')
+            or row.get('overall_score')
+            or layer2.get('overall_score')
+        )
+
+        if status in valid_score_status and isinstance(score_value, (int, float)):
+            score = _clamp_score(score_value)
+            all_scores.append(score)
+            round_type = str(row.get('round_type') or 'technical').strip() or 'technical'
+            round_scores.setdefault(round_type, []).append(score)
+            if turn_id:
+                scored_turns.add(turn_id)
+
+        dim_map = layer2.get('final_dimension_scores') or layer2.get('dimension_scores') or {}
+        for dim_key, dim_payload in (dim_map or {}).items():
+            dim_score = (dim_payload or {}).get('score')
+            if isinstance(dim_score, (int, float)):
+                dim_scores.setdefault(dim_key, []).append(float(dim_score))
+
+    evaluated_questions = len(scored_turns) if scored_turns else len(all_scores)
+    has_pending_status = any(status in {'queued', 'pending', 'running'} for status in status_counts)
+    if evaluated_questions > 0:
+        status = 'ready'
+        status_message = '结构化评分已就绪。'
+        if total_questions > evaluated_questions or has_pending_status:
+            status = 'partial'
+            status_message = '部分题目评分已完成，剩余题目仍在处理中。'
+    else:
+        status = 'processing' if total_questions > 0 else 'empty'
+        status_message = '结构化评分处理中，请稍后刷新。' if total_questions > 0 else '暂无可评分题目。'
+        if status_counts.get('skipped', 0) > 0 and status_counts.get('ok', 0) == 0 and status_counts.get('partial_ok', 0) == 0:
+            status = 'failed'
+            status_message = '未匹配到可用评分标准，暂无法生成结构化评分。'
+        if status_counts.get('failed', 0) > 0 and not has_pending_status:
+            status = 'failed'
+            status_message = '结构化评分执行失败，请稍后重试。'
+
+    dimension_items = [
+        {
+            'key': key,
+            'label': dimension_labels.get(key, key),
+            'score': round(_safe_avg(values), 1),
+        }
+        for key, values in sorted(dim_scores.items())
+    ]
+    round_breakdown = [
+        {
+            'round_type': round_type,
+            'count': len(values),
+            'avg_score': round(_safe_avg(values), 1),
+        }
+        for round_type, values in sorted(round_scores.items())
     ]
 
-    followup_chain = []
-    for item in dialogues[-6:]:
-        followup_chain.append({
-            'round': item.get('round_type', 'unknown'),
-            'question': item.get('question', ''),
-            'answer': item.get('answer', ''),
-            'feedback': item.get('llm_feedback', '')
-        })
-
-    started_at = _parse_db_datetime(dialogues[0].get('created_at')) if dialogues else None
-    ended_at = _parse_db_datetime(dialogues[-1].get('created_at')) if dialogues else None
-    duration_seconds = int((ended_at - started_at).total_seconds()) if started_at and ended_at else 0
-
-    expression_detail = {
-        'available': bool(speech_summary.get('available')),
-        'dimensions': speech_summary.get('dimensions', {}),
-        'summary': speech_summary.get('summary', {}),
-    }
-
+    overall_score = round(_safe_avg(all_scores), 1) if all_scores else None
     return {
-        'summary': {
-            'overall_score': overall,
-            'interview_count': len(dialogues),
-            'started_at': dialogues[0].get('created_at') if dialogues else '',
-            'ended_at': dialogues[-1].get('created_at') if dialogues else '',
-            'duration_seconds': max(0, duration_seconds),
-            'dominant_round': round_counter.most_common(1)[0][0] if round_counter else 'technical'
-        },
-        'score_breakdown': scores,
-        'expression_detail': expression_detail,
-        'strengths': strengths,
-        'weaknesses': weaknesses,
-        'improvement_plan': improvement_plan,
-        'followup_chain': followup_chain
+        'status': status,
+        'status_message': status_message,
+        'total_questions': total_questions,
+        'evaluated_questions': int(evaluated_questions),
+        'overall_score': overall_score,
+        'level': _score_to_level(overall_score) if overall_score is not None else None,
+        'round_breakdown': round_breakdown,
+        'dimension_scores': dimension_items,
+        'status_counts': dict(status_counts),
     }
+
+
+def _build_immediate_report_payload(interview_id: str):
+    """按 interview_id 生成即时报告聚合数据（不含复盘数据）。"""
+    normalized_id = str(interview_id or '').strip()
+    if not normalized_id:
+        return None, 'invalid interview id'
+
+    interview = db_manager.get_interview_by_id(normalized_id)
+    if not interview:
+        return None, 'interview not found'
+
+    statistics = db_manager.get_statistics_by_interview(normalized_id) if hasattr(db_manager, 'get_statistics_by_interview') else None
+    dialogues = db_manager.get_interview_dialogues(normalized_id) if hasattr(db_manager, 'get_interview_dialogues') else []
+    events = db_manager.get_events(normalized_id) if hasattr(db_manager, 'get_events') else []
+
+    report_path = str(interview.get('report_path') or '').strip()
+    report_file_path = Path(report_path)
+    if report_path and not report_file_path.is_absolute():
+        report_file_path = Path(report_path)
+    report_exists = bool(report_path and report_file_path.exists())
+    report_size = int(report_file_path.stat().st_size) if report_exists else 0
+
+    sorted_events = sorted(
+        events or [],
+        key=lambda item: float(item.get('score') or 0.0),
+        reverse=True,
+    )
+    event_type_counter = Counter(str(item.get('event_type') or 'unknown') for item in (events or []))
+    top_events = [
+        {
+            'event_type': str(item.get('event_type') or 'unknown'),
+            'score': float(item.get('score') or 0.0),
+            'description': str(item.get('description') or ''),
+            'timestamp': float(item.get('timestamp') or 0.0),
+        }
+        for item in sorted_events[:8]
+    ]
+
+    structured_snapshot = _build_structured_snapshot(normalized_id, dialogues=dialogues)
+    started_at = _parse_db_datetime(interview.get('start_time'))
+    ended_at = _parse_db_datetime(interview.get('end_time'))
+    if started_at and ended_at:
+        duration_seconds = int(max(0, (ended_at - started_at).total_seconds()))
+    else:
+        duration_seconds = int(interview.get('duration') or 0)
+
+    payload = {
+        'interview_id': normalized_id,
+        'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'summary': {
+            'start_time': interview.get('start_time'),
+            'end_time': interview.get('end_time'),
+            'duration_seconds': duration_seconds,
+            'dialogue_count': len(dialogues or []),
+        },
+        'pdf_report': {
+            'path': report_path,
+            'exists': report_exists,
+            'size_bytes': report_size,
+        },
+        'anti_cheat': {
+            'risk_level': str(interview.get('risk_level') or 'LOW'),
+            'max_probability': float(interview.get('max_probability') or 0.0),
+            'avg_probability': float(interview.get('avg_probability') or 0.0),
+            'events_count': int(interview.get('events_count') or len(events or [])),
+            'event_type_breakdown': [
+                {'event_type': key, 'count': int(count)}
+                for key, count in sorted(event_type_counter.items(), key=lambda item: item[1], reverse=True)
+            ],
+            'top_risk_events': top_events,
+            'statistics': {
+                'total_deviations': int((statistics or {}).get('total_deviations') or 0),
+                'total_mouth_open': int((statistics or {}).get('total_mouth_open') or 0),
+                'total_multi_person': int((statistics or {}).get('total_multi_person') or 0),
+                'off_screen_ratio': float((statistics or {}).get('off_screen_ratio') or 0.0),
+                'frames_processed': int((statistics or {}).get('frames_processed') or 0),
+            },
+        },
+        'structured_evaluation': structured_snapshot,
+        'next_steps': {
+            'review_url': f'/review?interviewId={normalized_id}',
+            'replay_url': f'/replay?interviewId={normalized_id}',
+        },
+    }
+    return payload, ''
 
 
 def _split_recent_sessions(rows):
@@ -2885,6 +3898,25 @@ def _split_recent_sessions(rows):
         sessions.append(current)
 
     return sessions
+
+
+def _load_speech_rows_for_dialogues(dialogues):
+    """按对话时间窗加载并解码语音评估明细。"""
+    if not dialogues or not hasattr(db_manager, 'get_speech_evaluations'):
+        return []
+
+    interview_id = str(dialogues[0].get('interview_id') or '').strip()
+    if not interview_id:
+        return []
+
+    start_time = dialogues[0].get('created_at')
+    end_time = dialogues[-1].get('created_at')
+    raw_speech_rows = db_manager.get_speech_evaluations(
+        interview_id=interview_id,
+        start_time=start_time,
+        end_time=end_time,
+    )
+    return _decode_speech_rows(raw_speech_rows)
 
 
 @app.route('/api/growth-report/latest')
@@ -2934,24 +3966,9 @@ def get_latest_growth_report():
 
         latest_session = list(reversed(sessions_desc[0]))
 
-        def _load_session_speech_rows(session_rows):
-            if not session_rows or not hasattr(db_manager, 'get_speech_evaluations'):
-                return []
-            interview_id = str(session_rows[0].get('interview_id') or '').strip()
-            if not interview_id:
-                return []
-            start_time = session_rows[0].get('created_at')
-            end_time = session_rows[-1].get('created_at')
-            raw_speech_rows = db_manager.get_speech_evaluations(
-                interview_id=interview_id,
-                start_time=start_time,
-                end_time=end_time,
-            )
-            return _decode_speech_rows(raw_speech_rows)
-
         latest_report = _build_growth_report(
             latest_session,
-            speech_rows=_load_session_speech_rows(latest_session),
+            speech_rows=_load_speech_rows_for_dialogues(latest_session),
         )
 
         trend = []
@@ -2961,7 +3978,7 @@ def get_latest_growth_report():
             session = list(reversed(session_desc))
             session_report = _build_growth_report(
                 session,
-                speech_rows=_load_session_speech_rows(session),
+                speech_rows=_load_speech_rows_for_dialogues(session),
             )
             interview_id = str(session[0].get('interview_id') or '').strip() if session else ''
             started_at = session[0].get('created_at') if session else ''
@@ -3016,6 +4033,379 @@ def get_latest_growth_report():
             'error': str(e)
         }), 500
 
+
+@app.route('/api/growth-report/interview/<interview_id>')
+def get_growth_report_by_interview(interview_id):
+    """按 interview_id 返回单场复盘。"""
+    try:
+        normalized_id = str(interview_id or '').strip()
+        if not normalized_id:
+            return jsonify({
+                'success': False,
+                'error': 'invalid interview id'
+            }), 400
+
+        dialogues = db_manager.get_interview_dialogues(normalized_id) if hasattr(db_manager, 'get_interview_dialogues') else []
+        if not dialogues:
+            return jsonify({
+                'success': False,
+                'error': 'interview dialogue not found'
+            }), 404
+
+        dialogues_sorted = sorted(
+            dialogues,
+            key=lambda item: _parse_db_datetime(item.get('created_at')) or datetime.min
+        )
+
+        report = _build_growth_report(
+            dialogues_sorted,
+            speech_rows=_load_speech_rows_for_dialogues(dialogues_sorted),
+        )
+
+        started_at = dialogues_sorted[0].get('created_at') if dialogues_sorted else ''
+        ended_at = dialogues_sorted[-1].get('created_at') if dialogues_sorted else ''
+        overall_score = float(report.get('summary', {}).get('overall_score') or 0.0)
+        trend = [{
+            'label': 'Session 1',
+            'interview_id': normalized_id,
+            'started_at': started_at,
+            'overall_score': overall_score,
+        }]
+        history = {
+            'session_count': 1,
+            'average_score': round(overall_score, 1),
+            'best_score': round(overall_score, 1),
+            'latest_score': round(overall_score, 1),
+            'delta_from_previous': None,
+            'trend': trend,
+            'sessions': [{
+                'session_index': 1,
+                'label': 'Session 1',
+                'interview_id': normalized_id,
+                'started_at': started_at,
+                'ended_at': ended_at,
+                'summary': report.get('summary', {}),
+                'dimensions': report.get('dimensions', []),
+                'meta': report.get('meta', {}),
+            }],
+        }
+
+        return jsonify({
+            'success': True,
+            'report': report,
+            'latest_report': report,
+            'trend': trend,
+            'history': history,
+        })
+
+    except Exception as e:
+        logger.error(f'获取单场成长报告错误: {e}', exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/report/interview/<interview_id>')
+def get_immediate_report_by_interview(interview_id):
+    """按 interview_id 获取即时报告（与复盘数据分离）。"""
+    try:
+        payload, error = _build_immediate_report_payload(interview_id)
+        if not payload:
+            status_code = 400 if error == 'invalid interview id' else 404
+            return jsonify({'success': False, 'error': error}), status_code
+        return jsonify({'success': True, 'report': payload})
+    except Exception as e:
+        logger.error(f'获取即时报告失败: {e}', exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/report/latest')
+def get_latest_immediate_report():
+    """获取最近一场面试的即时报告（与复盘分离）。"""
+    try:
+        latest_id = ''
+        with db_manager.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT interview_id
+                FROM interviews
+                WHERE
+                    (COALESCE(TRIM(end_time), '') != '')
+                    OR (COALESCE(duration, 0) > 0)
+                    OR (COALESCE(TRIM(report_path), '') != '')
+                ORDER BY datetime(COALESCE(end_time, created_at)) DESC, id DESC
+                LIMIT 1
+            ''')
+            row = cursor.fetchone()
+            latest_id = str(row['interview_id']).strip() if row and row['interview_id'] else ''
+
+        if not latest_id:
+            return jsonify({'success': False, 'error': 'no interview found'}), 404
+
+        payload, error = _build_immediate_report_payload(latest_id)
+        if not payload:
+            status_code = 400 if error == 'invalid interview id' else 404
+            return jsonify({'success': False, 'error': error}), status_code
+        return jsonify({'success': True, 'report': payload})
+    except Exception as e:
+        logger.error(f'获取最近即时报告失败: {e}', exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/interview/video/init', methods=['POST'])
+def api_video_init():
+    """初始化视频分片上传会话。"""
+    try:
+        payload = request.get_json(silent=True) or {}
+        session_id = str(payload.get('session_id', '')).strip()
+        interview_id = str(payload.get('interview_id', '')).strip() or (f"interview_{session_id}" if session_id else '')
+        if not interview_id:
+            return jsonify({'success': False, 'error': 'missing interview_id'}), 400
+
+        result = video_upload_service.init_upload(
+            session_id=session_id,
+            interview_id=interview_id,
+            mime_type=str(payload.get('mime_type', 'video/webm')).strip(),
+            codec=str(payload.get('codec', '')).strip(),
+        )
+        return jsonify({
+            'success': True,
+            **result,
+        })
+    except Exception as e:
+        logger.error(f"初始化视频上传失败：{e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/interview/video/chunk', methods=['POST'])
+def api_video_chunk():
+    """接收视频分片。支持 multipart file 或 base64 字段。"""
+    try:
+        payload = request.get_json(silent=True) or {}
+        upload_id = str(request.form.get('upload_id', '') or payload.get('upload_id', '')).strip()
+        part_no_raw = request.form.get('part_no', '') or payload.get('part_no', 0)
+        try:
+            part_no = int(part_no_raw)
+        except Exception:
+            part_no = 0
+
+        chunk_data = b''
+        if 'chunk' in request.files:
+            file_obj = request.files['chunk']
+            chunk_data = file_obj.read() or b''
+        else:
+            chunk_base64 = str(payload.get('chunk_base64', '')).strip()
+            if chunk_base64:
+                chunk_data = base64.b64decode(chunk_base64)
+
+        result = video_upload_service.save_chunk(upload_id=upload_id, part_no=part_no, chunk_data=chunk_data)
+        if not result.get('success'):
+            return jsonify(result), 400
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"上传视频分片失败：{e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/interview/video/finalize', methods=['POST'])
+def api_video_finalize():
+    """合并分片并写入视频资产。"""
+    try:
+        payload = request.get_json(silent=True) or {}
+        upload_id = str(payload.get('upload_id', '')).strip()
+        interview_id = str(payload.get('interview_id', '')).strip()
+        if not upload_id:
+            return jsonify({'success': False, 'error': 'missing upload_id'}), 400
+
+        result = video_upload_service.finalize_upload(upload_id=upload_id, interview_id=interview_id)
+        if not result.get('success'):
+            return jsonify(result), 400
+
+        db_result = db_manager.save_or_update_interview_asset({
+            'interview_id': result.get('interview_id', ''),
+            'upload_id': upload_id,
+            'storage_key': Path(result.get('final_path', '')).name,
+            'video_url': '',
+            'local_path': result.get('final_path', ''),
+            'duration_ms': result.get('duration_ms', 0),
+            'codec': result.get('codec', ''),
+            'status': result.get('status', 'uploaded'),
+            'metadata_json': json.dumps({
+                'raw_path': result.get('raw_path', ''),
+            }, ensure_ascii=False),
+        })
+
+        return jsonify({
+            'success': True,
+            'interview_id': result.get('interview_id', ''),
+            'asset_id': db_result.get('id', 0),
+            'status': result.get('status', 'uploaded'),
+            'duration_ms': result.get('duration_ms', 0),
+        })
+    except Exception as e:
+        logger.error(f"视频 finalize 失败：{e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/interview/video/<interview_id>/play-url')
+def api_video_play_url(interview_id):
+    """返回播放地址（本地回放签名 URL）。"""
+    try:
+        interview_id = str(interview_id or '').strip()
+        if not interview_id:
+            return jsonify({'success': False, 'error': 'invalid interview_id'}), 400
+
+        asset = db_manager.get_interview_asset(interview_id) if hasattr(db_manager, 'get_interview_asset') else None
+        if not asset:
+            return jsonify({'success': False, 'error': 'video asset not found'}), 404
+
+        expires_in = request.args.get('expires_in', 3600, type=int) or 3600
+        sig_payload = video_upload_service.sign_local_playback(interview_id, expires_in=expires_in)
+        play_url = f"/api/interview/video/raw/{interview_id}?expires={sig_payload['expires']}&sig={sig_payload['sig']}"
+
+        return jsonify({
+            'success': True,
+            'play_url': play_url,
+            'expires_in': int(expires_in),
+            'duration_ms': float(asset.get('duration_ms') or 0.0),
+            'status': asset.get('status', ''),
+            'codec': asset.get('codec', ''),
+        })
+    except Exception as e:
+        logger.error(f"获取视频播放地址失败：{e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/interview/video/raw/<interview_id>')
+def api_video_raw(interview_id):
+    """本地视频回放（签名鉴权）。"""
+    try:
+        interview_id = str(interview_id or '').strip()
+        expires = request.args.get('expires', '', type=str)
+        sig = request.args.get('sig', '', type=str)
+        if not video_upload_service.verify_local_playback(interview_id, expires=expires, sig=sig):
+            return jsonify({'success': False, 'error': 'invalid signature'}), 403
+
+        asset = db_manager.get_interview_asset(interview_id) if hasattr(db_manager, 'get_interview_asset') else None
+        if not asset:
+            return jsonify({'success': False, 'error': 'video asset not found'}), 404
+        local_path = str(asset.get('local_path', '')).strip()
+        if not local_path or not Path(local_path).exists():
+            return jsonify({'success': False, 'error': 'video file missing'}), 404
+
+        return send_file(
+            local_path,
+            mimetype='video/mp4' if local_path.lower().endswith('.mp4') else 'video/webm',
+            conditional=True,
+        )
+    except Exception as e:
+        logger.error(f"本地视频回放失败：{e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/review/generate/<interview_id>', methods=['POST'])
+def api_generate_replay(interview_id):
+    """异步触发复盘生成任务。"""
+    try:
+        normalized_id = str(interview_id or '').strip()
+        if not normalized_id:
+            return jsonify({'success': False, 'error': 'invalid interview_id'}), 400
+        payload = request.get_json(silent=True) or {}
+        force = bool(payload.get('force', False))
+        result = replay_task_manager.enqueue(normalized_id, force=force)
+        status_code = 200 if result.get('success') else 400
+        return jsonify(result), status_code
+    except Exception as e:
+        logger.error(f"触发复盘任务失败：{e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/review/tasks/<task_id>')
+def api_get_review_task(task_id):
+    """查询复盘任务状态。"""
+    try:
+        task = replay_task_manager.get_task(task_id)
+        if not task:
+            return jsonify({'success': False, 'error': 'task not found'}), 404
+        return jsonify({'success': True, 'task': task})
+    except Exception as e:
+        logger.error(f"查询复盘任务状态失败：{e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/review/behavior-analyze/<interview_id>', methods=['POST'])
+def api_behavior_analyze(interview_id):
+    """异步触发二期行为分析（emotion/posture/gaze）。"""
+    try:
+        normalized_id = str(interview_id or '').strip()
+        if not normalized_id:
+            return jsonify({'success': False, 'error': 'invalid interview_id'}), 400
+        payload = request.get_json(silent=True) or {}
+        force = bool(payload.get('force', False))
+        result = behavior_task_manager.enqueue(normalized_id, force=force)
+        status_code = 200 if result.get('success') else 400
+        return jsonify(result), status_code
+    except Exception as e:
+        logger.error(f"触发行为分析任务失败：{e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/review/behavior-tasks/<task_id>')
+def api_behavior_task(task_id):
+    """查询行为分析任务状态。"""
+    try:
+        task = behavior_task_manager.get_task(task_id)
+        if not task:
+            return jsonify({'success': False, 'error': 'task not found'}), 404
+        return jsonify({'success': True, 'task': task})
+    except Exception as e:
+        logger.error(f"查询行为分析任务状态失败：{e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/replay/<interview_id>')
+def api_get_replay(interview_id):
+    """聚合复盘接口：视频 + 锚点 + A/B/C/D。"""
+    try:
+        normalized_id = str(interview_id or '').strip()
+        if not normalized_id:
+            return jsonify({'success': False, 'error': 'invalid interview_id'}), 400
+
+        # 若当前无产物，先即时生成一版，保证首个调用有返回。
+        preview_payload = replay_service.build_replay_payload(normalized_id)
+        if not (preview_payload.get('transcript_anchor_list') or preview_payload.get('tags')):
+            replay_service.generate_replay(normalized_id, force=False)
+            preview_payload = replay_service.build_replay_payload(normalized_id)
+
+        video_meta = {'available': False}
+        asset = db_manager.get_interview_asset(normalized_id) if hasattr(db_manager, 'get_interview_asset') else None
+        if asset:
+            sig_payload = video_upload_service.sign_local_playback(normalized_id, expires_in=3600)
+            play_url = f"/api/interview/video/raw/{normalized_id}?expires={sig_payload['expires']}&sig={sig_payload['sig']}"
+            video_meta = {
+                'available': True,
+                'play_url': play_url,
+                'duration_ms': float(asset.get('duration_ms') or 0.0),
+                'status': asset.get('status', ''),
+                'codec': asset.get('codec', ''),
+            }
+            tag_types = {
+                str(item.get('tag_type') or '').strip().lower()
+                for item in (preview_payload.get('tags') or [])
+                if isinstance(item, dict)
+            }
+            if not ({'emotion', 'posture', 'gaze'} & tag_types):
+                _maybe_enqueue_behavior_analysis(normalized_id, force=False)
+
+        return jsonify({
+            **preview_payload,
+            'video': video_meta,
+        })
+    except Exception as e:
+        logger.error(f"获取复盘聚合数据失败：{e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 @app.route('/api/reports')
 def get_reports():
     """获取所有报告列表"""
@@ -3058,6 +4448,26 @@ def get_interviews_from_db():
         offset = request.args.get('offset', 0, type=int)
 
         interviews = db_manager.get_interviews(limit=limit, offset=offset)
+        interview_ids = [
+            str(item.get('interview_id') or '').strip()
+            for item in (interviews or [])
+            if str(item.get('interview_id') or '').strip()
+        ]
+        structured_score_map = {}
+        if interview_ids and hasattr(db_manager, 'get_interview_structured_score_map'):
+            structured_score_map = db_manager.get_interview_structured_score_map(interview_ids)
+
+        for item in interviews:
+            interview_id = str(item.get('interview_id') or '').strip()
+            score_payload = structured_score_map.get(interview_id)
+            if score_payload:
+                item['overall_score'] = float(score_payload.get('overall_score') or 0.0)
+                item['scored_turns'] = int(score_payload.get('scored_turns') or 0)
+                item['score_source'] = 'structured_evaluation'
+            else:
+                item['overall_score'] = None
+                item['scored_turns'] = 0
+                item['score_source'] = 'not_available'
 
         return jsonify({
             'success': True,

@@ -366,6 +366,31 @@ class RAGService:
 
         return normalized
 
+    def _ensure_unique_record_ids(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """确保记录 ID 全局唯一，避免向量库写入失败。"""
+        seen_counts: Dict[str, int] = {}
+        unique_items: List[Dict[str, Any]] = []
+
+        for item in items:
+            base_id = str(item.get("id") or "").strip()
+            if not base_id:
+                unique_items.append(item)
+                continue
+
+            seen_counts[base_id] = seen_counts.get(base_id, 0) + 1
+            if seen_counts[base_id] == 1:
+                unique_items.append(item)
+                continue
+
+            dedup_id = f"{base_id}__dup{seen_counts[base_id]}"
+            logger.warning(f"检测到重复题目ID：{base_id}，已自动改写为 {dedup_id}")
+            updated = dict(item)
+            updated["id"] = dedup_id
+            updated["original_id"] = base_id
+            unique_items.append(updated)
+
+        return unique_items
+
     def build_index(self, source_path: Optional[str] = None, rebuild: bool = False) -> int:
         if not self.enabled:
             logger.info("RAG 未启用，跳过建库")
@@ -382,6 +407,7 @@ class RAGService:
             self._normalize_record(record, idx)
             for idx, record in enumerate(raw_records, start=1)
         ]
+        items = self._ensure_unique_record_ids(items)
 
         if rebuild:
             self.store.reset()
@@ -1036,13 +1062,65 @@ class RAGService:
             if rubric:
                 return rubric
 
-        query_parts = [position, current_question, candidate_answer, round_type]
-        items = self.retrieve_rubrics(
-            query=" ".join(str(part).strip() for part in query_parts if str(part).strip()),
-            position=position,
-            top_k=1,
-            metadata_filters={"round_type": round_type} if round_type else None,
+        query_variants = []
+        long_query_parts = [position, current_question, candidate_answer, round_type]
+        long_query = " ".join(str(part).strip() for part in long_query_parts if str(part).strip())
+        if long_query:
+            query_variants.append(long_query)
+
+        question_with_round = " ".join(
+            str(part).strip() for part in [position, current_question, round_type] if str(part).strip()
         )
+        if question_with_round:
+            query_variants.append(question_with_round)
+
+        question_only = str(current_question or "").strip()
+        if question_only:
+            query_variants.append(question_only)
+
+        answer_only = str(candidate_answer or "").strip()
+        if answer_only:
+            query_variants.append(answer_only)
+
+        # 去重保序
+        query_variants = list(dict.fromkeys(query_variants))
+        if not query_variants:
+            query_variants = [""]
+
+        # 先走严格过滤（round_type + position），未命中时逐级放宽，避免整场评估被 skipped。
+        retrieval_strategies = [
+            {
+                "position": position,
+                "metadata_filters": {"round_type": round_type} if round_type else None,
+            },
+            {
+                "position": position,
+                "metadata_filters": None,
+            },
+            {
+                "position": None,
+                "metadata_filters": {"round_type": round_type} if round_type else None,
+            },
+            {
+                "position": None,
+                "metadata_filters": None,
+            },
+        ]
+
+        items = []
+        for query_text in query_variants:
+            for strategy in retrieval_strategies:
+                items = self.retrieve_rubrics(
+                    query=query_text,
+                    position=strategy["position"],
+                    top_k=1,
+                    metadata_filters=strategy["metadata_filters"],
+                )
+                if items:
+                    break
+            if items:
+                break
+
         if not items:
             return None
 

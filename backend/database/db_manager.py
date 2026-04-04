@@ -157,6 +157,7 @@ class DatabaseManager:
                 CREATE TABLE IF NOT EXISTS interview_dialogues (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     interview_id TEXT NOT NULL,
+                    turn_id TEXT,
                     round_type TEXT NOT NULL,
                     question TEXT NOT NULL,
                     answer TEXT,
@@ -170,6 +171,18 @@ class DatabaseManager:
             cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_interview_dialogues_interview_id
                 ON interview_dialogues(interview_id)
+            ''')
+
+            # 兼容旧库：若 interview_dialogues 缺少 turn_id 列则先补齐，再建索引
+            self._ensure_column_exists(
+                conn=conn,
+                table_name='interview_dialogues',
+                column_name='turn_id',
+                column_def='TEXT'
+            )
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_interview_dialogues_turn_id
+                ON interview_dialogues(turn_id)
             ''')
 
             # 语音表达评估明细表（整题终稿 + 对齐后指标）
@@ -274,6 +287,141 @@ class DatabaseManager:
                 CREATE INDEX IF NOT EXISTS idx_interview_evaluations_created_at
                 ON interview_evaluations(created_at)
             ''')
+
+            # 复盘视频资产表
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS interview_assets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    interview_id TEXT NOT NULL UNIQUE,
+                    upload_id TEXT,
+                    storage_key TEXT,
+                    video_url TEXT,
+                    local_path TEXT,
+                    duration_ms REAL DEFAULT 0,
+                    codec TEXT,
+                    status TEXT DEFAULT 'uploaded',
+                    metadata_json TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (interview_id) REFERENCES interviews(interview_id)
+                )
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_interview_assets_status
+                ON interview_assets(status)
+            ''')
+
+            # 题目级时间轴锚点
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS interview_turn_timeline (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    interview_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    question_start_ms REAL,
+                    question_end_ms REAL,
+                    answer_start_ms REAL,
+                    answer_end_ms REAL,
+                    latency_ms REAL,
+                    source TEXT DEFAULT 'runtime',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(interview_id, turn_id),
+                    FOREIGN KEY (interview_id) REFERENCES interviews(interview_id)
+                )
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_interview_turn_timeline_interview_id
+                ON interview_turn_timeline(interview_id)
+            ''')
+
+            # A/E 标签统一存储
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS interview_timeline_tags (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    interview_id TEXT NOT NULL,
+                    turn_id TEXT,
+                    tag_type TEXT NOT NULL,
+                    start_ms REAL NOT NULL,
+                    end_ms REAL NOT NULL,
+                    reason TEXT,
+                    confidence REAL DEFAULT 0,
+                    evidence_json TEXT,
+                    source TEXT DEFAULT 'review_service',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (interview_id) REFERENCES interviews(interview_id)
+                )
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_interview_timeline_tags_interview_id
+                ON interview_timeline_tags(interview_id)
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_interview_timeline_tags_start_ms
+                ON interview_timeline_tags(start_ms)
+            ''')
+
+            # B 深度技术诊断
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS interview_deep_audits (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    interview_id TEXT NOT NULL UNIQUE,
+                    fact_checks_json TEXT,
+                    dimension_gaps_json TEXT,
+                    round_diagnosis_json TEXT,
+                    version TEXT DEFAULT 'v1',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (interview_id) REFERENCES interviews(interview_id)
+                )
+            ''')
+
+            # C 影子回答
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS interview_shadow_answers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    interview_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    question TEXT,
+                    original_answer TEXT,
+                    shadow_answer TEXT,
+                    why_better TEXT,
+                    resume_alignment_json TEXT,
+                    version TEXT DEFAULT 'v1',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(interview_id, turn_id, version),
+                    FOREIGN KEY (interview_id) REFERENCES interviews(interview_id)
+                )
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_interview_shadow_answers_interview_id
+                ON interview_shadow_answers(interview_id)
+            ''')
+
+            # D 可视化评估矩阵
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS interview_visual_metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    interview_id TEXT NOT NULL UNIQUE,
+                    latency_matrix_json TEXT,
+                    keyword_coverage_json TEXT,
+                    speech_tone_json TEXT,
+                    radar_json TEXT,
+                    heatmap_json TEXT,
+                    version TEXT DEFAULT 'v1',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (interview_id) REFERENCES interviews(interview_id)
+                )
+            ''')
+
+            # 兼容逻辑保留（幂等）
+            self._ensure_column_exists(
+                conn=conn,
+                table_name='interview_dialogues',
+                column_name='turn_id',
+                column_def='TEXT'
+            )
             
             conn.commit()
             conn.close()
@@ -282,6 +430,21 @@ class DatabaseManager:
         except Exception as e:
             print(f"✗ 数据库初始化失败: {e}")
             raise
+
+    @staticmethod
+    def _ensure_column_exists(conn, table_name: str, column_name: str, column_def: str) -> None:
+        """兼容旧库表结构：缺列时自动 ALTER TABLE 新增。"""
+        try:
+            cursor = conn.cursor()
+            cursor.execute(f"PRAGMA table_info({table_name})")
+            columns = [str(row[1]).strip().lower() for row in cursor.fetchall()]
+            if str(column_name).strip().lower() not in columns:
+                cursor.execute(
+                    f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}"
+                )
+        except Exception:
+            # 兼容失败不影响主流程，后续业务可继续运行
+            pass
     
     @contextmanager
     def get_connection(self):
@@ -368,12 +531,21 @@ class DatabaseManager:
             try:
                 with self.get_connection() as conn:
                     cursor = conn.cursor()
-                    
+
                     cursor.execute('''
-                        INSERT INTO interviews 
+                        INSERT INTO interviews
                         (interview_id, start_time, end_time, duration, max_probability, 
                          avg_probability, risk_level, events_count, report_path)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(interview_id) DO UPDATE SET
+                            start_time = COALESCE(excluded.start_time, interviews.start_time),
+                            end_time = COALESCE(excluded.end_time, interviews.end_time),
+                            duration = COALESCE(excluded.duration, interviews.duration),
+                            max_probability = COALESCE(excluded.max_probability, interviews.max_probability),
+                            avg_probability = COALESCE(excluded.avg_probability, interviews.avg_probability),
+                            risk_level = COALESCE(excluded.risk_level, interviews.risk_level),
+                            events_count = COALESCE(excluded.events_count, interviews.events_count),
+                            report_path = COALESCE(excluded.report_path, interviews.report_path)
                     ''', (
                         interview_data['interview_id'],
                         interview_data.get('start_time'),
@@ -393,13 +565,7 @@ class DatabaseManager:
                         'success': True,
                         'interview_id': interview_data['interview_id']
                     }
-                    
-            except sqlite3.IntegrityError:
-                print(f"✗ 面试ID已存在: {interview_data['interview_id']}")
-                return {
-                    'success': False,
-                    'error': 'Interview ID already exists'
-                }
+
             except Exception as e:
                 print(f"✗ 保存面试记录失败: {e}")
                 return {
@@ -477,32 +643,55 @@ class DatabaseManager:
             dict: {'success': bool} 或 {'success': bool, 'error': str}
         """
         try:
-            conn = sqlite3.connect(self.db_path)
-            cursor = conn.cursor()
-            
-            cursor.execute('''
-                INSERT INTO statistics 
-                (interview_id, total_deviations, total_mouth_open, 
-                 total_multi_person, off_screen_ratio, frames_processed)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (
-                interview_id,
-                stats.get('total_deviations', 0),
-                stats.get('total_mouth_open', 0),
-                stats.get('total_multi_person', 0),
-                stats.get('off_screen_ratio', 0.0),
-                stats.get('frames_processed', 0)
-            ))
-            
-            conn.commit()
-            conn.close()
-            
+            with self._lock:
+                with self.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('''
+                        INSERT INTO statistics
+                        (interview_id, total_deviations, total_mouth_open,
+                         total_multi_person, off_screen_ratio, frames_processed)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(interview_id) DO UPDATE SET
+                            total_deviations = excluded.total_deviations,
+                            total_mouth_open = excluded.total_mouth_open,
+                            total_multi_person = excluded.total_multi_person,
+                            off_screen_ratio = excluded.off_screen_ratio,
+                            frames_processed = excluded.frames_processed
+                    ''', (
+                        interview_id,
+                        stats.get('total_deviations', 0),
+                        stats.get('total_mouth_open', 0),
+                        stats.get('total_multi_person', 0),
+                        stats.get('off_screen_ratio', 0.0),
+                        stats.get('frames_processed', 0)
+                    ))
+                    conn.commit()
+
             print(f"✓ 统计数据已保存")
             return {'success': True}
-            
+
         except Exception as e:
             print(f"✗ 保存统计数据失败: {e}")
             return {'success': False, 'error': str(e)}
+
+    def get_statistics_by_interview(self, interview_id: str):
+        """读取单场统计数据。"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT * FROM statistics
+                    WHERE interview_id = ?
+                    LIMIT 1
+                    ''',
+                    (interview_id,)
+                )
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            print(f"✗ 查询统计数据失败：{e}")
+            return None
     
     def get_interviews(self, limit=100, offset=0, risk_level=None):
         """
@@ -1364,6 +1553,467 @@ class DatabaseManager:
             print(f"✗ 查询面试轮次配置失败：{e}")
             return None
 
+    @staticmethod
+    def _extract_json_records_from_markdown(path: Path):
+        text = path.read_text(encoding='utf-8')
+        decoder = json.JSONDecoder()
+        records = []
+        cursor = 0
+
+        while cursor < len(text):
+            start = text.find('{', cursor)
+            if start == -1:
+                break
+
+            try:
+                record, offset = decoder.raw_decode(text[start:])
+            except json.JSONDecodeError:
+                cursor = start + 1
+                continue
+
+            if isinstance(record, dict):
+                records.append(record)
+            elif isinstance(record, list):
+                records.extend(item for item in record if isinstance(item, dict))
+
+            cursor = start + offset
+
+        return records
+
+    @staticmethod
+    def _normalize_question_difficulty(value):
+        normalized = str(value or '').strip().lower()
+        mapping = {
+            '简单': 'easy',
+            '初级': 'easy',
+            'easy': 'easy',
+            '中等': 'medium',
+            '普通': 'medium',
+            'medium': 'medium',
+            '困难': 'hard',
+            '高级': 'hard',
+            'hard': 'hard',
+        }
+        return mapping.get(normalized, 'medium')
+
+    @staticmethod
+    def _infer_position_from_role(role_text, file_stem):
+        role = str(role_text or '').strip().lower()
+        stem = str(file_stem or '').strip().lower()
+        merged = f'{role} {stem}'
+
+        if 'java' in merged and ('后端' in merged or 'backend' in merged):
+            return 'java_backend'
+        if '算法' in merged or 'algorithm' in merged:
+            return 'algorithm'
+        if '前端' in merged or 'frontend' in merged:
+            return 'frontend'
+        if 'fullstack' in merged or '全栈' in merged:
+            return 'fullstack'
+        if 'data' in merged and 'engineer' in merged:
+            return 'data_engineer'
+        if 'devops' in merged:
+            return 'devops'
+
+        return stem or 'unknown'
+
+    def _load_question_bank_from_interview_knowledge(
+        self,
+        round_type: str = None,
+        position: str = None,
+        difficulty: str = None
+    ):
+        """
+        从 backend/interview_knowledge 目录加载题库。
+        支持 .md / .json / .jsonl，md 中按 JSON 对象块解析。
+        """
+        knowledge_dir = Path(__file__).resolve().parents[1] / 'interview_knowledge'
+        if not knowledge_dir.exists() or not knowledge_dir.is_dir():
+            return []
+
+        round_type_filter = str(round_type or '').strip().lower()
+        position_filter = str(position or '').strip().lower()
+        difficulty_filter = self._normalize_question_difficulty(difficulty) if difficulty else ''
+
+        all_records = []
+        supported_suffixes = {'.md', '.json', '.jsonl'}
+        files = [
+            item for item in sorted(knowledge_dir.iterdir())
+            if item.is_file() and item.suffix.lower() in supported_suffixes
+        ]
+
+        for file_path in files:
+            try:
+                suffix = file_path.suffix.lower()
+                parsed_records = []
+
+                if suffix == '.md':
+                    parsed_records = self._extract_json_records_from_markdown(file_path)
+                elif suffix == '.jsonl':
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            obj = json.loads(line)
+                            if isinstance(obj, dict):
+                                parsed_records.append(obj)
+                            elif isinstance(obj, list):
+                                parsed_records.extend(item for item in obj if isinstance(item, dict))
+                else:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        if isinstance(data.get('questions'), list):
+                            parsed_records = [item for item in data['questions'] if isinstance(item, dict)]
+                        else:
+                            parsed_records = [data]
+                    elif isinstance(data, list):
+                        parsed_records = [item for item in data if isinstance(item, dict)]
+
+                all_records.extend((file_path, idx, record) for idx, record in enumerate(parsed_records, start=1))
+            except Exception as e:
+                print(f"⚠️  读取知识库文件失败（已跳过）: {file_path} - {e}")
+
+        question_bank = []
+        seen = set()
+
+        for file_path, index, record in all_records:
+            question = str(
+                record.get('question')
+                or record.get('title')
+                or record.get('content')
+                or ''
+            ).strip()
+            if not question:
+                continue
+
+            role = str(record.get('role') or record.get('position') or '').strip()
+            normalized_round_type = str(record.get('round_type') or 'technical').strip().lower()
+            normalized_position = self._infer_position_from_role(role, file_path.stem).lower()
+            normalized_difficulty = self._normalize_question_difficulty(record.get('difficulty'))
+
+            if round_type_filter and normalized_round_type != round_type_filter:
+                continue
+            if position_filter and normalized_position != position_filter:
+                continue
+            if difficulty_filter and normalized_difficulty != difficulty_filter:
+                continue
+
+            dedupe_key = (question.lower(), normalized_round_type, normalized_position)
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            question_bank.append({
+                'id': str(record.get('id') or f"{file_path.stem}-{index}"),
+                'question': question,
+                'category': str(record.get('category') or record.get('question_type') or normalized_round_type).strip(),
+                'round_type': normalized_round_type,
+                'position': normalized_position,
+                'difficulty': normalized_difficulty,
+                'frequency': str(record.get('frequency') or '').strip(),
+                'description': str(record.get('answer_summary') or '').strip(),
+                'created_at': '',
+                'source': str(file_path.name),
+            })
+
+        return question_bank
+
+    def get_question_bank(
+        self,
+        round_type: str = None,
+        position: str = None,
+        difficulty: str = None
+    ):
+        """
+        从数据库拉取题库：
+        1) 优先 interview_rounds.questions(JSON)
+        2) 若为空，回退到 interview_dialogues.question 聚合
+
+        Args:
+            round_type: 轮次类型过滤（可选）
+            position: 岗位过滤（可选）
+            difficulty: 难度过滤（可选）
+
+        Returns:
+            list: 题目列表（按 created_at/id 倒序去重）
+        """
+        try:
+            # 优先使用 backend/interview_knowledge 目录作为题库来源
+            knowledge_question_bank = self._load_question_bank_from_interview_knowledge(
+                round_type=round_type,
+                position=position,
+                difficulty=difficulty,
+            )
+            if knowledge_question_bank:
+                return knowledge_question_bank
+
+            conditions = []
+            params = []
+
+            if round_type:
+                conditions.append('round_type = ?')
+                params.append(round_type)
+            if position:
+                conditions.append('position = ?')
+                params.append(position)
+            if difficulty:
+                conditions.append('difficulty = ?')
+                params.append(difficulty)
+
+            where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ''
+
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(f'''
+                    SELECT id, round_type, position, difficulty, questions, description, created_at
+                    FROM interview_rounds
+                    {where_clause}
+                    ORDER BY datetime(created_at) DESC, id DESC
+                ''', params)
+                rows = cursor.fetchall()
+
+            question_bank = []
+            seen = set()
+
+            def _safe_text(value):
+                return str(value or '').strip()
+
+            def _normalize_question_entry(entry):
+                if isinstance(entry, str):
+                    text = _safe_text(entry)
+                    return {
+                        'text': text,
+                        'category': '',
+                        'difficulty': '',
+                        'frequency': '',
+                        'source_question_id': '',
+                    } if text else None
+
+                if isinstance(entry, dict):
+                    text = _safe_text(
+                        entry.get('title')
+                        or entry.get('question')
+                        or entry.get('content')
+                        or entry.get('text')
+                    )
+                    if not text:
+                        return None
+                    return {
+                        'text': text,
+                        'category': _safe_text(entry.get('category') or entry.get('dimension')),
+                        'difficulty': _safe_text(entry.get('difficulty')),
+                        'frequency': _safe_text(entry.get('frequency') or entry.get('frequency_label')),
+                        'source_question_id': _safe_text(entry.get('id') or entry.get('question_id')),
+                    }
+
+                return None
+
+            for row in rows:
+                questions_raw = row['questions']
+                if not questions_raw:
+                    continue
+
+                parsed_questions = []
+                if isinstance(questions_raw, str):
+                    try:
+                        parsed_questions = json.loads(questions_raw)
+                    except Exception:
+                        parsed_questions = []
+                elif isinstance(questions_raw, (list, tuple)):
+                    parsed_questions = list(questions_raw)
+
+                if isinstance(parsed_questions, dict):
+                    parsed_questions = [parsed_questions]
+
+                if not isinstance(parsed_questions, list):
+                    continue
+
+                for index, item in enumerate(parsed_questions):
+                    normalized = _normalize_question_entry(item)
+                    if not normalized:
+                        continue
+
+                    question_text = normalized['text']
+                    dedupe_key = (
+                        question_text.lower(),
+                        _safe_text(row['round_type']).lower(),
+                        _safe_text(row['position']).lower(),
+                    )
+                    if dedupe_key in seen:
+                        continue
+                    seen.add(dedupe_key)
+
+                    bank_id = normalized['source_question_id'] or f"{row['id']}-{index + 1}"
+                    row_difficulty = _safe_text(row['difficulty']).lower() or 'medium'
+                    entry_difficulty = normalized['difficulty'].lower() or row_difficulty
+
+                    question_bank.append({
+                        'id': bank_id,
+                        'question': question_text,
+                        'category': normalized['category'] or _safe_text(row['round_type']),
+                        'round_type': _safe_text(row['round_type']),
+                        'position': _safe_text(row['position']),
+                        'difficulty': entry_difficulty,
+                        'frequency': normalized['frequency'] or '',
+                        'description': _safe_text(row['description']),
+                        'created_at': _safe_text(row['created_at']),
+                    })
+
+            if question_bank:
+                return question_bank
+
+            # 回退：直接使用历史对话中的题目作为题库
+            if position:
+                # interview_dialogues 当前无岗位字段，带岗位过滤时不做回退
+                return []
+
+            normalized_difficulty = str(difficulty or '').strip().lower()
+            if normalized_difficulty and normalized_difficulty not in {'medium', 'normal', '中等'}:
+                # interview_dialogues 无难度字段，仅支持默认中等
+                return []
+
+            dialogue_conditions = ["question IS NOT NULL", "TRIM(question) <> ''"]
+            dialogue_params = []
+            if round_type:
+                dialogue_conditions.append('round_type = ?')
+                dialogue_params.append(round_type)
+            dialogue_where = f"WHERE {' AND '.join(dialogue_conditions)}"
+
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(f'''
+                    SELECT
+                        round_type,
+                        question,
+                        COUNT(*) AS frequency_count,
+                        MAX(created_at) AS created_at
+                    FROM interview_dialogues
+                    {dialogue_where}
+                    GROUP BY round_type, question
+                    ORDER BY datetime(created_at) DESC
+                ''', dialogue_params)
+                dialogue_rows = cursor.fetchall()
+
+            if not dialogue_rows:
+                return []
+
+            fallback_bank = []
+
+            def _frequency_label(count):
+                if count >= 5:
+                    return 'Very High'
+                if count >= 3:
+                    return 'High'
+                if count >= 2:
+                    return 'Medium'
+                return 'Low'
+
+            for index, row in enumerate(dialogue_rows):
+                text = _safe_text(row['question'])
+                if not text:
+                    continue
+                fallback_bank.append({
+                    'id': f"dialogue-{index + 1}",
+                    'question': text,
+                    'category': _safe_text(row['round_type']) or '未分类',
+                    'round_type': _safe_text(row['round_type']),
+                    'position': '',
+                    'difficulty': 'medium',
+                    'frequency': _frequency_label(int(row['frequency_count'] or 0)),
+                    'description': 'from interview_dialogues',
+                    'created_at': _safe_text(row['created_at']),
+                })
+
+            return fallback_bank
+
+        except Exception as e:
+            print(f"✗ 查询题库失败：{e}")
+            return []
+
+    def get_question_bank_facets(self):
+        """
+        获取题库筛选维度（轮次、岗位、难度）。
+
+        Returns:
+            dict: {'round_types': [...], 'positions': [...], 'difficulties': [...]}
+        """
+        try:
+            knowledge_question_bank = self._load_question_bank_from_interview_knowledge()
+            if knowledge_question_bank:
+                return {
+                    'round_types': sorted({
+                        str(item.get('round_type', '')).strip()
+                        for item in knowledge_question_bank
+                        if str(item.get('round_type', '')).strip()
+                    }),
+                    'positions': sorted({
+                        str(item.get('position', '')).strip()
+                        for item in knowledge_question_bank
+                        if str(item.get('position', '')).strip()
+                    }),
+                    'difficulties': sorted({
+                        str(item.get('difficulty', '')).strip()
+                        for item in knowledge_question_bank
+                        if str(item.get('difficulty', '')).strip()
+                    }),
+                }
+
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT DISTINCT round_type, position, difficulty
+                    FROM interview_rounds
+                ''')
+                round_rows = cursor.fetchall()
+
+                cursor.execute('''
+                    SELECT DISTINCT round_type
+                    FROM interview_dialogues
+                    WHERE round_type IS NOT NULL AND TRIM(round_type) <> ''
+                ''')
+                dialogue_round_rows = cursor.fetchall()
+
+                cursor.execute('''
+                    SELECT COUNT(*) AS total
+                    FROM interview_dialogues
+                    WHERE question IS NOT NULL AND TRIM(question) <> ''
+                ''')
+                dialogue_question_total = int(cursor.fetchone()['total'] or 0)
+
+            round_types = sorted(
+                {
+                    str(row['round_type']).strip()
+                    for row in round_rows
+                    if str(row['round_type']).strip()
+                }.union(
+                    {
+                        str(row['round_type']).strip()
+                        for row in dialogue_round_rows
+                        if str(row['round_type']).strip()
+                    }
+                )
+            )
+            positions = sorted({str(row['position']).strip() for row in round_rows if str(row['position']).strip()})
+            difficulties = sorted({str(row['difficulty']).strip() for row in round_rows if str(row['difficulty']).strip()})
+            if dialogue_question_total > 0 and 'medium' not in {item.lower() for item in difficulties}:
+                difficulties.append('medium')
+                difficulties = sorted(difficulties)
+
+            return {
+                'round_types': round_types,
+                'positions': positions,
+                'difficulties': difficulties,
+            }
+        except Exception as e:
+            print(f"✗ 查询题库筛选维度失败：{e}")
+            return {
+                'round_types': [],
+                'positions': [],
+                'difficulties': [],
+            }
+
     def save_interview_dialogue(self, dialogue_data):
         """
         保存面试对话记录
@@ -1386,10 +2036,11 @@ class DatabaseManager:
 
             cursor.execute('''
                 INSERT INTO interview_dialogues
-                (interview_id, round_type, question, answer, llm_feedback, score)
-                VALUES (?, ?, ?, ?, ?, ?)
+                (interview_id, turn_id, round_type, question, answer, llm_feedback, score)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             ''', (
                 dialogue_data['interview_id'],
+                dialogue_data.get('turn_id'),
                 dialogue_data['round_type'],
                 dialogue_data['question'],
                 dialogue_data.get('answer', ''),
@@ -1443,6 +2094,341 @@ class DatabaseManager:
         except Exception as e:
             print(f"✗ 查询面试对话失败：{e}")
             return []
+
+    def save_or_update_interview_asset(self, payload):
+        """保存或更新面试视频资产（interview_id 幂等）。"""
+        columns = [
+            'interview_id',
+            'upload_id',
+            'storage_key',
+            'video_url',
+            'local_path',
+            'duration_ms',
+            'codec',
+            'status',
+            'metadata_json',
+        ]
+        values = [payload.get(col) for col in columns]
+        placeholders = ', '.join(['?'] * len(columns))
+        update_cols = [col for col in columns if col != 'interview_id']
+        update_set = ', '.join([f"{col}=excluded.{col}" for col in update_cols] + ["updated_at=CURRENT_TIMESTAMP"])
+
+        sql = f'''
+            INSERT INTO interview_assets ({', '.join(columns)})
+            VALUES ({placeholders})
+            ON CONFLICT(interview_id)
+            DO UPDATE SET {update_set}
+        '''
+        with self._lock:
+            try:
+                with self.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(sql, values)
+                    conn.commit()
+                    cursor.execute(
+                        '''
+                        SELECT id FROM interview_assets WHERE interview_id = ? LIMIT 1
+                        ''',
+                        (payload.get('interview_id', ''),)
+                    )
+                    row = cursor.fetchone()
+                    return {
+                        'success': True,
+                        'id': int(row['id']) if row and row['id'] is not None else 0,
+                    }
+            except Exception as e:
+                print(f"✗ 保存视频资产失败：{e}")
+                return {'success': False, 'error': str(e)}
+
+    def get_interview_asset(self, interview_id: str):
+        """获取单场面试视频资产。"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT * FROM interview_assets
+                    WHERE interview_id = ?
+                    ORDER BY datetime(updated_at) DESC, id DESC
+                    LIMIT 1
+                    ''',
+                    (interview_id,)
+                )
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            print(f"✗ 查询视频资产失败：{e}")
+            return None
+
+    def save_or_update_turn_timeline(self, payload):
+        """保存或更新 turn 级时间锚点。"""
+        columns = [
+            'interview_id',
+            'turn_id',
+            'question_start_ms',
+            'question_end_ms',
+            'answer_start_ms',
+            'answer_end_ms',
+            'latency_ms',
+            'source',
+        ]
+        values = [payload.get(col) for col in columns]
+        placeholders = ', '.join(['?'] * len(columns))
+        update_cols = [col for col in columns if col not in ('interview_id', 'turn_id')]
+        # 允许按阶段增量写入（先 question，再 answer），避免后写覆盖前写的非空字段。
+        update_set = ', '.join(
+            [f"{col}=COALESCE(excluded.{col}, {col})" for col in update_cols] +
+            ["updated_at=CURRENT_TIMESTAMP"]
+        )
+        sql = f'''
+            INSERT INTO interview_turn_timeline ({', '.join(columns)})
+            VALUES ({placeholders})
+            ON CONFLICT(interview_id, turn_id)
+            DO UPDATE SET {update_set}
+        '''
+        with self._lock:
+            try:
+                with self.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(sql, values)
+                    conn.commit()
+                    return {'success': True}
+            except Exception as e:
+                print(f"✗ 保存 turn 时间轴失败：{e}")
+                return {'success': False, 'error': str(e)}
+
+    def get_interview_turn_timelines(self, interview_id: str):
+        """获取单场面试 turn 时间轴。"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT * FROM interview_turn_timeline
+                    WHERE interview_id = ?
+                    ORDER BY COALESCE(answer_start_ms, question_start_ms, 0) ASC, id ASC
+                    ''',
+                    (interview_id,)
+                )
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            print(f"✗ 查询 turn 时间轴失败：{e}")
+            return []
+
+    def replace_timeline_tags(self, interview_id: str, tags):
+        """覆盖写入时间轴标签。"""
+        with self._lock:
+            try:
+                with self.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        'DELETE FROM interview_timeline_tags WHERE interview_id = ?',
+                        (interview_id,)
+                    )
+                    for item in tags or []:
+                        cursor.execute(
+                            '''
+                            INSERT INTO interview_timeline_tags
+                            (interview_id, turn_id, tag_type, start_ms, end_ms, reason, confidence, evidence_json, source)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ''',
+                            (
+                                interview_id,
+                                item.get('turn_id'),
+                                item.get('tag_type', ''),
+                                item.get('start_ms', 0),
+                                item.get('end_ms', 0),
+                                item.get('reason', ''),
+                                item.get('confidence', 0.0),
+                                item.get('evidence_json', ''),
+                                item.get('source', 'review_service'),
+                            )
+                        )
+                    conn.commit()
+                    return {'success': True, 'count': len(tags or [])}
+            except Exception as e:
+                print(f"✗ 覆盖时间轴标签失败：{e}")
+                return {'success': False, 'error': str(e)}
+
+    def get_timeline_tags(self, interview_id: str):
+        """读取单场面试时间轴标签。"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT * FROM interview_timeline_tags
+                    WHERE interview_id = ?
+                    ORDER BY start_ms ASC, id ASC
+                    ''',
+                    (interview_id,)
+                )
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            print(f"✗ 查询时间轴标签失败：{e}")
+            return []
+
+    def save_or_update_deep_audit(self, payload):
+        """保存或更新深度技术诊断（interview_id 幂等）。"""
+        columns = [
+            'interview_id',
+            'fact_checks_json',
+            'dimension_gaps_json',
+            'round_diagnosis_json',
+            'version',
+        ]
+        values = [payload.get(col) for col in columns]
+        placeholders = ', '.join(['?'] * len(columns))
+        update_cols = [col for col in columns if col != 'interview_id']
+        update_set = ', '.join([f"{col}=excluded.{col}" for col in update_cols] + ["updated_at=CURRENT_TIMESTAMP"])
+        sql = f'''
+            INSERT INTO interview_deep_audits ({', '.join(columns)})
+            VALUES ({placeholders})
+            ON CONFLICT(interview_id)
+            DO UPDATE SET {update_set}
+        '''
+        with self._lock:
+            try:
+                with self.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(sql, values)
+                    conn.commit()
+                    return {'success': True}
+            except Exception as e:
+                print(f"✗ 保存深度技术诊断失败：{e}")
+                return {'success': False, 'error': str(e)}
+
+    def get_deep_audit(self, interview_id: str):
+        """读取单场深度技术诊断。"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT * FROM interview_deep_audits
+                    WHERE interview_id = ?
+                    LIMIT 1
+                    ''',
+                    (interview_id,)
+                )
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            print(f"✗ 查询深度技术诊断失败：{e}")
+            return None
+
+    def replace_shadow_answers(self, interview_id: str, records, version: str = 'v1'):
+        """覆盖写入影子回答。"""
+        with self._lock:
+            try:
+                with self.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        'DELETE FROM interview_shadow_answers WHERE interview_id = ? AND version = ?',
+                        (interview_id, version)
+                    )
+                    for item in records or []:
+                        cursor.execute(
+                            '''
+                            INSERT INTO interview_shadow_answers
+                            (interview_id, turn_id, question, original_answer, shadow_answer, why_better, resume_alignment_json, version)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            ''',
+                            (
+                                interview_id,
+                                item.get('turn_id', ''),
+                                item.get('question', ''),
+                                item.get('original_answer', ''),
+                                item.get('shadow_answer', ''),
+                                item.get('why_better', ''),
+                                item.get('resume_alignment_json', ''),
+                                version,
+                            )
+                        )
+                    conn.commit()
+                    return {'success': True, 'count': len(records or [])}
+            except Exception as e:
+                print(f"✗ 覆盖影子回答失败：{e}")
+                return {'success': False, 'error': str(e)}
+
+    def get_shadow_answers(self, interview_id: str, version: str = None):
+        """读取影子回答列表。"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                if version:
+                    cursor.execute(
+                        '''
+                        SELECT * FROM interview_shadow_answers
+                        WHERE interview_id = ? AND version = ?
+                        ORDER BY datetime(created_at) ASC, id ASC
+                        ''',
+                        (interview_id, version)
+                    )
+                else:
+                    cursor.execute(
+                        '''
+                        SELECT * FROM interview_shadow_answers
+                        WHERE interview_id = ?
+                        ORDER BY datetime(created_at) ASC, id ASC
+                        ''',
+                        (interview_id,)
+                    )
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            print(f"✗ 查询影子回答失败：{e}")
+            return []
+
+    def save_or_update_visual_metrics(self, payload):
+        """保存或更新可视化矩阵数据。"""
+        columns = [
+            'interview_id',
+            'latency_matrix_json',
+            'keyword_coverage_json',
+            'speech_tone_json',
+            'radar_json',
+            'heatmap_json',
+            'version',
+        ]
+        values = [payload.get(col) for col in columns]
+        placeholders = ', '.join(['?'] * len(columns))
+        update_cols = [col for col in columns if col != 'interview_id']
+        update_set = ', '.join([f"{col}=excluded.{col}" for col in update_cols] + ["updated_at=CURRENT_TIMESTAMP"])
+        sql = f'''
+            INSERT INTO interview_visual_metrics ({', '.join(columns)})
+            VALUES ({placeholders})
+            ON CONFLICT(interview_id)
+            DO UPDATE SET {update_set}
+        '''
+        with self._lock:
+            try:
+                with self.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(sql, values)
+                    conn.commit()
+                    return {'success': True}
+            except Exception as e:
+                print(f"✗ 保存可视化矩阵失败：{e}")
+                return {'success': False, 'error': str(e)}
+
+    def get_visual_metrics(self, interview_id: str):
+        """读取可视化矩阵。"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    '''
+                    SELECT * FROM interview_visual_metrics
+                    WHERE interview_id = ?
+                    LIMIT 1
+                    ''',
+                    (interview_id,)
+                )
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            print(f"✗ 查询可视化矩阵失败：{e}")
+            return None
 
     def save_or_update_speech_evaluation(self, payload):
         """
@@ -1632,6 +2618,69 @@ class DatabaseManager:
         except Exception as e:
             print(f"✗ 查询评估记录失败：{e}")
             return []
+
+    def get_interview_structured_score_map(self, interview_ids):
+        """
+        批量获取面试结构化总分（按 turn 取最新评估记录后求平均）。
+
+        Returns:
+            dict: {
+                interview_id: {
+                    'overall_score': float,
+                    'scored_turns': int,
+                    'score_source': 'structured_evaluation'
+                }
+            }
+        """
+        normalized_ids = [str(item).strip() for item in (interview_ids or []) if str(item).strip()]
+        if not normalized_ids:
+            return {}
+
+        placeholders = ','.join(['?'] * len(normalized_ids))
+        sql = f'''
+            WITH ranked AS (
+                SELECT
+                    interview_id,
+                    turn_id,
+                    overall_score,
+                    status,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY interview_id, turn_id
+                        ORDER BY datetime(updated_at) DESC, id DESC
+                    ) AS rn
+                FROM interview_evaluations
+                WHERE interview_id IN ({placeholders})
+            )
+            SELECT
+                interview_id,
+                ROUND(AVG(overall_score), 1) AS overall_score,
+                COUNT(*) AS scored_turns
+            FROM ranked
+            WHERE rn = 1
+              AND overall_score IS NOT NULL
+              AND status IN ('ok', 'partial_ok', 'skipped')
+            GROUP BY interview_id
+        '''
+
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(sql, normalized_ids)
+                rows = cursor.fetchall()
+                result = {}
+                for row in rows:
+                    interview_id = str(row['interview_id'] or '').strip()
+                    if not interview_id:
+                        continue
+                    result[interview_id] = {
+                        'overall_score': float(row['overall_score'] or 0.0),
+                        'scored_turns': int(row['scored_turns'] or 0),
+                        'score_source': 'structured_evaluation',
+                    }
+                return result
+        except Exception as e:
+            print(f"✗ 查询结构化总分失败：{e}")
+            return {}
 
     def get_evaluation_record(
         self,

@@ -38,10 +38,18 @@ class SessionRuntime:
     last_committed_hash: str = ""
     last_committed_at: float = 0.0
     current_question: str = ""
+    current_question_started_at: Optional[float] = None
+    current_question_estimated_end_at: Optional[float] = None
+    current_answer_started_at: Optional[float] = None
     data_manager: Optional[DataManager] = None
     pending_asr_partials: List[str] = field(default_factory=list)
     pending_asr_finals: List[str] = field(default_factory=list)
+    pending_asr_audio_lock: Any = field(default_factory=threading.RLock)
+    pending_asr_audio_chunks: List[bytes] = field(default_factory=list)
+    pending_asr_audio_bytes: int = 0
     speech_epoch: int = 0
+    client_speech_epoch: int = 0
+    active_client_speech_epoch: int = 0
     asr_generation_counter: int = 0
     active_asr_generation: int = 0
     active_asr_speech_epoch: int = 0
@@ -180,6 +188,9 @@ class StateOrchestrator:
         runtime.mode = "listening"
         runtime.pending_asr_partials.clear()
         runtime.pending_asr_finals.clear()
+        with runtime.pending_asr_audio_lock:
+            runtime.pending_asr_audio_chunks.clear()
+            runtime.pending_asr_audio_bytes = 0
         runtime.finalizing_asr_generation = 0
         runtime.last_finalized_asr_generation = 0
         runtime.active_asr_stream_id = runtime.active_asr_stream_id or runtime.session_id

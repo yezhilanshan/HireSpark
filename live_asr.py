@@ -36,10 +36,20 @@ tts_queue = queue.Queue()
 tts_thread = None
 stop_tts_worker = False
 
-TTS_VOICE = os.environ.get('EDGE_TTS_VOICE', 'zh-CN-XiaoxiaoNeural')
+TTS_VOICE = os.environ.get('EDGE_TTS_VOICE', '').strip()
+TTS_FEMALE_VOICE = os.environ.get('EDGE_TTS_FEMALE_VOICE', 'zh-CN-XiaoxiaoNeural').strip()
+TTS_MALE_VOICE = os.environ.get('EDGE_TTS_MALE_VOICE', 'zh-CN-YunyangNeural').strip()
+TTS_AUTO_GENDER = str(os.environ.get('EDGE_TTS_AUTO_GENDER', '1')).strip().lower() in {
+    '1',
+    'true',
+    'yes',
+    'on',
+}
 TTS_RATE = os.environ.get('EDGE_TTS_RATE', '+0%')
 TTS_VOLUME = os.environ.get('EDGE_TTS_VOLUME', '+0%')
 TTS_CONNECT_TIMEOUT_SEC = float(os.environ.get('EDGE_TTS_TIMEOUT_SEC', '8'))
+tts_voice_turn = 0
+tts_voice_lock = threading.Lock()
 
 # Set recording parameters
 sample_rate = 16000  # sampling rate (Hz)
@@ -69,9 +79,20 @@ async def _synthesize_to_file(text: str, output_path: str):
     """将文本合成为语音文件。"""
     import edge_tts
 
+    global tts_voice_turn
+
+    if TTS_VOICE:
+        selected_voice = TTS_VOICE
+    elif TTS_AUTO_GENDER:
+        with tts_voice_lock:
+            selected_voice = TTS_FEMALE_VOICE if tts_voice_turn % 2 == 0 else TTS_MALE_VOICE
+            tts_voice_turn += 1
+    else:
+        selected_voice = TTS_FEMALE_VOICE
+
     communicate = edge_tts.Communicate(
         text=text,
-        voice=TTS_VOICE,
+        voice=selected_voice,
         rate=TTS_RATE,
         volume=TTS_VOLUME,
     )
@@ -406,7 +427,12 @@ if __name__ == '__main__':
     start_tts_worker()
 
     if TTS_AVAILABLE:
-        print(f'🔊 EdgeTTS 已启用，发音人: {TTS_VOICE}')
+        if TTS_VOICE:
+            print(f'🔊 EdgeTTS 已启用，固定发音人: {TTS_VOICE}')
+        elif TTS_AUTO_GENDER:
+            print(f'🔊 EdgeTTS 已启用，男女声自动轮换: {TTS_FEMALE_VOICE} <-> {TTS_MALE_VOICE}')
+        else:
+            print(f'🔊 EdgeTTS 已启用，默认发音人: {TTS_FEMALE_VOICE}')
     else:
         print('⚠️  EdgeTTS 未启用。请安装项目根目录 requirements.txt 中的依赖。')
     

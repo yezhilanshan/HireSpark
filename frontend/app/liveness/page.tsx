@@ -3,7 +3,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import SocketClient from '@/lib/socket'
-import { Home, FileText } from 'lucide-react'
 
 export default function LivenessPage() {
     const router = useRouter()
@@ -59,10 +58,8 @@ export default function LivenessPage() {
             await socketClient.connect()
             setSocket(socketClient)
             setSocketReady(true)
-            console.log('Socket connected successfully')
 
             socketClient.on('liveness_result', (data: any) => {
-                console.log('Received liveness_result:', data)
                 setBlinkDetected(data.blink_detected)
                 setMouthOpened(data.mouth_opened)
                 setMessage(data.message)
@@ -75,8 +72,8 @@ export default function LivenessPage() {
                 }
             })
 
-            socketClient.on('connection_response', (data: any) => {
-                console.log('Server connection response:', data)
+            socketClient.on('connection_response', () => {
+                return
             })
         } catch (error) {
             console.error('Socket connection error:', error)
@@ -89,7 +86,7 @@ export default function LivenessPage() {
 
         const interval = setInterval(() => {
             captureAndSend()
-        }, 100) // 10 fps
+        }, 100)
 
         return () => clearInterval(interval)
     }, [cameraReady, socket, socketReady])
@@ -112,78 +109,56 @@ export default function LivenessPage() {
     }
 
     return (
-        <div className="min-h-screen bg-gradient-to-br from-green-50 to-blue-100 dark:from-gray-900 dark:to-blue-950 flex items-center justify-center p-4 transition-colors">
-            {/* Navigation Header */}
-            <div className="fixed top-4 left-4 z-50 flex gap-2">
-                <button
-                    onClick={() => router.push('/')}
-                    className="flex items-center gap-2 bg-white dark:bg-gray-800 hover:bg-gray-100 dark:hover:bg-gray-700 px-4 py-2 rounded-lg shadow-lg transition-all border border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-200"
-                >
-                    <Home className="w-5 h-5" />
-                    <span className="text-sm font-medium">首页</span>
-                </button>
-                <button
-                    onClick={() => router.push('/report')}
-                    className="flex items-center gap-2 bg-white dark:bg-gray-800 hover:bg-gray-100 dark:hover:bg-gray-700 px-4 py-2 rounded-lg shadow-lg transition-all border border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-200"
-                >
-                    <FileText className="w-5 h-5" />
-                    <span className="text-sm font-medium">报告</span>
-                </button>
-            </div>
+        <div className="page-shell-compact flex items-center justify-center">
+            <div className="w-full max-w-4xl rounded-3xl border border-[#E5E5E5] bg-white p-8 shadow-sm animate-slide-up">
+                <h1 className="mb-8 text-center text-3xl text-[#111111]">面试前校准</h1>
 
-            <div className="max-w-4xl w-full bg-white dark:bg-gray-800 rounded-lg shadow-xl p-8 animate-slide-up">
-                <h1 className="text-3xl font-bold text-center mb-8 text-gray-800 dark:text-gray-100">
-                    面试前校准
-                </h1>
-
-                <div className="grid md:grid-cols-2 gap-8">
-                    {/* Video Preview */}
+                <div className="grid gap-8 md:grid-cols-2">
                     <div className="space-y-4">
-                        <div className="relative bg-black rounded-lg overflow-hidden shadow-xl" style={{ aspectRatio: '4/3' }}>
+                        <div className="relative aspect-[4/3] overflow-hidden rounded-lg bg-black shadow-sm">
                             <video
                                 ref={videoRef}
                                 autoPlay
                                 playsInline
                                 muted
-                                className="w-full h-full object-cover"
+                                className="h-full w-full object-cover"
                             />
                             <canvas ref={canvasRef} className="hidden" />
 
                             {!cameraReady && (
-                                <div className="absolute inset-0 flex items-center justify-center bg-black bg-opacity-50">
-                                    <div className="text-white text-center">
-                                        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-white mx-auto mb-4"></div>
-                                        <p>加载摄像头中...</p>
+                                <div className="absolute inset-0 flex items-center justify-center bg-black/60">
+                                    <div className="text-center text-white">
+                                        <div className="mx-auto mb-4 h-10 w-10 animate-spin rounded-full border-2 border-white border-t-transparent" />
+                                        <p className="text-sm">加载摄像头中...</p>
                                     </div>
                                 </div>
                             )}
                         </div>
                     </div>
 
-                    {/* Status Panel */}
                     <div className="space-y-6">
-                        <div className="bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800 rounded-lg p-6">
-                            <h3 className="font-semibold text-lg mb-4 text-gray-800 dark:text-gray-100">校准状态</h3>
+                        <div className="rounded-lg border border-[#E5E5E5] bg-[#FAF9F6] p-6">
+                            <h3 className="mb-4 text-lg text-[#111111]">校准状态</h3>
 
                             <div className="space-y-3">
                                 <div className="flex items-center justify-between">
-                                    <span className="text-gray-700 dark:text-gray-300">眨眼动作</span>
-                                    <span className={`font-semibold ${blinkDetected ? 'text-green-600 dark:text-green-400' : 'text-gray-400 dark:text-gray-500'}`}>
+                                    <span className="text-[#666666]">眨眼动作</span>
+                                    <span className={`font-medium ${blinkDetected ? 'text-green-600' : 'text-[#999999]'}`}>
                                         {blinkDetected ? '✓ 已检测' : '○ 等待中'}
                                     </span>
                                 </div>
 
                                 <div className="flex items-center justify-between">
-                                    <span className="text-gray-700 dark:text-gray-300">开合动作</span>
-                                    <span className={`font-semibold ${mouthOpened ? 'text-green-600 dark:text-green-400' : 'text-gray-400 dark:text-gray-500'}`}>
+                                    <span className="text-[#666666]">开合动作</span>
+                                    <span className={`font-medium ${mouthOpened ? 'text-green-600' : 'text-[#999999]'}`}>
                                         {mouthOpened ? '✓ 已检测' : '○ 等待中'}
                                     </span>
                                 </div>
                             </div>
                         </div>
 
-                        <div className={`p-4 rounded-lg ${verified ? 'bg-green-100 dark:bg-green-900/30 border border-green-300 dark:border-green-800' : 'bg-gray-100 dark:bg-gray-700 border border-gray-300 dark:border-gray-600'}`}>
-                            <p className={`text-center font-medium ${verified ? 'text-green-800 dark:text-green-200' : 'text-gray-700 dark:text-gray-300'}`}>
+                        <div className={`rounded-lg border p-4 ${verified ? 'border-green-300 bg-green-50' : 'border-[#E5E5E5] bg-[#FAF9F6]'}`}>
+                            <p className={`text-center text-sm font-medium ${verified ? 'text-green-700' : 'text-[#666666]'}`}>
                                 {message}
                             </p>
                         </div>
@@ -191,17 +166,17 @@ export default function LivenessPage() {
                         {verified && (
                             <div className="text-center animate-fade-in">
                                 <div className="inline-block animate-bounce">
-                                    <svg className="w-16 h-16 text-green-500 dark:text-green-400 mx-auto" fill="currentColor" viewBox="0 0 20 20">
+                                    <svg className="mx-auto h-14 w-14 text-green-500" fill="currentColor" viewBox="0 0 20 20">
                                         <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
                                     </svg>
                                 </div>
-                                <p className="text-green-600 dark:text-green-400 font-semibold mt-2">校准完成，正在进入 AI 模拟面试...</p>
+                                <p className="mt-2 text-sm font-medium text-green-700">校准完成，正在进入 AI 模拟面试...</p>
                             </div>
                         )}
 
-                        <div className="text-sm text-gray-500 dark:text-gray-400 bg-gray-50 dark:bg-gray-700 p-4 rounded-lg">
-                            <p className="font-semibold mb-2">引导说明：</p>
-                            <ol className="list-decimal list-inside space-y-1">
+                        <div className="rounded-lg border border-[#E5E5E5] bg-[#FAF9F6] p-4 text-sm text-[#666666]">
+                            <p className="mb-2 font-medium text-[#111111]">引导说明：</p>
+                            <ol className="list-inside list-decimal space-y-1">
                                 <li>正视摄像头</li>
                                 <li>自然眨眼</li>
                                 <li>张大嘴巴</li>

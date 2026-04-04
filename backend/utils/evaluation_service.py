@@ -477,7 +477,21 @@ class EvaluationService:
                 columns[key] = self._safe_float(payload.get("score"))
         return columns
 
-    def _build_partial_layer2_from_layer1(self, layer1_result: Dict[str, Any], reason: str) -> Dict[str, Any]:
+    def _estimate_fallback_score(self, answer: str) -> float:
+        text = str(answer or "").strip()
+        if not text:
+            return 25.0
+        units = len(re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9]+", text))
+        punct = len(re.findall(r"[。！？.!?；;，,]", text))
+        score = 30.0 + min(45.0, float(units) * 1.1) + min(8.0, float(punct) * 1.2)
+        return round(max(20.0, min(85.0, score)), 1)
+
+    def _build_partial_layer2_from_layer1(
+        self,
+        layer1_result: Dict[str, Any],
+        reason: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         rubric_match = (layer1_result or {}).get("rubric_match", {}) or {}
         best_level = None
         confidence = 0.45
@@ -487,7 +501,19 @@ class EvaluationService:
                 best_level = ranked[0][0]
                 confidence = min(0.75, max(0.2, float(ranked[0][1] or 0.0)))
 
-        overall_score = float(rubric_match.get("good", 0.0) or 0.0) * 100.0
+        rubric_score = float(rubric_match.get("good", 0.0) or 0.0) * 100.0
+        round_type = str((payload or {}).get("round_type") or "technical").strip() or "technical"
+        dimensions = self.ROUND_DIMENSIONS.get(round_type, self.ROUND_DIMENSIONS["technical"])
+        heuristic_score = self._estimate_fallback_score((payload or {}).get("answer", ""))
+        overall_score = round(rubric_score if rubric_score > 0 else heuristic_score, 1)
+
+        dimension_scores = {
+            dim: {
+                "score": overall_score,
+                "reason": "基于回答文本长度与结构的回退评分。",
+            }
+            for dim in dimensions
+        }
 
         return {
             "rubric_eval": {
@@ -498,11 +524,11 @@ class EvaluationService:
                 "confidence": round(confidence, 4),
                 "reason": reason,
             },
-            "dimension_scores": {},
-            "text_base_dimension_scores": {},
+            "dimension_scores": dimension_scores,
+            "text_base_dimension_scores": dimension_scores,
             "speech_context": {},
-            "speech_adjustments": {},
-            "final_dimension_scores": {},
+            "speech_adjustments": {dim: 0.0 for dim in dimensions},
+            "final_dimension_scores": dimension_scores,
             "overall_score_base": overall_score,
             "overall_score_final": overall_score,
             "overall_score": overall_score,
@@ -526,6 +552,7 @@ class EvaluationService:
         question: str,
         answer: str,
         evaluation_version: Optional[str] = None,
+        force: bool = False,
     ) -> Dict[str, Any]:
         interview_id = str(interview_id or "").strip()
         turn_id = str(turn_id or "").strip()
@@ -567,7 +594,7 @@ class EvaluationService:
                 turn_id=payload["turn_id"],
                 evaluation_version=payload["evaluation_version"],
             )
-            if existing is not None:
+            if existing is not None and not force:
                 return {
                     "success": True,
                     "enqueued": False,
@@ -638,8 +665,26 @@ class EvaluationService:
                 return
 
             if layer1_result.get("status") == self.STATUS_SKIPPED:
-                layer2_result = self._build_partial_layer2_from_layer1(layer1_result, "第一层未命中可用 rubric，跳过第二层")
-                final_status = self.STATUS_SKIPPED
+                payload["rubric_version"] = str(layer1_result.get("rubric_version", "fallback_unknown") or "fallback_unknown")
+                layer2_result, retry_count_layer2, layer2_error_code, layer2_error_message = self._retry(
+                    lambda: self.evaluate_layer2(payload, layer1_result),
+                    max_retries=self.retry_layer2,
+                    error_prefix="LAYER2_FALLBACK",
+                )
+                if layer2_error_code or layer2_result is None or layer2_result.get("error"):
+                    layer2_result = self._build_partial_layer2_from_layer1(
+                        layer1_result,
+                        "第一层未命中可用 rubric，回退评分失败，已使用启发式文本评分",
+                        payload=payload,
+                    )
+                    final_status = self.STATUS_PARTIAL_OK
+                    final_error_code = layer2_error_code or str((layer2_result or {}).get("error", "")) or "LAYER2_FALLBACK_FAILED"
+                    final_error_message = layer2_error_message or str((layer2_result or {}).get("message", "")) or "第二层回退评估失败"
+                else:
+                    fallback_reason = str((layer1_result or {}).get("error_code") or "RUBRIC_NOT_FOUND")
+                    layer2_result["evaluation_mode"] = "layer2_without_layer1_rubric"
+                    layer2_result["evaluation_note"] = f"layer1 skipped: {fallback_reason}"
+                    final_status = self.STATUS_PARTIAL_OK
             else:
                 payload["rubric_version"] = str(layer1_result.get("rubric_version", "unknown") or "unknown")
                 layer2_result, retry_count_layer2, layer2_error_code, layer2_error_message = self._retry(
@@ -649,7 +694,7 @@ class EvaluationService:
                 )
                 if layer2_error_code or layer2_result is None or layer2_result.get("error"):
                     reason = layer2_error_message or str((layer2_result or {}).get("message", "")) or "第二层评估失败"
-                    layer2_result = self._build_partial_layer2_from_layer1(layer1_result, reason)
+                    layer2_result = self._build_partial_layer2_from_layer1(layer1_result, reason, payload=payload)
                     final_status = self.STATUS_PARTIAL_OK
                     final_error_code = layer2_error_code or str((layer2_result or {}).get("error", "")) or "LAYER2_FAILED"
                     final_error_message = reason

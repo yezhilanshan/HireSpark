@@ -4,12 +4,45 @@ import { useEffect, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import SocketClient from '@/lib/socket'
 import { useFacePhysRppg } from '@/lib/facephys/useFacePhysRppg'
-import { Home, FileText, Mic, Radar } from 'lucide-react'
+import { Mic, Loader2, ArrowRight, User, X, CheckCircle2, MessageSquare } from 'lucide-react'
+
+const BACKEND_API_BASE = (process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000').replace(/\/$/, '')
+const SERVER_ASR_ACTIVE_COOLDOWN_MS = 3200
+const SERVER_ASR_FALLBACK_DELAY_MS = 3200
+const SERVER_ASR_STALL_WINDOW_MS = 3200
+const SERVER_ASR_RECHECK_DELAY_MS = 1100
+const ENABLE_BROWSER_ASR_STALL_FALLBACK = false
+const ASR_DEBUG_PANEL_ENABLED = process.env.NEXT_PUBLIC_ASR_DEBUG_PANEL !== 'false'
+const ASR_DEBUG_MAX_ITEMS = 120
+const BASE_SILENCE_MS = 1650
+const BROWSER_SILENCE_BONUS_MS = 220
+const NOISY_ENV_SILENCE_BONUS_MS = 320
+const MIN_ADAPTIVE_SILENCE_MS = 1650
+const MAX_ADAPTIVE_SILENCE_MS = 2600
 
 interface ChatMessage {
     role: 'interviewer' | 'candidate'
     content: string
     timestamp: string
+}
+
+interface AsrDebugEvent {
+    event: string
+    level: string
+    timestamp: number
+    session_id?: string
+    turn_id?: string
+    source?: string
+    reason?: string
+    reason_detail?: string
+    asr_generation?: number | string
+    speech_epoch?: number | string
+    details?: string
+    partial_preview?: string
+    final_preview?: string
+    segment_preview?: string
+    answer_preview?: string
+    text_snapshot?: string
 }
 
 interface SpeechRecognitionAlternativeLike {
@@ -69,6 +102,8 @@ export default function InterviewPage() {
     const router = useRouter()
     const videoRef = useRef<HTMLVideoElement>(null)
     const cameraStreamRef = useRef<MediaStream | null>(null)
+    const microphoneStreamRef = useRef<MediaStream | null>(null)
+    const replayCaptureStreamRef = useRef<MediaStream | null>(null)
     const [socket, setSocket] = useState<SocketClient | null>(null)
 
     const [cameraReady, setCameraReady] = useState(false)
@@ -94,6 +129,8 @@ export default function InterviewPage() {
         segment_index: 0,
     })
     const [finalMetricsReady, setFinalMetricsReady] = useState(false)
+    const [asrDebugEvents, setAsrDebugEvents] = useState<AsrDebugEvent[]>([])
+    const [showAsrDebugPanel, setShowAsrDebugPanel] = useState(true)
     const [isProcessing, setIsProcessing] = useState(false)
     const [isVoiceSupported, setIsVoiceSupported] = useState(true)
     const [isBrowserAsrSupported, setIsBrowserAsrSupported] = useState(false)
@@ -102,6 +139,9 @@ export default function InterviewPage() {
     const [isListening, setIsListening] = useState(false)
     const [isAiSpeaking, setIsAiSpeaking] = useState(false)
     const [isRecording, setIsRecording] = useState(false)
+    const [sessionElapsed, setSessionElapsed] = useState(0)
+    const [showCompletionModal, setShowCompletionModal] = useState(false)
+    const [completedInterviewId, setCompletedInterviewId] = useState('')
 
     // 检测数据
     const interviewStartedRef = useRef(false)
@@ -113,6 +153,7 @@ export default function InterviewPage() {
     const currentTurnIdRef = useRef('')
     const interruptEpochRef = useRef(0)
     const activeTtsJobIdRef = useRef('')
+    const autoStartTriggeredRef = useRef(false)
     const pendingTtsTextRef = useRef('')
     const answerSessionIdRef = useRef('')
     const committedAnswerSessionIdsRef = useRef<Set<string>>(new Set())
@@ -120,12 +161,19 @@ export default function InterviewPage() {
     const speechActiveRef = useRef(false)
     const consecutiveSpeechFramesRef = useRef(0)
     const lastSpeechAtRef = useRef(0)
+    const clientSpeechEpochRef = useRef(0)
+    const activeSpeechEpochRef = useRef(0)
     const speechPrebufferRef = useRef<ArrayBuffer[]>([])
     const noFaceSinceRef = useRef<number | null>(null)
     const llmTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
     const pendingCommitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
     const audioContextRef = useRef<AudioContext | null>(null)
     const audioWorkletNodeRef = useRef<AudioWorkletNode | null>(null)
+    const videoRecorderRef = useRef<MediaRecorder | null>(null)
+    const videoUploadIdRef = useRef('')
+    const videoPartNoRef = useRef(0)
+    const videoMimeTypeRef = useRef('video/webm')
+    const videoFinalizeInFlightRef = useRef(false)
     const browserAsrRecognitionRef = useRef<SpeechRecognitionLike | null>(null)
     const browserAsrFallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
     const browserAsrActiveRef = useRef(false)
@@ -133,10 +181,14 @@ export default function InterviewPage() {
     const browserAsrFinalTextRef = useRef('')
     const browserAsrInterimTextRef = useRef('')
     const lastServerTranscriptAtRef = useRef(0)
+    const serverAsrMuteUntilRef = useRef(0)
+    const asrChannelRef = useRef<'none' | 'server' | 'browser'>('none')
+    const noiseFloorRef = useRef(0.004)
     const answerSessionStatusRef = useRef('idle')
     const asrLockedRef = useRef(false)
     const socketRef = useRef<SocketClient | null>(null)
     const chatScrollContainerRef = useRef<HTMLDivElement | null>(null)
+    const asrDebugScrollContainerRef = useRef<HTMLDivElement | null>(null)
     // TTS 音频播放
     const currentTtsAudioRef = useRef<HTMLAudioElement | null>(null)
     const currentTtsUrlRef = useRef<string | null>(null)
@@ -172,6 +224,222 @@ export default function InterviewPage() {
         speechPrebufferRef.current = []
     }
 
+    const clamp = (value: number, min: number, max: number) => {
+        return Math.min(max, Math.max(min, value))
+    }
+
+    const buildInterviewId = (sessionId: string) => {
+        const normalized = String(sessionId || '').trim()
+        if (!normalized) return ''
+        return `interview_${normalized}`
+    }
+
+    const initVideoUploadSession = async (sessionId: string, mimeType: string) => {
+        const interviewId = buildInterviewId(sessionId)
+        const res = await fetch(`${BACKEND_API_BASE}/api/interview/video/init`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                session_id: sessionId,
+                interview_id: interviewId,
+                mime_type: mimeType,
+            }),
+        })
+        const data = await res.json()
+        if (!res.ok || !data?.success || !data?.upload_id) {
+            throw new Error(data?.error || 'video upload init failed')
+        }
+        videoUploadIdRef.current = String(data.upload_id)
+        videoPartNoRef.current = 0
+    }
+
+    const uploadVideoChunk = async (chunkBlob: Blob) => {
+        const uploadId = videoUploadIdRef.current
+        if (!uploadId || !chunkBlob || chunkBlob.size <= 0) {
+            return
+        }
+        videoPartNoRef.current += 1
+        const form = new FormData()
+        form.append('upload_id', uploadId)
+        form.append('part_no', String(videoPartNoRef.current))
+        form.append('chunk', chunkBlob, `part_${videoPartNoRef.current}.bin`)
+
+        const res = await fetch(`${BACKEND_API_BASE}/api/interview/video/chunk`, {
+            method: 'POST',
+            body: form,
+        })
+        if (!res.ok) {
+            const data = await res.json().catch(() => ({}))
+            throw new Error(data?.error || 'video chunk upload failed')
+        }
+    }
+
+    const finalizeVideoUpload = async (sessionId: string) => {
+        if (videoFinalizeInFlightRef.current) return
+        const uploadId = videoUploadIdRef.current
+        if (!uploadId) return
+        videoFinalizeInFlightRef.current = true
+        try {
+            const interviewId = buildInterviewId(sessionId)
+            await fetch(`${BACKEND_API_BASE}/api/interview/video/finalize`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    upload_id: uploadId,
+                    interview_id: interviewId,
+                }),
+            })
+        } catch (error) {
+            console.warn('[Replay] finalize video upload failed:', error)
+        } finally {
+            videoUploadIdRef.current = ''
+            videoPartNoRef.current = 0
+            videoFinalizeInFlightRef.current = false
+        }
+    }
+
+    const startVideoRecording = async (sessionId: string) => {
+        if (typeof window === 'undefined' || !cameraStreamRef.current || !(window as any).MediaRecorder) {
+            return
+        }
+        if (videoRecorderRef.current) {
+            return
+        }
+
+        const cameraTrack = cameraStreamRef.current.getVideoTracks()[0]
+        if (!cameraTrack) {
+            console.warn('[Replay] missing camera track, skip recording')
+            return
+        }
+        const captureTracks: MediaStreamTrack[] = [cameraTrack.clone()]
+        const micTrack = microphoneStreamRef.current?.getAudioTracks?.()[0]
+        if (micTrack && micTrack.readyState === 'live') {
+            captureTracks.push(micTrack.clone())
+        }
+        const captureStream = new MediaStream(captureTracks)
+        replayCaptureStreamRef.current = captureStream
+
+        const preferredTypes = [
+            'video/webm;codecs=vp9,opus',
+            'video/webm;codecs=vp8,opus',
+            'video/webm',
+        ]
+        let mimeType = 'video/webm'
+        for (const candidate of preferredTypes) {
+            if ((window as any).MediaRecorder.isTypeSupported?.(candidate)) {
+                mimeType = candidate
+                break
+            }
+        }
+        videoMimeTypeRef.current = mimeType
+
+        try {
+            await initVideoUploadSession(sessionId, mimeType)
+        } catch (error) {
+            console.warn('[Replay] init video upload failed:', error)
+            captureStream.getTracks().forEach(track => track.stop())
+            replayCaptureStreamRef.current = null
+            return
+        }
+
+        try {
+            const recorder = new MediaRecorder(captureStream, { mimeType })
+            videoRecorderRef.current = recorder
+            recorder.ondataavailable = (event: BlobEvent) => {
+                if (!event.data || event.data.size <= 0) return
+                uploadVideoChunk(event.data).catch((error) => {
+                    console.warn('[Replay] upload video chunk failed:', error)
+                })
+            }
+            recorder.onerror = (event) => {
+                console.warn('[Replay] media recorder error:', event)
+            }
+            recorder.start(4000)
+            console.log('[Replay] video recording started')
+        } catch (error) {
+            console.warn('[Replay] start video recording failed:', error)
+            captureStream.getTracks().forEach(track => track.stop())
+            replayCaptureStreamRef.current = null
+            videoRecorderRef.current = null
+            videoUploadIdRef.current = ''
+            videoPartNoRef.current = 0
+        }
+    }
+
+    const stopVideoRecording = async (sessionId: string, finalize = true) => {
+        const recorder = videoRecorderRef.current
+        videoRecorderRef.current = null
+
+        if (recorder && recorder.state !== 'inactive') {
+            await new Promise<void>((resolve) => {
+                const done = () => resolve()
+                recorder.onstop = done
+                try {
+                    recorder.stop()
+                } catch (_error) {
+                    resolve()
+                }
+            })
+        }
+        if (replayCaptureStreamRef.current) {
+            replayCaptureStreamRef.current.getTracks().forEach(track => track.stop())
+            replayCaptureStreamRef.current = null
+        }
+
+        if (finalize && sessionId) {
+            await finalizeVideoUpload(sessionId)
+        } else if (!finalize) {
+            videoUploadIdRef.current = ''
+            videoPartNoRef.current = 0
+        }
+    }
+
+    const normalizeTranscript = (value: string) => {
+        return value.replace(/\s+/g, ' ').trim()
+    }
+
+    const squashStutterText = (value: string) => {
+        return normalizeTranscript(value)
+    }
+
+    const mergeTranscriptWithDedup = (existingText: string, incomingText: string) => {
+        const existing = squashStutterText(existingText)
+        const incoming = squashStutterText(incomingText)
+
+        if (!incoming) {
+            return existing
+        }
+        if (!existing) {
+            return incoming
+        }
+        if (existing.endsWith(incoming)) {
+            return existing
+        }
+        if (incoming.startsWith(existing)) {
+            return incoming
+        }
+        if (incoming.length >= 4 && existing.includes(incoming)) {
+            return existing
+        }
+
+        const maxOverlap = Math.min(32, existing.length, incoming.length)
+        for (let overlap = maxOverlap; overlap >= 3; overlap--) {
+            if (existing.slice(-overlap) === incoming.slice(0, overlap)) {
+                return `${existing}${incoming.slice(overlap)}`.trim()
+            }
+        }
+
+        const needsSpace = /[A-Za-z0-9]$/.test(existing) && /^[A-Za-z0-9]/.test(incoming)
+        return `${existing}${needsSpace ? ' ' : ''}${incoming}`.trim()
+    }
+
+    const markServerTranscriptActive = (cooldownMs = SERVER_ASR_ACTIVE_COOLDOWN_MS) => {
+        const now = Date.now()
+        lastServerTranscriptAtRef.current = now
+        serverAsrMuteUntilRef.current = now + cooldownMs
+        asrChannelRef.current = 'server'
+    }
+
     const enqueueSpeechPrebuffer = (buffer: ArrayBuffer, maxChunks = 6) => {
         speechPrebufferRef.current.push(buffer)
         if (speechPrebufferRef.current.length > maxChunks) {
@@ -183,6 +451,12 @@ export default function InterviewPage() {
         isServerAsrAvailableRef.current = available
         setIsServerAsrAvailable(available)
         setAsrStatusMessage(message)
+        if (!available) {
+            serverAsrMuteUntilRef.current = 0
+            if (asrChannelRef.current === 'server') {
+                asrChannelRef.current = 'none'
+            }
+        }
     }
 
     const setBrowserAsrAvailability = (available: boolean, message = '') => {
@@ -221,6 +495,10 @@ export default function InterviewPage() {
         answerSessionIdRef.current = ''
         committedAnswerSessionIdsRef.current.clear()
         asrLockedRef.current = false
+        asrChannelRef.current = 'none'
+        serverAsrMuteUntilRef.current = 0
+        browserAsrFinalTextRef.current = ''
+        browserAsrInterimTextRef.current = ''
         setAnswerSessionStatus('idle')
         setFinalMetricsReady(false)
         setSpeechRealtimeMetrics({
@@ -331,6 +609,7 @@ export default function InterviewPage() {
             || !isRecordingRef.current
             || isAiSpeakingRef.current
             || isAnswerAsrLocked()
+            || (isServerAsrAvailableRef.current && Date.now() < serverAsrMuteUntilRef.current)
         ) {
             return
         }
@@ -353,6 +632,7 @@ export default function InterviewPage() {
             recognition.onstart = () => {
                 browserAsrActiveRef.current = true
                 browserAsrStopRequestedRef.current = false
+                asrChannelRef.current = 'browser'
                 console.warn('[ASR] 已切换到浏览器语音识别')
             }
             recognition.onresult = (event: SpeechRecognitionEventLike) => {
@@ -366,15 +646,15 @@ export default function InterviewPage() {
                         continue
                     }
                     if (result.isFinal) {
-                        nextFinal = `${nextFinal} ${transcript}`.trim()
+                        nextFinal = mergeTranscriptWithDedup(nextFinal, transcript)
                     } else {
-                        nextInterim = `${nextInterim} ${transcript}`.trim()
+                        nextInterim = mergeTranscriptWithDedup(nextInterim, transcript)
                     }
                 }
 
                 browserAsrFinalTextRef.current = nextFinal
                 browserAsrInterimTextRef.current = nextInterim
-                const mergedText = [nextFinal, nextInterim].filter(Boolean).join(' ').trim()
+                const mergedText = mergeTranscriptWithDedup(nextFinal, nextInterim)
                 if (!mergedText) {
                     return
                 }
@@ -413,6 +693,7 @@ export default function InterviewPage() {
                     && interviewStartedRef.current
                     && isRecordingRef.current
                     && !isAiSpeakingRef.current
+                    && (!isServerAsrAvailableRef.current || Date.now() >= serverAsrMuteUntilRef.current)
                 ) {
                     setTimeout(() => {
                         startBrowserSpeechRecognition()
@@ -430,7 +711,7 @@ export default function InterviewPage() {
         }
     }
 
-    const scheduleBrowserAsrFallback = () => {
+    const scheduleBrowserAsrFallback = (delayOverrideMs?: number) => {
         clearBrowserAsrFallbackTimer()
         if (
             !isBrowserAsrSupportedRef.current
@@ -441,18 +722,68 @@ export default function InterviewPage() {
         ) {
             return
         }
+        if (isServerAsrAvailableRef.current && !ENABLE_BROWSER_ASR_STALL_FALLBACK) {
+            return
+        }
 
-        const delay = isServerAsrAvailableRef.current ? 1600 : 120
+        const delay = typeof delayOverrideMs === 'number'
+            ? delayOverrideMs
+            : (isServerAsrAvailableRef.current ? SERVER_ASR_FALLBACK_DELAY_MS : 180)
         browserAsrFallbackTimerRef.current = setTimeout(() => {
-            const noServerTranscript = Date.now() - lastServerTranscriptAtRef.current > 1200
-            if (!isServerAsrAvailableRef.current || noServerTranscript) {
+            if (!interviewStartedRef.current || !isRecordingRef.current || isAiSpeakingRef.current || isAnswerAsrLocked()) {
+                return
+            }
+            const now = Date.now()
+            const noServerTranscript = now - lastServerTranscriptAtRef.current > SERVER_ASR_STALL_WINDOW_MS
+            const mutualExclusionPassed = now >= serverAsrMuteUntilRef.current
+            const shouldFallbackToBrowser = !isServerAsrAvailableRef.current || (
+                ENABLE_BROWSER_ASR_STALL_FALLBACK
+                && noServerTranscript
+                && mutualExclusionPassed
+            )
+            if (shouldFallbackToBrowser) {
+                if (
+                    socketRef.current
+                    && isServerAsrAvailableRef.current
+                    && asrChannelRef.current === 'server'
+                    && activeSpeechEpochRef.current > 0
+                    && sessionIdRef.current
+                ) {
+                    socketRef.current.emit('speech_end', {
+                        session_id: sessionIdRef.current,
+                        turn_id: currentTurnIdRef.current,
+                        speech_epoch: activeSpeechEpochRef.current
+                    })
+                    activeSpeechEpochRef.current = 0
+                }
+                asrChannelRef.current = 'browser'
                 startBrowserSpeechRecognition()
+                return
+            }
+
+            if (
+                isServerAsrAvailableRef.current
+                && speechActiveRef.current
+                && asrChannelRef.current === 'server'
+                && !browserAsrActiveRef.current
+            ) {
+                scheduleBrowserAsrFallback(SERVER_ASR_RECHECK_DELAY_MS)
             }
         }, delay)
     }
 
     useEffect(() => {
         interviewStartedRef.current = interviewStarted
+    }, [interviewStarted])
+
+    useEffect(() => {
+        if (!interviewStarted) {
+            return
+        }
+        const interval = setInterval(() => {
+            setSessionElapsed(prev => prev + 1)
+        }, 1000)
+        return () => clearInterval(interval)
     }, [interviewStarted])
 
     useEffect(() => {
@@ -487,6 +818,20 @@ export default function InterviewPage() {
             behavior: 'smooth'
         })
     }, [chatMessages])
+
+    useEffect(() => {
+        if (!showAsrDebugPanel) {
+            return
+        }
+        const panel = asrDebugScrollContainerRef.current
+        if (!panel) {
+            return
+        }
+        panel.scrollTo({
+            top: panel.scrollHeight,
+            behavior: 'smooth',
+        })
+    }, [asrDebugEvents, showAsrDebugPanel])
 
     useEffect(() => {
         if (!videoRef.current || !cameraStreamRef.current) {
@@ -532,6 +877,7 @@ export default function InterviewPage() {
             clearLlmTimeout()
             clearPendingCommit()
             stopCurrentTts()
+            void stopVideoRecording(sessionIdRef.current, false)
             cleanupAudioRecording()
             stopBrowserSpeechRecognition(true)
             stopCamera()
@@ -567,7 +913,7 @@ export default function InterviewPage() {
         } catch (error) {
             console.error('Camera error:', error)
             alert('Camera access denied')
-            router.push('/')
+            router.push('/dashboard')
         }
     }
 
@@ -675,6 +1021,7 @@ export default function InterviewPage() {
                     autoGainControl: true
                 }
             })
+            microphoneStreamRef.current = stream
 
             const audioContext = new AudioContext({ sampleRate: 16000 })
             const source = audioContext.createMediaStreamSource(stream)
@@ -713,24 +1060,39 @@ export default function InterviewPage() {
                     const pcmData = (event.data.audio as ArrayBuffer).slice(0)
                     const rms = Number(event.data.rms || 0)
                     const now = performance.now()
-                    const speechThreshold = speechActiveRef.current ? 0.010 : 0.020
+                    if (!speechActiveRef.current) {
+                        noiseFloorRef.current = clamp(
+                            noiseFloorRef.current * 0.92 + rms * 0.08,
+                            0.0015,
+                            0.03
+                        )
+                    }
+
+                    const activationThreshold = clamp(noiseFloorRef.current * 2.8, 0.012, 0.045)
+                    const holdThreshold = clamp(noiseFloorRef.current * 1.9, 0.008, 0.032)
+                    const speechThreshold = speechActiveRef.current ? holdThreshold : activationThreshold
                     const isSpeechChunk = rms >= speechThreshold
+                    const requiredSpeechFrames = rms >= activationThreshold * 1.35 ? 2 : 3
                     enqueueSpeechPrebuffer(pcmData)
 
                     if (isSpeechChunk) {
                         consecutiveSpeechFramesRef.current += 1
                         lastSpeechAtRef.current = now
-                        if (!speechActiveRef.current && consecutiveSpeechFramesRef.current >= 3) {
+                        if (!speechActiveRef.current && consecutiveSpeechFramesRef.current >= requiredSpeechFrames) {
                             speechActiveRef.current = true
                             clearPendingCommit()
                             browserAsrFinalTextRef.current = ''
                             browserAsrInterimTextRef.current = ''
-                            lastServerTranscriptAtRef.current = 0
+                            lastServerTranscriptAtRef.current = Date.now()
+                            clientSpeechEpochRef.current += 1
+                            activeSpeechEpochRef.current = clientSpeechEpochRef.current
                             const prebufferChunks = [...speechPrebufferRef.current]
                             if (isServerAsrAvailableRef.current) {
+                                asrChannelRef.current = 'server'
                                 socketRef.current.emit('speech_start', {
                                     session_id: sessionIdRef.current,
-                                    turn_id: currentTurnIdRef.current
+                                    turn_id: currentTurnIdRef.current,
+                                    speech_epoch: activeSpeechEpochRef.current
                                 })
                                 for (const chunk of prebufferChunks) {
                                     socketRef.current.emit('audio_chunk', {
@@ -739,6 +1101,9 @@ export default function InterviewPage() {
                                         audio: arrayBufferToBase64(chunk)
                                     })
                                 }
+                            } else {
+                                asrChannelRef.current = 'browser'
+                                startBrowserSpeechRecognition()
                             }
                             scheduleBrowserAsrFallback()
                             clearSpeechPrebuffer()
@@ -748,20 +1113,30 @@ export default function InterviewPage() {
                         consecutiveSpeechFramesRef.current = 0
                     }
 
-                    if (speechActiveRef.current && now - lastSpeechAtRef.current >= 900) {
+                    const adaptiveSilenceMs = clamp(
+                        BASE_SILENCE_MS
+                        + (browserAsrActiveRef.current ? BROWSER_SILENCE_BONUS_MS : 0)
+                        + (noiseFloorRef.current > 0.012 ? NOISY_ENV_SILENCE_BONUS_MS : 0),
+                        MIN_ADAPTIVE_SILENCE_MS,
+                        MAX_ADAPTIVE_SILENCE_MS
+                    )
+                    if (speechActiveRef.current && now - lastSpeechAtRef.current >= adaptiveSilenceMs) {
                         speechActiveRef.current = false
-                        if (isServerAsrAvailableRef.current) {
+                        if (isServerAsrAvailableRef.current && asrChannelRef.current === 'server' && activeSpeechEpochRef.current > 0) {
                             socketRef.current.emit('speech_end', {
                                 session_id: sessionIdRef.current,
-                                turn_id: currentTurnIdRef.current
+                                turn_id: currentTurnIdRef.current,
+                                speech_epoch: activeSpeechEpochRef.current
                             })
                         }
+                        activeSpeechEpochRef.current = 0
+                        asrChannelRef.current = 'none'
                         stopBrowserSpeechRecognition()
                         clearSpeechPrebuffer()
                     }
 
                     // 只在检测到用户说话时上传音频，避免长时间静音导致服务端 ASR 会话超时。
-                    const shouldSendAudio = speechActiveRef.current && isServerAsrAvailableRef.current
+                    const shouldSendAudio = speechActiveRef.current && isServerAsrAvailableRef.current && asrChannelRef.current === 'server'
                     if (!shouldSendAudio) {
                         return
                     }
@@ -822,6 +1197,7 @@ export default function InterviewPage() {
         }
 
         isRecordingRef.current = true
+        asrChannelRef.current = 'none'
         setIsRecording(true)
         setIsListening(true)
         console.log('[ASR] 开始录音')
@@ -834,8 +1210,25 @@ export default function InterviewPage() {
         clearPendingCommit()
         clearBrowserAsrFallbackTimer()
         stopBrowserSpeechRecognition()
+
+        if (
+            socketRef.current
+            && sessionIdRef.current
+            && isServerAsrAvailableRef.current
+            && asrChannelRef.current === 'server'
+            && activeSpeechEpochRef.current > 0
+        ) {
+            socketRef.current.emit('speech_end', {
+                session_id: sessionIdRef.current,
+                turn_id: currentTurnIdRef.current,
+                speech_epoch: activeSpeechEpochRef.current
+            })
+        }
+
         speechActiveRef.current = false
         consecutiveSpeechFramesRef.current = 0
+        activeSpeechEpochRef.current = 0
+        asrChannelRef.current = 'none'
         clearSpeechPrebuffer()
         isRecordingRef.current = false
         setIsRecording(false)
@@ -852,6 +1245,10 @@ export default function InterviewPage() {
         if (audioContextRef.current) {
             audioContextRef.current.close()
             audioContextRef.current = null
+        }
+        if (microphoneStreamRef.current) {
+            microphoneStreamRef.current.getTracks().forEach(track => track.stop())
+            microphoneStreamRef.current = null
         }
     }
 
@@ -870,6 +1267,7 @@ export default function InterviewPage() {
             socketClient.off('speech_metrics_realtime')
             socketClient.off('asr_partial')
             socketClient.off('asr_final')
+            socketClient.off('asr_debug')
             socketClient.off('tts_chunk')
             socketClient.off('tts_stop')
             socketClient.off('session_control_notice')
@@ -878,6 +1276,9 @@ export default function InterviewPage() {
             socketClient.off('interview_ended')
 
             socketClient.on('orchestrator_state', (data: any) => {
+                if (sessionIdRef.current && data?.session_id && data.session_id !== sessionIdRef.current) {
+                    return
+                }
                 if (data?.session_id) {
                     sessionIdRef.current = data.session_id
                 }
@@ -924,6 +1325,7 @@ export default function InterviewPage() {
                     startAudioRecording()
                 }
                 if (mode === 'ended') {
+                    void stopVideoRecording(sessionIdRef.current, true)
                     interviewStartedRef.current = false
                     setInterviewStarted(false)
                     stopCurrentTts()
@@ -935,7 +1337,8 @@ export default function InterviewPage() {
                 console.log('Dialog reply:', data)
                 clearLlmTimeout()
                 if (!data?.display_text || !data?.session_id) return
-                if (sessionIdRef.current && data.session_id !== sessionIdRef.current) return
+                if (!interviewStartedRef.current) return
+                if (!sessionIdRef.current || data.session_id !== sessionIdRef.current) return
                 if (typeof data?.interrupt_epoch === 'number' && data.interrupt_epoch < interruptEpochRef.current) return
 
                 if (data.session_id) {
@@ -968,8 +1371,9 @@ export default function InterviewPage() {
                     answerSessionIdRef.current = answerSessionId
                 }
 
-                if (data?.display_text || data?.final_text || data?.live_text || data?.merged_text_draft) {
-                    lastServerTranscriptAtRef.current = Date.now()
+                const allowServerTranscript = asrChannelRef.current !== 'browser'
+                if ((data?.display_text || data?.final_text || data?.live_text || data?.merged_text_draft) && allowServerTranscript) {
+                    markServerTranscriptActive()
                     if (browserAsrActiveRef.current) {
                         stopBrowserSpeechRecognition()
                     }
@@ -987,7 +1391,7 @@ export default function InterviewPage() {
                 }
 
                 const displayText = data?.display_text || data?.final_text || data?.live_text || data?.merged_text_draft || ''
-                if (typeof displayText === 'string') {
+                if (typeof displayText === 'string' && asrChannelRef.current !== 'browser') {
                     setUserAnswer(displayText)
                 }
 
@@ -1018,12 +1422,15 @@ export default function InterviewPage() {
                 if (!data?.session_id || data.session_id !== sessionIdRef.current) return
                 if (data?.turn_id && currentTurnIdRef.current && data.turn_id !== currentTurnIdRef.current) return
                 if (typeof data?.interrupt_epoch === 'number' && data.interrupt_epoch < interruptEpochRef.current) return
-                lastServerTranscriptAtRef.current = Date.now()
-                if (browserAsrActiveRef.current) {
+                if (asrChannelRef.current !== 'browser') {
+                    markServerTranscriptActive()
+                }
+                if (browserAsrActiveRef.current && asrChannelRef.current !== 'browser') {
                     stopBrowserSpeechRecognition()
                 }
-                if (!answerSessionIdRef.current && data?.text) {
-                    setUserAnswer(data.text)
+                const partialDisplayText = data?.full_text || data?.text || ''
+                if (!answerSessionIdRef.current && partialDisplayText && asrChannelRef.current !== 'browser') {
+                    setUserAnswer(normalizeTranscript(partialDisplayText))
                 }
             })
 
@@ -1031,13 +1438,50 @@ export default function InterviewPage() {
                 if (!data?.session_id || data.session_id !== sessionIdRef.current) return
                 if (data?.turn_id && currentTurnIdRef.current && data.turn_id !== currentTurnIdRef.current) return
                 if (typeof data?.interrupt_epoch === 'number' && data.interrupt_epoch < interruptEpochRef.current) return
-                lastServerTranscriptAtRef.current = Date.now()
-                if (browserAsrActiveRef.current) {
+                if (asrChannelRef.current !== 'browser') {
+                    markServerTranscriptActive()
+                }
+                if (browserAsrActiveRef.current && asrChannelRef.current !== 'browser') {
                     stopBrowserSpeechRecognition()
                 }
-                if (!answerSessionIdRef.current && (data?.full_text || data?.text)) {
-                    setUserAnswer(data.full_text || data.text)
+                const finalDisplayText = data?.full_text || data?.preview_text || data?.text || ''
+                if (!answerSessionIdRef.current && finalDisplayText && asrChannelRef.current !== 'browser') {
+                    setUserAnswer(normalizeTranscript(finalDisplayText))
                 }
+            })
+
+            socketClient.on('asr_debug', (data: any) => {
+                if (!ASR_DEBUG_PANEL_ENABLED) return
+                if (!data?.session_id || data.session_id !== sessionIdRef.current) return
+                if (data?.turn_id && currentTurnIdRef.current && data.turn_id !== currentTurnIdRef.current) return
+                if (typeof data?.interrupt_epoch === 'number' && data.interrupt_epoch < interruptEpochRef.current) return
+
+                const item: AsrDebugEvent = {
+                    event: String(data?.event || '').trim() || 'asr_event',
+                    level: String(data?.level || 'info').trim() || 'info',
+                    timestamp: Number(data?.timestamp || Date.now() / 1000),
+                    session_id: data?.session_id || '',
+                    turn_id: data?.turn_id || '',
+                    source: data?.source || '',
+                    reason: data?.reason || '',
+                    reason_detail: data?.reason_detail || '',
+                    asr_generation: data?.asr_generation ?? '',
+                    speech_epoch: data?.speech_epoch ?? '',
+                    details: data?.details || '',
+                    partial_preview: data?.partial_preview || '',
+                    final_preview: data?.final_preview || '',
+                    segment_preview: data?.segment_preview || '',
+                    answer_preview: data?.answer_preview || '',
+                    text_snapshot: data?.text_snapshot || '',
+                }
+
+                setAsrDebugEvents((prev) => {
+                    const next = [...prev, item]
+                    if (next.length <= ASR_DEBUG_MAX_ITEMS) {
+                        return next
+                    }
+                    return next.slice(next.length - ASR_DEBUG_MAX_ITEMS)
+                })
             })
 
             socketClient.on('tts_chunk', (data: any) => {
@@ -1141,6 +1585,10 @@ export default function InterviewPage() {
             socketClient.on('interview_ended', (data: any) => {
                 if (data?.session_id && sessionIdRef.current && data.session_id !== sessionIdRef.current) return
                 console.log('Interview ended:', data)
+                const endedSessionId = String(data?.session_id || sessionIdRef.current || '').trim()
+                const endedInterviewId = String(data?.interview_id || buildInterviewId(endedSessionId)).trim()
+                void stopVideoRecording(endedSessionId, true)
+                setCompletedInterviewId(endedInterviewId)
                 interviewStartedRef.current = false
                 setInterviewStarted(false)
                 sessionIdRef.current = ''
@@ -1149,98 +1597,18 @@ export default function InterviewPage() {
                 activeTtsJobIdRef.current = ''
                 resetAnswerSessionUi()
                 stopAudioRecording()
-
-                // 创建自定义弹窗
-                const modal = document.createElement('div')
-                modal.className = 'fixed inset-0 bg-black/70 backdrop-blur-md flex items-center justify-center z-50 animate-fade-in p-4'
-                modal.innerHTML = `
-                    <div class="bg-gradient-to-br from-white via-blue-50 to-indigo-100 dark:from-gray-800 dark:via-gray-850 dark:to-gray-900 rounded-3xl shadow-2xl max-w-lg w-full mx-4 border-2 border-blue-200 dark:border-gray-600 animate-scale-up overflow-hidden">
-                        <!-- 装饰性顶部 -->
-                        <div class="h-2 bg-gradient-to-r from-green-400 via-blue-500 to-purple-600"></div>
-
-                        <!-- 主要内容 -->
-                        <div class="p-10">
-                            <div class="text-center mb-8">
-                                <!-- 成功图标 -->
-                                <div class="relative inline-block mb-6">
-                                    <div class="w-28 h-28 bg-gradient-to-br from-green-400 to-green-600 rounded-full mx-auto flex items-center justify-center shadow-2xl animate-bounce-slow">
-                                        <svg class="w-16 h-16 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7"></path>
-                                        </svg>
-                                    </div>
-                                    <!-- 光环效果 -->
-                                    <div class="absolute inset-0 w-28 h-28 mx-auto bg-green-400 rounded-full opacity-20 animate-ping"></div>
-                                </div>
-
-                                <!-- 标题 -->
-                                <h3 class="text-4xl font-black text-transparent bg-clip-text bg-gradient-to-r from-blue-600 to-purple-600 dark:from-blue-400 dark:to-purple-400 mb-3">
-                                    分析完成！
-                                </h3>
-                                <p class="text-lg text-gray-600 dark:text-gray-400">本次会话洞察已生成</p>
-
-                                <!-- 分隔线 -->
-                                <div class="mt-6 mb-8 flex items-center justify-center gap-3">
-                                    <div class="h-px w-16 bg-gradient-to-r from-transparent to-blue-400"></div>
-                                    <div class="w-2 h-2 rounded-full bg-blue-400"></div>
-                                    <div class="h-px w-16 bg-gradient-to-l from-transparent to-blue-400"></div>
-                                </div>
-                            </div>
-
-                            <!-- 信息卡片 -->
-                            <div class="bg-white dark:bg-gray-800 rounded-2xl p-6 mb-8 shadow-lg border border-gray-200 dark:border-gray-700">
-                                <div class="flex items-center justify-center gap-4 text-center">
-                                    <div class="flex-1">
-                                        <div class="inline-flex items-center justify-center w-12 h-12 bg-blue-100 dark:bg-blue-900/30 rounded-full mb-2">
-                                            <svg class="w-6 h-6 text-blue-600 dark:text-blue-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                                            </svg>
-                                        </div>
-                                        <p class="text-xs text-gray-500 dark:text-gray-400 font-semibold uppercase tracking-wide">状态</p>
-                                        <p class="text-sm font-bold text-green-600 dark:text-green-400 mt-1">已完成</p>
-                                    </div>
-                                    <div class="w-px h-12 bg-gray-300 dark:bg-gray-600"></div>
-                                    <div class="flex-1">
-                                        <div class="inline-flex items-center justify-center w-12 h-12 bg-purple-100 dark:bg-purple-900/30 rounded-full mb-2">
-                                            <svg class="w-6 h-6 text-purple-600 dark:text-purple-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
-                                            </svg>
-                                        </div>
-                                        <p class="text-xs text-gray-500 dark:text-gray-400 font-semibold uppercase tracking-wide">报告</p>
-                                        <p class="text-sm font-bold text-purple-600 dark:text-purple-400 mt-1">报告已生成</p>
-                                    </div>
-                                </div>
-                            </div>
-                            
-                            <!-- 按钮 -->
-                            <button 
-                                onclick="this.closest('.fixed').remove(); window.location.href='/report'" 
-                                class="group relative w-full bg-gradient-to-r from-blue-600 via-blue-500 to-indigo-600 hover:from-blue-700 hover:via-blue-600 hover:to-indigo-700 text-white font-bold py-5 px-8 rounded-2xl transition-all duration-300 transform hover:scale-105 shadow-2xl hover:shadow-blue-500/50 overflow-hidden"
-                            >
-                                <span class="relative z-10 flex items-center justify-center gap-3 text-lg">
-                                    查看洞察
-                                    <svg class="w-5 h-5 transform group-hover:translate-x-1 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path>
-                                    </svg>
-                                </span>
-                                <!-- 动画光效 -->
-                                <div class="absolute inset-0 bg-gradient-to-r from-transparent via-white/20 to-transparent transform -skew-x-12 translate-x-full group-hover:translate-x-[-200%] transition-transform duration-1000"></div>
-                            </button>
-                        </div>
-                    </div>
-                `
-                document.body.appendChild(modal)
+                setShowCompletionModal(true)
             })
         } catch (error) {
             console.error('Socket connection error:', error)
             alert('Failed to connect to server')
-            router.push('/')
+            router.push('/dashboard')
         }
     }
 
-    const handleStartInterview = () => {
-        if (!socket) return
-
-        socketRef.current = socket
+    const startInterviewSession = (socketClient: SocketClient) => {
+        socketRef.current = socketClient
+        setShowCompletionModal(false)
         clearLlmTimeout()
         clearPendingCommit()
         stopCurrentTts()
@@ -1251,17 +1619,26 @@ export default function InterviewPage() {
         currentTurnIdRef.current = ''
         interruptEpochRef.current = 0
         activeTtsJobIdRef.current = ''
+        clientSpeechEpochRef.current = 0
+        activeSpeechEpochRef.current = 0
         speechActiveRef.current = false
+        asrChannelRef.current = 'none'
+        noiseFloorRef.current = 0.004
+        serverAsrMuteUntilRef.current = 0
         clearSpeechPrebuffer()
         setServerAsrAvailability(true)
         resetAnswerSessionUi()
         interviewStartedRef.current = true
         setInterviewStarted(true)
+        setSessionElapsed(0)
         setChatMessages([])
+        setAsrDebugEvents([])
         setCurrentQuestion('')
         setUserAnswer('')
+        setCompletedInterviewId('')
+        void startVideoRecording(sessionId)
 
-        socket.emit('session_start', {
+        socketClient.emit('session_start', {
             session_id: sessionId,
             round_type: interviewConfig.round,
             position: interviewConfig.position,
@@ -1270,20 +1647,59 @@ export default function InterviewPage() {
         })
     }
 
-    const handleEndInterview = () => {
+    const handleStartInterview = () => {
+        if (!socket) return
+        startInterviewSession(socket)
+    }
+
+    useEffect(() => {
+        if (!cameraReady || !socket || interviewStarted || showCompletionModal || autoStartTriggeredRef.current) {
+            return
+        }
+
+        autoStartTriggeredRef.current = true
+        startInterviewSession(socket)
+    }, [cameraReady, socket, interviewStarted, showCompletionModal])
+
+    const handleEndInterview = async () => {
         if (!socket || !sessionIdRef.current) return
+        const endedSessionId = sessionIdRef.current
+        const pendingUploadId = videoUploadIdRef.current
+        const endedInterviewId = buildInterviewId(endedSessionId)
         clearLlmTimeout()
         clearPendingCommit()
         stopCurrentTts()
         stopAudioRecording()
         speechActiveRef.current = false
         clearSpeechPrebuffer()
+        await stopVideoRecording(endedSessionId, true)
         interviewStartedRef.current = false
         setInterviewStarted(false)
+        setSessionElapsed(0)
         resetAnswerSessionUi()
-        socket.emit('session_end', { session_id: sessionIdRef.current })
+        setCompletedInterviewId(endedInterviewId)
+        socket.emit('session_end', {
+            session_id: endedSessionId,
+            video_upload_id: pendingUploadId || '',
+        })
         setUserAnswer('')
         socketRef.current = null
+    }
+
+    const closeCompletionModal = () => {
+        setShowCompletionModal(false)
+    }
+
+    const gotoCompletionTarget = (target: '/' | '/replay' | '/review' | '/report') => {
+        setShowCompletionModal(false)
+        if (target === '/') {
+            router.push(target)
+            return
+        }
+        const query = completedInterviewId
+            ? `?interviewId=${encodeURIComponent(completedInterviewId)}`
+            : ''
+        router.push(`${target}${query}`)
     }
 
     const handleSubmitAnswer = (forcedAnswer?: string) => {
@@ -1318,49 +1734,21 @@ export default function InterviewPage() {
     }
 
     const voiceInputEnabled = isVoiceSupported && (isServerAsrAvailable || isBrowserAsrSupported)
-    const realtimePauseSeconds = (speechRealtimeMetrics.silence_ms / 1000).toFixed(1)
-    const realtimeWpmText = speechRealtimeMetrics.rough_wpm > 0
-        ? `${speechRealtimeMetrics.rough_wpm.toFixed(1)} token/min`
-        : '--'
-    const voiceStatusText = !voiceInputEnabled
-        ? (isVoiceSupported
+    const autoRecordStatus = !voiceInputEnabled
+        ? (asrStatusMessage || (isVoiceSupported
             ? '语音识别当前不可用，请使用下方文本框继续回答。'
-            : '当前浏览器无法录音，请使用下方文本框回答。')
+            : '当前浏览器无法录音，请使用下方文本框回答。'))
         : isAiSpeaking
-            ? '面试官正在提问，请聆听...'
+            ? '面试官发言中，录音已自动暂停'
             : isProcessing
-                ? '正在分析你的回答并生成下一问...'
+                ? '正在处理你的回答...'
                 : answerSessionStatus === 'finalizing'
-                    ? '当前回答整理中，正在生成终稿...'
-                    : answerSessionStatus === 'paused_short'
-                        ? '检测到短暂停顿，继续说话会自动并入同一题回答。'
-                        : isListening
-                            ? (isServerAsrAvailable
-                                ? 'ASR 语音识别中，直接说话即可...'
-                                : '浏览器语音识别中，直接说话即可...')
-                            : (isServerAsrAvailable
-                                ? 'ASR 识别服务已启动'
-                                : '浏览器语音识别已启动')
-    const answerPanelTitle = !voiceInputEnabled
-        ? '你的回答'
-        : answerSessionStatus === 'recording'
-            ? '当前回答（实时识别中）'
-            : answerSessionStatus === 'paused_short'
-                ? '当前回答（短暂停顿）'
-                : answerSessionStatus === 'finalizing'
-                    ? '当前回答（整理中）'
-                    : answerSessionStatus === 'finalized'
-                        ? '最终回答'
-                        : '你的回答'
-    const answerPanelHint = !voiceInputEnabled
-        ? '当前为文字回答模式'
-        : answerSessionStatus === 'finalizing'
-            ? '系统正在把同一题下的多个语音分段整理成完整回答'
-            : answerSessionStatus === 'paused_short'
-                ? '这一小段停顿不会提交给面试官，继续说会自动续写'
-                : finalMetricsReady
-                    ? '终稿指标已就绪（语速/停顿/口头禅/流畅度/清晰度代理）'
-                    : '语音转写会同步显示，可直接编辑后提交'
+                    ? '当前回答整理中，稍候会自动续录'
+                : answerSessionStatus === 'paused_short'
+                    ? '检测到停顿，继续说话会自动并入同一题回答'
+                    : (isRecording || isListening)
+                        ? '录音自动进行中'
+                        : '等待你开始回答，系统将自动录音'
 
     useEffect(() => {
         if (!cameraReady || !socket || !interviewStarted || !sessionIdRef.current) return
@@ -1432,313 +1820,368 @@ export default function InterviewPage() {
         rppgMetrics.status
     ])
 
-    const getRppgStatusLabel = () => {
-        if (rppgMetrics.status === 'loading') return '心率模型加载中'
-        if (rppgMetrics.status === 'tracking') return '采集中'
-        if (rppgMetrics.status === 'unstable') return '信号不稳定'
-        if (rppgMetrics.status === 'no_face') return '未检测到人脸'
-        if (rppgMetrics.status === 'error') return '心率初始化失败'
-        return '等待开始'
+    const difficultyText = interviewConfig.difficulty === 'easy'
+        ? '简单'
+        : interviewConfig.difficulty === 'medium'
+            ? '中等'
+            : '困难'
+    const displayQuestion = currentQuestion || '面试官正在准备下一道问题，请稍候。'
+    const formatTime = (seconds: number) => {
+        const minutes = Math.floor(seconds / 60).toString().padStart(2, '0')
+        const restSeconds = (seconds % 60).toString().padStart(2, '0')
+        return `${minutes}:${restSeconds}`
     }
-
-    const getRppgStatusClass = () => {
-        if (rppgMetrics.status === 'tracking') return 'bg-emerald-500/20 text-emerald-200 border-emerald-400/40'
-        if (rppgMetrics.status === 'unstable') return 'bg-amber-500/20 text-amber-100 border-amber-300/40'
-        if (rppgMetrics.status === 'error') return 'bg-red-500/20 text-red-100 border-red-300/40'
-        return 'bg-slate-800/70 text-slate-100 border-white/15'
+    const formatDebugTime = (timestamp: number) => {
+        const msTs = timestamp > 1e12 ? timestamp : timestamp * 1000
+        const date = new Date(msTs)
+        return date.toLocaleTimeString()
     }
-
-    const hrDisplay = rppgMetrics.isReliable && rppgMetrics.hr !== null
-        ? rppgMetrics.hr.toFixed(1)
-        : '--'
-    const sqiDisplay = rppgMetrics.sqi !== null ? rppgMetrics.sqi.toFixed(2) : '--'
-    const rppgHint = rppgMetrics.error
-        || (rppgMetrics.fps !== null && rppgMetrics.latencyMs !== null
-            ? `${rppgMetrics.fps.toFixed(1)} FPS · ${rppgMetrics.latencyMs.toFixed(1)} ms`
-            : '本地设备实时计算，不上传视频或心率数据')
-
-    if (interviewStarted) {
+    const buildDebugPreview = (item: AsrDebugEvent) => {
         return (
-            <div className="min-h-screen bg-black">
-                <div className="relative h-screen w-full overflow-hidden bg-black">
-                    <video
-                        ref={videoRef}
-                        autoPlay
-                        playsInline
-                        muted
-                        className="absolute inset-0 h-full w-full object-cover"
-                        style={{ transform: 'scaleX(-1)' }}
-                    />
-
-                    {!cameraReady && (
-                        <div className="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-gray-900 to-black">
-                            <div className="text-center text-white">
-                                <div className="relative">
-                                    <div className="mx-auto mb-4 h-16 w-16 animate-spin rounded-full border-4 border-gray-700 border-t-blue-500"></div>
-                                    <div className="absolute inset-0 flex items-center justify-center">
-                                        <div className="h-8 w-8 animate-pulse rounded-full bg-blue-500"></div>
-                                    </div>
-                                </div>
-                                <p className="text-lg font-semibold">加载摄像头中...</p>
-                            </div>
-                        </div>
-                    )}
-
-                    <div className="absolute inset-0 bg-gradient-to-b from-black/30 via-transparent to-black/35"></div>
-                    <div className="absolute left-3 top-3 z-20 flex items-center gap-3 sm:left-4 sm:top-4">
-                        <div className="rounded-full border border-white/15 bg-slate-950/55 px-3 py-2 text-xs font-semibold tracking-[0.18em] text-white shadow-xl backdrop-blur-md">
-                            AI 模拟面试舱
-                        </div>
-                        <div className="hidden rounded-full border border-red-400/25 bg-red-500/15 px-3 py-2 text-xs font-semibold text-red-100 shadow-xl backdrop-blur-md sm:flex sm:items-center sm:gap-2">
-                            <span className="h-2 w-2 animate-pulse rounded-full bg-red-400"></span>
-                            录制中
-                        </div>
-                    </div>
-
-                    <div className="absolute right-3 top-3 z-20 flex items-center gap-2 sm:right-4 sm:top-4">
-                        <button
-                            onClick={() => router.push('/')}
-                            className="flex items-center gap-2 rounded-full border border-white/15 bg-slate-950/55 px-3 py-2 text-sm font-medium text-white shadow-xl backdrop-blur-md transition hover:bg-slate-950/70"
-                        >
-                            <Home className="h-4 w-4" />
-                            <span className="hidden sm:inline">首页</span>
-                        </button>
-                        <button
-                            onClick={() => router.push('/report')}
-                            className="flex items-center gap-2 rounded-full border border-white/15 bg-slate-950/55 px-3 py-2 text-sm font-medium text-white shadow-xl backdrop-blur-md transition hover:bg-slate-950/70"
-                        >
-                            <FileText className="h-4 w-4" />
-                            <span className="hidden sm:inline">报告</span>
-                        </button>
-                        <button
-                            onClick={handleEndInterview}
-                            className="rounded-full bg-red-600 px-4 py-2 text-sm font-semibold text-white shadow-xl transition hover:bg-red-700"
-                        >
-                            结束面试
-                        </button>
-                    </div>
-
-                    <div className="absolute left-1/2 top-3 z-20 w-[min(92vw,32rem)] -translate-x-1/2 sm:top-4">
-                        <div className="rounded-[28px] border border-white/15 bg-slate-950/48 px-5 py-3 text-center text-white shadow-2xl backdrop-blur-md">
-                            <p className="text-[11px] uppercase tracking-[0.28em] text-white/65">当前面试轮次</p>
-                            <div className="mt-1 flex items-center justify-center gap-3">
-                                <div className="flex h-10 w-10 items-center justify-center rounded-full border border-white/15 bg-white/10">
-                                    <Radar className="h-5 w-5" />
-                                </div>
-                                <div>
-                                    <h2 className="text-lg font-black sm:text-xl">{interviewConfig.roundName}</h2>
-                                    <p className="text-xs text-white/65">
-                                        {interviewConfig.position.replace('_', ' ')} · 难度：
-                                        {interviewConfig.difficulty === 'easy' ? '简单' : interviewConfig.difficulty === 'medium' ? '中等' : '困难'}
-                                    </p>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    <div className="absolute bottom-3 left-3 right-3 z-20 flex max-h-[46vh] flex-col rounded-[30px] border border-white/12 bg-slate-950/36 p-4 text-white shadow-2xl backdrop-blur-md sm:left-auto sm:top-24 sm:right-4 sm:bottom-4 sm:max-h-none sm:w-[min(28rem,42vw)] lg:w-[min(30rem,34vw)]">
-                        <h2 className="mb-4 flex items-center gap-2 text-lg font-bold">
-                            <Mic className="h-5 w-5 text-cyan-300" />
-                            面试对话
-                        </h2>
-
-                        <div
-                            ref={chatScrollContainerRef}
-                            className="mb-4 min-h-0 flex-1 overflow-y-auto overscroll-contain rounded-2xl border border-white/10 bg-black/18 p-4"
-                        >
-                            {chatMessages.length === 0 ? (
-                                <p className="py-8 text-center text-sm text-white/60">等待面试官提问...</p>
-                            ) : (
-                                <div className="space-y-4">
-                                    {chatMessages.map((msg, idx) => (
-                                        <div
-                                            key={idx}
-                                            className={`flex ${msg.role === 'candidate' ? 'justify-end' : 'justify-start'}`}
-                                        >
-                                            <div
-                                                className={`max-w-[90%] rounded-2xl px-4 py-3 ${msg.role === 'candidate'
-                                                    ? 'bg-cyan-500/78 text-white'
-                                                    : 'border border-white/10 bg-white/12 text-white'
-                                                    }`}
-                                            >
-                                                <p className="mb-1 text-xs font-medium opacity-70">
-                                                    {msg.role === 'candidate' ? '你' : '面试官'} · {msg.timestamp}
-                                                </p>
-                                                <p className="text-sm leading-relaxed">{msg.content}</p>
-                                            </div>
-                                        </div>
-                                    ))}
-                                </div>
-                            )}
-                        </div>
-
-                        <div className="flex flex-col gap-3">
-                            <div className="rounded-2xl border border-white/10 bg-white/10 px-4 py-3">
-                                <div className="flex items-center gap-3">
-                                    <Mic className={`h-5 w-5 ${voiceInputEnabled && isListening && answerSessionStatus !== 'finalizing' ? 'animate-pulse text-emerald-300' : voiceInputEnabled ? 'text-white/65' : 'text-amber-300'}`} />
-                                    <span className="text-sm text-white/80">
-                                        {voiceStatusText}
-                                    </span>
-                                </div>
-                                {voiceInputEnabled && (
-                                    <div className="mt-2 text-xs text-white/65">
-                                        <span>
-                                            {speechRealtimeMetrics.is_speaking ? '说话中' : `停顿 ${realtimePauseSeconds}s`}
-                                        </span>
-                                        <span className="mx-2">|</span>
-                                        <span>实时语速 {realtimeWpmText}</span>
-                                        <span className="mx-2">|</span>
-                                        <span>分段 #{Math.max(1, speechRealtimeMetrics.segment_index || 1)}</span>
-                                    </div>
-                                )}
-                            </div>
-
-                            {!voiceInputEnabled && (
-                                <div className="rounded-2xl border border-amber-300/20 bg-amber-500/12 px-4 py-3 text-sm text-amber-100">
-                                    {asrStatusMessage || '语音识别当前不可用，系统已切换到文字回答模式。'}
-                                </div>
-                            )}
-
-                            <div className="rounded-2xl border border-white/10 bg-white/10 p-3">
-                                <div className="mb-2 flex items-center justify-between gap-3">
-                                    <p className="text-sm font-semibold text-white">{answerPanelTitle}</p>
-                                    <p className="text-xs text-white/55">
-                                        {answerPanelHint}
-                                    </p>
-                                </div>
-                                <textarea
-                                    value={userAnswer}
-                                    onChange={(event) => setUserAnswer(event.target.value)}
-                                    onKeyDown={(event) => {
-                                        if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
-                                            event.preventDefault()
-                                            handleSubmitAnswer()
-                                        }
-                                    }}
-                                    disabled={!currentQuestion || isProcessing || isAiSpeaking}
-                                    placeholder={voiceInputEnabled
-                                        ? '你可以直接说话，也可以在这里修改识别结果后提交。'
-                                        : '请输入你的回答，然后点击“提交回答”。'}
-                                    className="min-h-[112px] w-full resize-y rounded-2xl border border-white/10 bg-black/20 px-4 py-3 text-sm leading-6 text-white outline-none transition placeholder:text-white/35 focus:border-cyan-300/60 focus:bg-black/30 disabled:cursor-not-allowed disabled:opacity-60"
-                                />
-                                <div className="mt-3 flex items-center justify-between gap-3">
-                                    <p className="text-xs text-white/50">
-                                        `Ctrl/Cmd + Enter` 可快速提交
-                                    </p>
-                                    <button
-                                        onClick={() => handleSubmitAnswer()}
-                                        disabled={!userAnswer.trim() || !currentQuestion || isProcessing || isAiSpeaking}
-                                        className="rounded-xl bg-cyan-500 px-4 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400 disabled:cursor-not-allowed disabled:bg-white/20 disabled:text-white/50"
-                                    >
-                                        提交回答
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    <div className="absolute bottom-4 left-4 z-20 hidden w-[300px] rounded-[28px] border border-white/12 bg-slate-950/42 p-4 text-white shadow-2xl backdrop-blur-md sm:block">
-                        <div className="flex items-center justify-between gap-3">
-                            <div>
-                                <p className="text-[11px] uppercase tracking-[0.22em] text-cyan-200/70">FacePhys rPPG</p>
-                                <h3 className="mt-1 text-sm font-semibold">本地心率监测</h3>
-                            </div>
-                            <span className={`rounded-full border px-3 py-1 text-[11px] font-semibold ${getRppgStatusClass()}`}>
-                                {getRppgStatusLabel()}
-                            </span>
-                        </div>
-
-                        <div className="mt-4 grid grid-cols-2 gap-3">
-                            <div className="rounded-2xl border border-white/10 bg-white/10 px-3 py-3">
-                                <p className="text-[11px] uppercase tracking-[0.18em] text-white/55">心率 BPM</p>
-                                <p className="mt-2 text-3xl font-black text-white">{hrDisplay}</p>
-                            </div>
-                            <div className="rounded-2xl border border-white/10 bg-white/10 px-3 py-3">
-                                <p className="text-[11px] uppercase tracking-[0.18em] text-white/55">SQI</p>
-                                <p className="mt-2 text-3xl font-black text-white">{sqiDisplay}</p>
-                            </div>
-                        </div>
-
-                        <div className="mt-3 rounded-2xl border border-white/10 bg-white/10 px-3 py-3">
-                            <p className="text-[11px] uppercase tracking-[0.18em] text-white/55">信号状态</p>
-                            <p className="mt-2 text-sm font-medium text-white">
-                                {rppgMetrics.hasFace ? '人脸跟踪中' : '等待稳定人脸进入画面'}
-                            </p>
-                            <p className="mt-2 text-xs leading-5 text-white/62">{rppgHint}</p>
-                        </div>
-                    </div>
-                </div>
-            </div>
+            item.final_preview
+            || item.partial_preview
+            || item.segment_preview
+            || item.answer_preview
+            || item.text_snapshot
+            || item.details
+            || item.reason_detail
+            || ''
         )
     }
 
-    return (
-        <div className="min-h-screen bg-gray-50 p-4 transition-colors dark:bg-gray-900">
-            <div className="mx-auto max-w-7xl">
-                <div className="mb-4 animate-slide-up rounded-lg bg-white p-4 shadow-md dark:bg-gray-800">
-                    <div className="flex items-center justify-between">
-                        <h1 className="text-2xl font-bold text-gray-800 dark:text-gray-100">AI 模拟面试舱</h1>
-                        <div className="flex gap-4">
+    if (interviewStarted) {
+        return (
+            <div
+                className="interview-shell-bg -m-3 flex h-[100dvh] flex-col overflow-hidden font-sans text-[#111111] sm:-m-4 lg:-m-5"
+            >
+                <header className="z-10 shrink-0 border-b border-[#E5E5E5] bg-white/88 px-3 py-2.5 backdrop-blur-md sm:px-5">
+                    <div className="flex items-center justify-between gap-4">
+                        <div className="flex min-w-0 items-center gap-3">
                             <button
-                                onClick={() => router.push('/')}
-                                className="flex items-center gap-2 rounded-lg bg-gray-500 px-4 py-2 font-semibold text-white shadow-lg transition hover:bg-gray-600 hover:shadow-xl"
+                                onClick={handleEndInterview}
+                                className="rounded-full p-2 text-[#666666] transition-colors hover:bg-[#F5F5F5] hover:text-[#111111]"
+                                aria-label="结束并返回"
                             >
-                                <Home className="h-5 w-5" />
-                                首页
+                                <X size={18} />
                             </button>
-                            <button
-                                onClick={() => router.push('/report')}
-                                className="flex items-center gap-2 rounded-lg bg-blue-500 px-4 py-2 font-semibold text-white shadow-lg transition hover:bg-blue-600 hover:shadow-xl"
-                            >
-                                <FileText className="h-5 w-5" />
-                                报告
-                            </button>
-                            <button
-                                onClick={handleStartInterview}
-                                disabled={!cameraReady}
-                                className="rounded-lg bg-green-600 px-6 py-2 font-semibold text-white shadow-lg transition hover:bg-green-700 hover:shadow-xl disabled:bg-gray-400 dark:disabled:bg-gray-600"
-                            >
-                                开始面试
-                            </button>
+                            <div className="h-4 w-px bg-[#E5E5E5]" />
+                            <span className="truncate text-sm font-semibold tracking-tight text-[#111111]">AI 面试进行中</span>
+                        </div>
+                        <div className="flex items-center gap-3 sm:gap-6">
+                            <div className="flex items-center gap-2 text-sm text-[#666666]">
+                                <span className={`h-2 w-2 rounded-full ${isRecording ? 'bg-[#E27A5F] animate-pulse' : isAiSpeaking ? 'bg-[#f59e0b] animate-pulse' : 'bg-[#2E6A45]'}`} />
+                                {isRecording ? 'Recording' : isAiSpeaking ? 'Interviewer Speaking' : 'Session Active'}
+                            </div>
+                            <span className="w-12 text-right font-mono text-sm text-[#111111]">{formatTime(sessionElapsed)}</span>
                         </div>
                     </div>
-                </div>
+                </header>
 
-                <div className="space-y-6">
-                    <div className="animate-fade-in rounded-2xl border border-gray-100 bg-gradient-to-br from-white to-gray-50 p-6 shadow-2xl dark:border-gray-700 dark:from-gray-800 dark:to-gray-900">
-                        <div className="mb-4 flex items-center justify-between">
-                            <h2 className="flex items-center gap-2 text-xl font-bold text-gray-800 dark:text-gray-100">
-                                <div className="h-2 w-2 animate-pulse rounded-full bg-red-500"></div>
-                                实时画面
-                            </h2>
-                            <div className="rounded-full border border-indigo-200 bg-indigo-50 px-4 py-2 text-sm font-semibold text-indigo-700 dark:border-indigo-500/20 dark:bg-indigo-500/10 dark:text-indigo-200">
-                                {interviewConfig.roundName}
-                            </div>
-                        </div>
-                        <div className="relative h-[64vh] min-h-[420px] overflow-hidden rounded-xl border-4 border-gray-200 bg-gradient-to-br from-gray-900 to-black shadow-2xl dark:border-gray-700">
+                <main className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden p-2.5 md:flex-row md:gap-3 md:p-3 lg:gap-4 lg:p-4">
+                    <div className="flex min-w-0 flex-1 flex-col gap-2.5 md:flex-[1.58]">
+                        <div className="relative min-h-0 flex-[1_1_62%] overflow-hidden rounded-2xl border border-[#1D1D1D] bg-[#0B0B0D] shadow-[0_22px_40px_-28px_rgba(0,0,0,0.75)]">
                             <video
                                 ref={videoRef}
                                 autoPlay
                                 playsInline
                                 muted
-                                className="h-full w-full object-cover"
-                                style={{ transform: 'scaleX(-1)' }}
+                                className="h-full w-full -scale-x-100 object-cover"
                             />
+                            <div className="pointer-events-none absolute inset-x-0 top-0 h-24 bg-gradient-to-b from-black/55 to-transparent" />
+                            <div className="pointer-events-none absolute inset-x-0 bottom-0 h-24 bg-gradient-to-t from-black/60 to-transparent" />
+                            {isRecording && (
+                                <div className="absolute right-4 top-4 z-20 inline-flex items-center gap-2 rounded-full border border-white/15 bg-black/45 px-3 py-1.5 text-[11px] font-medium uppercase tracking-wider text-white backdrop-blur">
+                                    <span className="h-2 w-2 rounded-full bg-[#E27A5F] animate-pulse" />
+                                    REC
+                                </div>
+                            )}
                             {!cameraReady && (
-                                <div className="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-gray-900 to-black">
-                                    <div className="text-center text-white">
-                                        <div className="relative">
-                                            <div className="mx-auto mb-4 h-16 w-16 animate-spin rounded-full border-4 border-gray-700 border-t-blue-500"></div>
-                                            <div className="absolute inset-0 flex items-center justify-center">
-                                                <div className="h-8 w-8 animate-pulse rounded-full bg-blue-500"></div>
-                                            </div>
-                                        </div>
-                                        <p className="text-lg font-semibold">加载摄像头中...</p>
+                                <div className="absolute inset-0 flex items-center justify-center bg-black/70 text-white">
+                                    <div className="flex items-center gap-2 text-sm">
+                                        <Loader2 className="h-4 w-4 animate-spin" />
+                                        加载摄像头中...
                                     </div>
                                 </div>
                             )}
+                            <div className="absolute left-3 top-3 z-20 max-w-[84%] rounded-xl border border-white/15 bg-black/40 px-3 py-1.5 text-xs text-white backdrop-blur">
+                                <p className="mb-1 text-[10px] uppercase tracking-wider text-white/70">Current Question</p>
+                                <p className="line-clamp-3 text-sm leading-relaxed">{displayQuestion}</p>
+                            </div>
+                            <div className="absolute bottom-3 left-3 inline-flex items-center gap-2 rounded-xl border border-white/10 bg-black/45 px-3 py-1.5 text-xs text-white backdrop-blur">
+                                <span className="flex h-6 w-6 items-center justify-center rounded-full bg-white/20">
+                                    <User size={14} />
+                                </span>
+                                You
+                            </div>
+                            <div className="absolute bottom-3 right-3 flex h-20 w-36 items-center justify-center overflow-hidden rounded-xl border border-white/10 bg-[#1F1F22] shadow-2xl">
+                                <span className={`h-3 w-3 rounded-full ${isAiSpeaking ? 'animate-pulse bg-[#E27A5F]' : 'bg-white/75'}`} />
+                                <span className={`absolute h-10 w-10 rounded-full border border-white/20 ${isAiSpeaking ? 'animate-ping' : ''}`} />
+                                <span className="absolute bottom-2 left-2 text-[10px] uppercase tracking-wider text-white/70">
+                                    Interviewer · {isAiSpeaking ? 'Speaking' : 'Waiting'}
+                                </span>
+                            </div>
+                        </div>
+
+                        <div className="h-[clamp(148px,24vh,208px)] shrink-0 rounded-2xl border border-[#E5E5E5] bg-white p-4 shadow-sm lg:p-5">
+                            <div className="mb-3 flex h-full flex-col">
+                                <div className="flex-1 overflow-y-auto pr-2">
+                                    {userAnswer ? (
+                                        <p className="text-base leading-relaxed text-[#111111]">
+                                            {userAnswer}
+                                            {isRecording && <span className="ml-1 inline-block h-5 w-2 animate-pulse bg-[#111111] align-middle" />}
+                                        </p>
+                                    ) : (
+                                        <p className="text-base italic leading-relaxed text-[#999999]">
+                                            {isProcessing ? '正在处理你的回答...' : '你的语音转录会实时显示在这里...'}
+                                        </p>
+                                    )}
+                                </div>
+
+                                <div className="flex shrink-0 items-center justify-between border-t border-[#F5F5F5] pt-2">
+                                    <div className="flex items-center gap-4">
+                                        <div
+                                            aria-label="自动录音状态"
+                                            className={`relative inline-flex h-11 w-11 items-center justify-center rounded-full ${
+                                                isRecording
+                                                    ? 'bg-[#111111] text-white'
+                                                    : voiceInputEnabled
+                                                        ? (isAiSpeaking ? 'bg-[#ECEAE4] text-[#7D776B]' : 'bg-[#F1EFEA] text-[#555046]')
+                                                        : 'bg-[#E7E3DB] text-[#9A9387]'
+                                            }`}
+                                        >
+                                            {isRecording && (
+                                                <span className="absolute inset-0 rounded-full border border-[#111111]/65 animate-ping" />
+                                            )}
+                                            <Mic size={18} />
+                                        </div>
+
+                                        {isRecording && (
+                                            <div className="flex h-8 items-center gap-1 overflow-hidden">
+                                                <span className="h-2 w-1 animate-pulse rounded-full bg-[#111111]" />
+                                                <span className="h-4 w-1 animate-pulse rounded-full bg-[#111111] [animation-delay:120ms]" />
+                                                <span className="h-3 w-1 animate-pulse rounded-full bg-[#111111] [animation-delay:240ms]" />
+                                                <span className="h-5 w-1 animate-pulse rounded-full bg-[#111111] [animation-delay:360ms]" />
+                                                <span className="h-2 w-1 animate-pulse rounded-full bg-[#111111] [animation-delay:480ms]" />
+                                            </div>
+                                        )}
+                                        <p className="line-clamp-2 text-xs leading-5 text-[#777268]">{autoRecordStatus}</p>
+                                    </div>
+
+                                    <button
+                                        onClick={() => handleSubmitAnswer()}
+                                        disabled={!userAnswer.trim() || !currentQuestion || isProcessing || isAiSpeaking}
+                                        className="inline-flex items-center gap-1 rounded-full bg-[#111111] px-4 py-2 text-xs font-semibold text-white transition hover:bg-[#222222] disabled:cursor-not-allowed disabled:bg-[#c8c2b7]"
+                                    >
+                                        提交答案
+                                        <ArrowRight size={14} />
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <aside className="flex w-full shrink-0 flex-col overflow-hidden rounded-2xl border border-[#E5E5E5] bg-white/95 shadow-sm md:w-[300px] lg:w-[320px]">
+                        <div className="border-b border-[#E5E5E5] bg-[#FAFAFA] px-4 py-3">
+                            <h3 className="text-sm font-medium text-[#111111]">Interview Transcript</h3>
+                            <p className="mt-1 text-xs text-[#666666]">已记录 {chatMessages.length} 条对话</p>
+                        </div>
+
+                        <div
+                            ref={chatScrollContainerRef}
+                            className="min-h-0 flex-1 space-y-4 overflow-y-auto bg-[#FCFCFB] p-4"
+                        >
+                            {chatMessages.length === 0 ? (
+                                <div className="rounded-lg border border-dashed border-[#D9D4CA] bg-[#FAFAFA] p-6 text-center text-sm text-[#777268]">
+                                    <div className="mx-auto mb-2 inline-flex h-9 w-9 items-center justify-center rounded-full bg-white text-[#777268]">
+                                        <MessageSquare size={16} />
+                                    </div>
+                                    <p>等待面试官提问...</p>
+                                    <p className="mt-1 text-xs text-[#9B9488]">系统会在收到首问后自动开始记录</p>
+                                </div>
+                            ) : (
+                                chatMessages.map((msg, idx) => (
+                                    <div
+                                        key={idx}
+                                        className={`flex flex-col ${msg.role === 'candidate' ? 'items-end' : 'items-start'}`}
+                                    >
+                                        <div className="mb-1.5 flex items-center gap-2 px-1">
+                                            <span className="text-[11px] font-medium uppercase tracking-wider text-[#111111]">
+                                                {msg.role === 'interviewer' ? 'Interviewer' : 'You'}
+                                            </span>
+                                            <span className="text-[10px] text-[#999999]">{msg.timestamp}</span>
+                                        </div>
+                                        <div
+                                            className={`max-w-[92%] rounded-2xl p-2.5 text-sm leading-relaxed ${
+                                                msg.role === 'candidate'
+                                                    ? 'rounded-tr-sm bg-[#111111] text-white shadow-[0_12px_20px_-18px_rgba(0,0,0,0.9)]'
+                                                    : 'rounded-tl-sm border border-[#E7E3DB] bg-[#F7F6F2] text-[#111111]'
+                                            }`}
+                                        >
+                                            {msg.content}
+                                        </div>
+                                    </div>
+                                ))
+                            )}
+                        </div>
+
+                        {ASR_DEBUG_PANEL_ENABLED && (
+                            <div className="border-t border-[#E5E5E5] bg-[#FAFAFA]">
+                                <div className="flex items-center justify-between gap-2 px-3 py-2">
+                                    <div>
+                                        <p className="text-[11px] font-semibold uppercase tracking-wider text-[#111111]">ASR Diagnostics</p>
+                                        <p className="text-[10px] text-[#777268]">{asrDebugEvents.length} events</p>
+                                    </div>
+                                    <div className="flex items-center gap-1.5">
+                                        <button
+                                            onClick={() => setShowAsrDebugPanel((prev) => !prev)}
+                                            className="rounded border border-[#DAD6CE] bg-white px-2 py-1 text-[10px] text-[#333333] hover:bg-[#F5F5F5]"
+                                        >
+                                            {showAsrDebugPanel ? '收起' : '展开'}
+                                        </button>
+                                        <button
+                                            onClick={() => setAsrDebugEvents([])}
+                                            className="rounded border border-[#DAD6CE] bg-white px-2 py-1 text-[10px] text-[#333333] hover:bg-[#F5F5F5]"
+                                        >
+                                            清空
+                                        </button>
+                                    </div>
+                                </div>
+                                {showAsrDebugPanel && (
+                                    <div
+                                        ref={asrDebugScrollContainerRef}
+                                        className="max-h-44 space-y-1.5 overflow-y-auto border-t border-[#E5E5E5] px-3 py-2"
+                                    >
+                                        {asrDebugEvents.length === 0 ? (
+                                            <p className="text-[11px] text-[#8A8376]">等待 ASR 调试事件...</p>
+                                        ) : (
+                                            asrDebugEvents.map((item, index) => {
+                                                const preview = buildDebugPreview(item)
+                                                return (
+                                                    <div
+                                                        key={`${item.timestamp}_${item.event}_${index}`}
+                                                        className="rounded-md border border-[#E8E4DC] bg-white px-2 py-1.5"
+                                                    >
+                                                        <div className="flex items-center justify-between gap-2">
+                                                            <p className="truncate text-[10px] font-semibold text-[#111111]">{item.event}</p>
+                                                            <span className="shrink-0 text-[10px] text-[#888274]">{formatDebugTime(item.timestamp)}</span>
+                                                        </div>
+                                                        <p className="mt-0.5 text-[10px] text-[#666666]">
+                                                            gen:{String(item.asr_generation || '-')} | epoch:{String(item.speech_epoch || '-')}
+                                                        </p>
+                                                        {preview && (
+                                                            <p className="mt-0.5 line-clamp-2 text-[10px] leading-4 text-[#333333]">{preview}</p>
+                                                        )}
+                                                    </div>
+                                                )
+                                            })
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+                        )}
+                    </aside>
+                </main>
+            </div>
+        )
+    }
+
+    return (
+        <div className="-m-3 h-[100dvh] overflow-hidden bg-[#F3F2EF] p-3 sm:-m-4 sm:p-4 lg:-m-5">
+            <div className="mx-auto flex h-full max-w-3xl items-center justify-center">
+                <section className="w-full rounded-2xl border border-[#E5E5E5] bg-white p-5 shadow-sm sm:p-6">
+                    <div className="mb-4 flex items-center gap-3 text-[#111111]">
+                        <Loader2 className="h-5 w-5 animate-spin" />
+                        <h2 className="text-lg font-semibold">正在进入面试场景</h2>
+                    </div>
+                    <p className="text-sm leading-6 text-[#666666]">
+                        系统正在连接面试会话与实时识别通道，请稍候。
+                    </p>
+                    <div className="mt-4 grid gap-2 rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-3 text-xs text-[#666666] sm:grid-cols-3">
+                        <div>面试轮次：<span className="font-medium text-[#111111]">{interviewConfig.roundName}</span></div>
+                        <div>目标岗位：<span className="font-medium text-[#111111]">{interviewConfig.position.replace('_', ' ')}</span></div>
+                        <div>难度：<span className="font-medium text-[#111111]">{difficultyText}</span></div>
+                    </div>
+                    <div className="mt-4 flex flex-wrap gap-2.5">
+                        <button
+                            onClick={() => router.push('/interview/setup')}
+                            className="inline-flex items-center rounded-lg border border-[#E5E5E5] bg-white px-4 py-2 text-sm font-medium text-[#111111] hover:bg-[#F5F5F5]"
+                        >
+                            返回开始前检查
+                        </button>
+                        <button
+                            onClick={handleStartInterview}
+                            disabled={!cameraReady || !socket}
+                            className="inline-flex items-center gap-2 rounded-lg bg-[#111111] px-4 py-2 text-sm font-medium text-white hover:bg-[#222222] disabled:cursor-not-allowed disabled:bg-[#cbc5b9]"
+                        >
+                            立即重试连接
+                            <ArrowRight className="h-4 w-4" />
+                        </button>
+                    </div>
+                </section>
+            </div>
+
+            {showCompletionModal && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 p-4 backdrop-blur-sm">
+                    <div className="w-full max-w-md overflow-hidden rounded-3xl border border-[#E5E5E5] bg-[#FAF9F6] shadow-2xl animate-scale-up">
+                        <div className="h-1 bg-[#111111]" />
+                        <div className="p-8">
+                            <div className="mx-auto mb-5 flex h-16 w-16 items-center justify-center rounded-full bg-[#111111] text-white">
+                                <CheckCircle2 className="h-8 w-8" />
+                            </div>
+
+                            <h3 className="text-center text-2xl font-semibold tracking-tight text-[#111111]">会话已完成</h3>
+                            <p className="mt-2 text-center text-sm leading-6 text-[#666666]">系统已生成本场即时报告；深度复盘（单题与视频）已拆分到独立复盘页。</p>
+
+                            <div className="mt-6 rounded-2xl border border-[#E5E5E5] bg-white p-4 text-sm text-[#555555]">
+                                <p className="font-medium text-[#111111]">已完成事项</p>
+                                <p className="mt-1">语音转写、问题追问链路与生理信号评估均已归档。</p>
+                                {completedInterviewId && (
+                                    <p className="mt-2 text-xs text-[#777268]">会话 ID：{completedInterviewId}</p>
+                                )}
+                            </div>
+
+                            <div className="mt-6 grid gap-2 sm:grid-cols-3">
+                                <button
+                                    onClick={() => gotoCompletionTarget('/review')}
+                                    className="inline-flex items-center justify-center rounded-xl bg-[#111111] px-4 py-2.5 text-sm font-medium text-white transition hover:bg-[#222222]"
+                                >
+                                    进入复盘清单
+                                </button>
+                                <button
+                                    onClick={() => gotoCompletionTarget('/report')}
+                                    className="inline-flex items-center justify-center rounded-xl border border-[#E5E5E5] px-4 py-2.5 text-sm font-medium text-[#111111] transition hover:bg-[#F5F5F5]"
+                                >
+                                    查看即时报告
+                                </button>
+                                <button
+                                    onClick={() => gotoCompletionTarget('/')}
+                                    className="inline-flex items-center justify-center rounded-xl border border-[#E5E5E5] px-4 py-2.5 text-sm font-medium text-[#111111] transition hover:bg-[#F5F5F5]"
+                                >
+                                    返回工作台
+                                </button>
+                            </div>
+
+                            <div className="mt-2">
+                                <button
+                                    onClick={() => gotoCompletionTarget('/replay')}
+                                    className="w-full inline-flex items-center justify-center rounded-xl border border-[#E5E5E5] px-4 py-2.5 text-sm font-medium text-[#111111] transition hover:bg-[#F5F5F5]"
+                                >
+                                    进入视频复盘
+                                </button>
+                            </div>
+
+                            <button
+                                onClick={closeCompletionModal}
+                                className="mt-3 w-full text-center text-xs text-[#666666] hover:text-[#111111]"
+                            >
+                                暂不跳转
+                            </button>
                         </div>
                     </div>
                 </div>
-            </div>
+            )}
         </div>
     )
 }
+
+

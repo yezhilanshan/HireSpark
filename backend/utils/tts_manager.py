@@ -62,8 +62,20 @@ class TTSManager:
     def prepare_text(text: str) -> str:
         return prepare_tts_text(text)
 
-    def _synthesize_remote(self, text: str) -> Optional[bytes]:
-        payload = json.dumps({"text": text}).encode("utf-8")
+    def _synthesize_remote(
+        self,
+        text: str,
+        interview_id: str = "",
+        session_id: str = "",
+    ) -> Optional[bytes]:
+        payload_dict = {"text": text}
+        normalized_interview_id = str(interview_id or "").strip()
+        normalized_session_id = str(session_id or "").strip()
+        if normalized_interview_id:
+            payload_dict["interview_id"] = normalized_interview_id
+        if normalized_session_id:
+            payload_dict["session_id"] = normalized_session_id
+        payload = json.dumps(payload_dict).encode("utf-8")
         req = request.Request(
             f"{self.service_url}/synthesize",
             data=payload,
@@ -128,6 +140,8 @@ class TTSManager:
         self,
         text: str,
         callback: Optional[Callable[[bytes], None]] = None,
+        interview_id: str = "",
+        session_id: str = "",
     ) -> bool:
         if not self.enabled:
             self.last_error = "TTS not enabled"
@@ -154,7 +168,11 @@ class TTSManager:
         self.last_error = ""
         self.last_content_type = "audio/mpeg"
         self.last_provider = ""
-        audio_data = self._synthesize_remote(prepared_text)
+        audio_data = self._synthesize_remote(
+            prepared_text,
+            interview_id=interview_id,
+            session_id=session_id,
+        )
         if not audio_data:
             logger.error(f"[TTS] 远程合成失败：{self.last_error}")
             return False

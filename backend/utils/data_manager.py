@@ -197,6 +197,7 @@ class DataManager:
         return {
             'summary': summary,
             'events': self.interview_data['events'],
+            'timeline': self.interview_data['timeline'],
             'probability_timeline': self.probability_history,
             'statistics': self.interview_data['statistics']
         }

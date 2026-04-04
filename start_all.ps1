@@ -2,6 +2,33 @@
 # 同时启动后端、独立 TTS 服务和前端
 
 $ErrorActionPreference = "Continue"
+$env:CONDA_NO_PLUGINS = "true"
+$env:CONDA_REPORT_ERRORS = "false"
+
+function Ensure-HomeEnv {
+    $userProfile = $env:USERPROFILE
+    if (-not $userProfile) {
+        $userProfile = [Environment]::GetFolderPath('UserProfile')
+    }
+    if (-not $userProfile -or -not (Test-Path $userProfile)) {
+        if ($env:USERNAME -and (Test-Path "C:\Users\$($env:USERNAME)")) {
+            $userProfile = "C:\Users\$($env:USERNAME)"
+        } else {
+            $userProfile = "C:\Users\Public"
+        }
+    }
+
+    $env:USERPROFILE = $userProfile
+    $env:HOME = $userProfile
+    $homeRoot = [System.IO.Path]::GetPathRoot($userProfile)
+    if (-not $homeRoot) {
+        $homeRoot = "C:\"
+    }
+    $env:HOMEDRIVE = $homeRoot.TrimEnd('\')
+    $env:HOMEPATH = $userProfile.Substring($env:HOMEDRIVE.Length)
+}
+
+Ensure-HomeEnv
 
 function Get-EnvFileValue {
     param(
@@ -79,6 +106,7 @@ Write-Host "后端环境: $BackendEnv" -ForegroundColor Gray
 Write-Host "TTS 环境: $TtsEnv" -ForegroundColor Gray
 Write-Host "TTS Provider: $TtsProvider" -ForegroundColor Gray
 Write-Host "TTS 端口: $TtsPort" -ForegroundColor Gray
+Write-Host "Conda 模式: --no-plugins" -ForegroundColor Gray
 Write-Host ""
 
 # 检查路径
@@ -103,10 +131,10 @@ if (-not (Test-Path $FrontendPath)) {
 # 检查虚拟环境
 Write-Host "[0/4] 检查环境..." -ForegroundColor Yellow
 try {
-    $condaCheck = conda --version 2>&1
+    $condaCheck = conda --no-plugins --version 2>&1
     Write-Host "✓ Conda 已安装: $condaCheck" -ForegroundColor Green
 
-    $backendEnvCheck = conda env list 2>&1 | Select-String $BackendEnv
+    $backendEnvCheck = conda --no-plugins env list 2>&1 | Select-String $BackendEnv
     if ($backendEnvCheck) {
         Write-Host "✓ 后端虚拟环境 $BackendEnv 已存在" -ForegroundColor Green
     } else {
@@ -118,7 +146,7 @@ try {
         exit 1
     }
 
-    $ttsEnvCheck = conda env list 2>&1 | Select-String $TtsEnv
+    $ttsEnvCheck = conda --no-plugins env list 2>&1 | Select-String $TtsEnv
     if ($ttsEnvCheck) {
         Write-Host "✓ TTS 虚拟环境 $TtsEnv 已存在" -ForegroundColor Green
     } else {
@@ -147,7 +175,7 @@ if (Test-Path $TtsServiceScript) {
         $env:TTS_CONDA_ENV = $TtsEnv
         $env:TTS_PROVIDER = $TtsProvider
         $env:TTS_SERVICE_PORT = $TtsPort
-        Start-Process powershell -ArgumentList "-NoExit", "-ExecutionPolicy", "Bypass", "-File", "`"$TtsServiceScript`"" -WorkingDirectory $RootPath
+        Start-Process powershell -ArgumentList "-NoProfile", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", "`"$TtsServiceScript`"" -WorkingDirectory $RootPath
         Write-Host "✓ TTS 服务已在新窗口启动" -ForegroundColor Green
     } catch {
         Write-Host "✗ TTS 服务启动失败: $_" -ForegroundColor Red
@@ -171,7 +199,7 @@ if (Test-Path $backendScript) {
     Write-Host "使用脚本: $backendScript" -ForegroundColor Gray
     try {
         $env:BACKEND_CONDA_ENV = $BackendEnv
-        Start-Process powershell -ArgumentList "-NoExit", "-ExecutionPolicy", "Bypass", "-File", "`"$backendScript`"" -WorkingDirectory $BackendPath
+        Start-Process powershell -ArgumentList "-NoProfile", "-NoExit", "-ExecutionPolicy", "Bypass", "-File", "`"$backendScript`"" -WorkingDirectory $BackendPath
         Write-Host "✓ 后端服务已在新窗口启动" -ForegroundColor Green
     } catch {
         Write-Host "✗ 后端启动失败: $_" -ForegroundColor Red
@@ -183,7 +211,7 @@ if (Test-Path $backendScript) {
 } else {
     Write-Host "! 脚本不存在，使用默认启动方式" -ForegroundColor Yellow
     try {
-        Start-Process powershell -ArgumentList "-NoExit", "-Command", "`$env:BACKEND_CONDA_ENV='$BackendEnv'; cd '$BackendPath'; conda run -n $BackendEnv python app.py" -WorkingDirectory $BackendPath
+        Start-Process powershell -ArgumentList "-NoProfile", "-NoExit", "-Command", "`$env:BACKEND_CONDA_ENV='$BackendEnv'; `$env:CONDA_NO_PLUGINS='true'; `$env:CONDA_REPORT_ERRORS='false'; cd '$BackendPath'; conda --no-plugins run -n $BackendEnv python app.py" -WorkingDirectory $BackendPath
         Write-Host "✓ 后端服务已在新窗口启动" -ForegroundColor Green
     } catch {
         Write-Host "✗ 后端启动失败: $_" -ForegroundColor Red
@@ -233,7 +261,7 @@ Write-Host "✓ 前端依赖安装完成" -ForegroundColor Green
 }
 
 try {
-    Start-Process powershell -ArgumentList "-NoExit", "-Command", "cd '$FrontendPath'; npm run dev" -WorkingDirectory $FrontendPath
+    Start-Process powershell -ArgumentList "-NoProfile", "-NoExit", "-Command", "cd '$FrontendPath'; npm run dev" -WorkingDirectory $FrontendPath
     Write-Host "✓ 前端服务已在新窗口启动" -ForegroundColor Green
 } catch {
     Write-Host "✗ 前端启动失败: $_" -ForegroundColor Red

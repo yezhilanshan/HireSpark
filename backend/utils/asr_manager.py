@@ -125,20 +125,47 @@ try:
         def __init__(self):
             self.enabled = False
             self.api_key = self._get_api_key()
+            self._project_root = Path(__file__).resolve().parents[2]
             self.sample_rate = 16000
             self.format_pcm = "pcm"
             self.model = os.environ.get("ASR_MODEL", "fun-asr-realtime")
-            self.final_model = os.environ.get("ASR_FINAL_MODEL", "qwen3-asr-1.7b")
+            configured_final_model = str(os.environ.get("ASR_FINAL_MODEL", "qwen3-asr-flash") or "").strip()
+            self.final_model = configured_final_model or "qwen3-asr-flash"
+            if self._is_realtime_model_name(self.final_model):
+                fallback_model = str(
+                    os.environ.get("ASR_FINAL_MODEL_FALLBACK", "qwen3-asr-flash") or "qwen3-asr-flash"
+                ).strip() or "qwen3-asr-flash"
+                logger.warning(
+                    "[ASR] 检测到 ASR_FINAL_MODEL=%s 为实时模型，不适合文件级复写；自动回退到 %s",
+                    self.final_model,
+                    fallback_model,
+                )
+                self.final_model = fallback_model
             self.final_language = os.environ.get("ASR_FINAL_LANGUAGE", "").strip()
             self.final_timeout = int(os.environ.get("ASR_FINAL_TIMEOUT", "60") or 60)
             self.final_enable_itn = str(
                 os.environ.get("ASR_FINAL_ENABLE_ITN", "true")
             ).strip().lower() not in {"0", "false", "no", "off"}
-            self.aligner_model = os.environ.get("ASR_ALIGNER_MODEL", "qwen3-forcedaligner-0.6b").strip()
+            self.aligner_model = os.environ.get(
+                "ASR_ALIGNER_MODEL",
+                "qwen3-forcedaligner-0.6b",
+            ).strip()
+            self.aligner_model_source, self.aligner_model_target = self._resolve_aligner_target(
+                self.aligner_model
+            )
+            self.aligner_model = self.aligner_model_target
             self.aligner_timeout = int(os.environ.get("ASR_ALIGNER_TIMEOUT", "90") or 90)
             self.aligner_enabled = str(
                 os.environ.get("ASR_ALIGNER_ENABLED", "true")
             ).strip().lower() not in {"0", "false", "no", "off"}
+            self.local_aligner_device_map = str(
+                os.environ.get("ASR_ALIGNER_LOCAL_DEVICE_MAP", "auto")
+            ).strip() or "auto"
+            self.local_aligner_dtype = str(
+                os.environ.get("ASR_ALIGNER_LOCAL_DTYPE", "auto")
+            ).strip().lower() or "auto"
+            self._local_forced_aligner = None
+            self._local_forced_aligner_lock = threading.Lock()
             self.base_http_api_url = str(
                 os.environ.get("DASHSCOPE_BASE_HTTP_API_URL")
                 or os.environ.get("ASR_FINAL_BASE_HTTP_API_URL")
@@ -150,7 +177,7 @@ try:
             self.last_transcribe_error = ""
             self.last_align_error = ""
             self.vad_enabled = str(
-                os.environ.get("ASR_STREAM_VAD_ENABLED", "true")
+                os.environ.get("ASR_STREAM_VAD_ENABLED", "false")
             ).strip().lower() not in {"0", "false", "no", "off"}
             self.vad_rms_threshold = self._get_env_int(
                 "ASR_STREAM_VAD_RMS_THRESHOLD",
@@ -174,13 +201,21 @@ try:
             )
             self.vad_keepalive_interval = self._get_env_float(
                 "ASR_STREAM_VAD_KEEPALIVE_SECONDS",
-                default=0.6,
+                default=0.0,
                 minimum=0.0,
             )
             self.vad_idle_reset_seconds = self._get_env_float(
                 "ASR_STREAM_VAD_IDLE_RESET_SECONDS",
                 default=1.5,
                 minimum=0.4,
+            )
+            self.stream_disfluency_removal_enabled = self._get_env_bool(
+                "ASR_STREAM_DISFLUENCY_REMOVAL_ENABLED",
+                default=True,
+            )
+            self.stream_timestamp_alignment_enabled = self._get_env_bool(
+                "ASR_STREAM_TIMESTAMP_ALIGNMENT_ENABLED",
+                default=True,
             )
 
             logger.info(
@@ -194,10 +229,16 @@ try:
                 self.vad_idle_reset_seconds,
             )
             logger.info(
-                "[ASR] 模型配置 realtime=%s final=%s aligner=%s aligner_enabled=%s",
+                "[ASR] 流式原生能力 disfluency_removal=%s timestamp_alignment=%s",
+                self.stream_disfluency_removal_enabled,
+                self.stream_timestamp_alignment_enabled,
+            )
+            logger.info(
+                "[ASR] 模型配置 realtime=%s final=%s aligner=%s source=%s aligner_enabled=%s",
                 self.model,
                 self.final_model,
                 self.aligner_model or "disabled",
+                self.aligner_model_source,
                 self.aligner_enabled,
             )
 
@@ -213,6 +254,42 @@ try:
         @staticmethod
         def _get_api_key() -> Optional[str]:
             return os.environ.get("DASHSCOPE_API_KEY") or os.environ.get("BAILIAN_API_KEY")
+
+        @staticmethod
+        def _is_realtime_model_name(model_name: str) -> bool:
+            normalized = str(model_name or "").strip().lower()
+            if not normalized:
+                return False
+            return "realtime" in normalized or "real-time" in normalized
+
+        def _resolve_aligner_target(self, configured_value: str) -> tuple[str, str]:
+            value = str(configured_value or "").strip()
+            if not value:
+                return "disabled", ""
+
+            raw_path = Path(value).expanduser()
+            candidates: List[Path] = []
+            if raw_path.is_absolute():
+                candidates.append(raw_path)
+            else:
+                candidates.append(raw_path)
+                candidates.append((self._project_root / raw_path).resolve())
+
+            for candidate in candidates:
+                if candidate.is_dir() and (candidate / "config.json").exists():
+                    resolved = str(candidate.resolve())
+                    logger.info("[ASR] ForcedAligner 使用本地模型目录：%s", resolved)
+                    return "local", resolved
+
+            # 默认配置时，若项目根目录有本地模型则自动切换为本地优先
+            if value.lower() in {"qwen3-forcedaligner-0.6b", "qwen/qwen3-forcedaligner-0.6b"}:
+                default_local = (self._project_root / "Qwen3-ForcedAligner-0.6B").resolve()
+                if default_local.is_dir() and (default_local / "config.json").exists():
+                    resolved = str(default_local)
+                    logger.info("[ASR] 自动检测到本地 ForcedAligner 模型目录：%s", resolved)
+                    return "local", resolved
+
+            return "dashscope", value
 
         @staticmethod
         def _get_env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -231,6 +308,15 @@ try:
             except Exception:
                 parsed = default
             return max(minimum, parsed)
+
+        @staticmethod
+        def _get_env_bool(name: str, default: bool) -> bool:
+            raw_value = str(os.environ.get(name, str(default))).strip().lower()
+            if raw_value in {"1", "true", "yes", "on"}:
+                return True
+            if raw_value in {"0", "false", "no", "off"}:
+                return False
+            return bool(default)
 
         def start_session(
             self,
@@ -270,7 +356,10 @@ try:
                 )
                 with self._lock:
                     self._streams[stream_id] = state
-                state.recognition.start()
+                state.recognition.start(
+                    disfluency_removal_enabled=self.stream_disfluency_removal_enabled,
+                    timestamp_alignment_enabled=self.stream_timestamp_alignment_enabled,
+                )
                 state.is_running = True
                 state.stop_worker = False
 
@@ -304,7 +393,7 @@ try:
                 logger.error(f"[ASR] 启动失败 - stream={stream_id}: {e}")
                 return False
 
-        def send_audio(self, stream_id: str, audio_data: Optional[bytes] = None):
+        def send_audio(self, stream_id: str, audio_data: Optional[bytes] = None) -> bool:
             if audio_data is None:
                 audio_data = stream_id  # 兼容旧签名 send_audio(audio_data)
                 stream_id = self._default_stream_id
@@ -314,9 +403,17 @@ try:
 
             if not state or not state.is_running or not state.recognition:
                 logger.warning(f"[ASR] stream={stream_id} 未运行")
-                return
+                return False
 
-            state.audio_queue.put(audio_data)
+            if not audio_data:
+                return False
+
+            try:
+                state.audio_queue.put(audio_data)
+                return True
+            except Exception as e:
+                logger.warning(f"[ASR] stream={stream_id} 音频入队失败: {e}")
+                return False
 
         def _audio_worker(self, stream_id: str):
             logger.info(f"[ASR] 音频工作线程已启动 - stream={stream_id}")
@@ -787,6 +884,153 @@ try:
 
             return {"word_timestamps": timestamps, "mode": "naive", "confidence": 0.5}
 
+        def _load_local_forced_aligner(self):
+            with self._local_forced_aligner_lock:
+                if self._local_forced_aligner is not None:
+                    return self._local_forced_aligner
+
+                try:
+                    from qwen_asr import Qwen3ForcedAligner
+                except Exception as exc:
+                    self.last_align_error = (
+                        "qwen-asr is required for local forced aligner "
+                        f"(pip install -U qwen-asr). detail={exc}"
+                    )
+                    logger.warning("[ASR] 本地 ForcedAligner 依赖缺失：%s", exc)
+                    return None
+
+                kwargs: Dict[str, Any] = {}
+                if self.local_aligner_device_map:
+                    kwargs["device_map"] = self.local_aligner_device_map
+                if self.local_aligner_dtype != "auto":
+                    try:
+                        import torch
+
+                        dtype_map = {
+                            "float16": torch.float16,
+                            "fp16": torch.float16,
+                            "bfloat16": torch.bfloat16,
+                            "bf16": torch.bfloat16,
+                            "float32": torch.float32,
+                            "fp32": torch.float32,
+                        }
+                        mapped_dtype = dtype_map.get(self.local_aligner_dtype)
+                        if mapped_dtype is not None:
+                            kwargs["dtype"] = mapped_dtype
+                    except Exception as exc:
+                        logger.warning("[ASR] 本地 ForcedAligner dtype 配置失败，使用默认值: %s", exc)
+
+                try:
+                    self._local_forced_aligner = Qwen3ForcedAligner.from_pretrained(
+                        self.aligner_model,
+                        **kwargs,
+                    )
+                    logger.info("[ASR] 本地 ForcedAligner 加载成功：%s", self.aligner_model)
+                except Exception as exc:
+                    self.last_align_error = f"failed to load local forced aligner: {exc}"
+                    logger.warning("[ASR] 本地 ForcedAligner 加载失败：%s", exc)
+                    self._local_forced_aligner = None
+
+                return self._local_forced_aligner
+
+        def _normalize_local_alignment(self, raw_result: Any) -> List[Dict[str, Any]]:
+            if isinstance(raw_result, list) and raw_result and isinstance(raw_result[0], list):
+                entries = raw_result[0]
+            elif isinstance(raw_result, list):
+                entries = raw_result
+            else:
+                entries = [raw_result]
+
+            normalized: List[Dict[str, Any]] = []
+            for item in entries:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    start = item.get("start_time", item.get("start_ms", item.get("start")))
+                    end = item.get("end_time", item.get("end_ms", item.get("end")))
+                    confidence = item.get("confidence")
+                else:
+                    text = getattr(item, "text", None)
+                    start = getattr(item, "start_time", None)
+                    end = getattr(item, "end_time", None)
+                    confidence = getattr(item, "confidence", None)
+
+                if text is None or start is None or end is None:
+                    continue
+
+                try:
+                    start_v = float(start)
+                    end_v = float(end)
+                except Exception:
+                    continue
+
+                if end_v < start_v:
+                    start_v, end_v = end_v, start_v
+
+                # qwen-asr forced aligner 常返回秒级时间戳，这里统一转成毫秒。
+                if end_v <= 1000 and start_v <= 1000:
+                    start_ms = start_v * 1000.0
+                    end_ms = end_v * 1000.0
+                else:
+                    start_ms = start_v
+                    end_ms = end_v
+
+                confidence_v: Optional[float] = None
+                if confidence is not None:
+                    try:
+                        confidence_v = float(confidence)
+                    except Exception:
+                        confidence_v = None
+
+                normalized.append(
+                    {
+                        "text": str(text).strip(),
+                        "start_ms": round(max(0.0, start_ms), 2),
+                        "end_ms": round(max(0.0, end_ms), 2),
+                        "confidence": confidence_v,
+                    }
+                )
+
+            return [item for item in normalized if item.get("text")]
+
+        def _align_transcript_local(
+            self,
+            audio_path: str,
+            transcript: str,
+            language: str = "",
+        ) -> Optional[Dict[str, Any]]:
+            local_aligner = self._load_local_forced_aligner()
+            if local_aligner is None:
+                return None
+
+            language_hint = str(language or self.final_language or "").strip() or "zh"
+            align_kwargs: Dict[str, Any] = {
+                "audio": audio_path,
+                "text": transcript,
+                "language": language_hint,
+            }
+
+            try:
+                result = local_aligner.align(**align_kwargs)
+                word_timestamps = self._normalize_local_alignment(result)
+                if not word_timestamps:
+                    self.last_align_error = "local forced aligner returned empty timestamps"
+                    return None
+                confidences = [
+                    item["confidence"]
+                    for item in word_timestamps
+                    if item.get("confidence") is not None
+                ]
+                confidence = (sum(confidences) / len(confidences)) if confidences else None
+                return {
+                    "word_timestamps": word_timestamps,
+                    "mode": "forced_aligner_local",
+                    "confidence": round(float(confidence), 4) if confidence is not None else None,
+                }
+            except Exception as exc:
+                self.last_align_error = str(exc)
+                logger.warning("[ASR] 本地 ForcedAligner 推理失败：%s", exc)
+                return None
+
         def align_transcript(
             self,
             audio_path: str,
@@ -804,12 +1048,20 @@ try:
                 self.last_align_error = f"audio file not found: {resolved_audio_path}"
                 return self._build_naive_alignment(normalized_transcript, audio_path="")
 
-            if (
-                not self.enabled
-                or not self.aligner_enabled
-                or MultiModalConversation is None
-                or not self.aligner_model
-            ):
+            if not self.aligner_enabled or not self.aligner_model:
+                return self._build_naive_alignment(normalized_transcript, resolved_audio_path)
+
+            if self.aligner_model_source == "local":
+                local_result = self._align_transcript_local(
+                    audio_path=resolved_audio_path,
+                    transcript=normalized_transcript,
+                    language=language,
+                )
+                if local_result is not None:
+                    return local_result
+                return self._build_naive_alignment(normalized_transcript, resolved_audio_path)
+
+            if not self.enabled or MultiModalConversation is None:
                 return self._build_naive_alignment(normalized_transcript, resolved_audio_path)
 
             try:

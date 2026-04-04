@@ -8,7 +8,7 @@ export default function GlobalFloatingActions() {
     const pathname = usePathname()
 
     // 这些页面有自己的顶部操作区，避免右上角浮层遮挡。
-    const shouldHide = pathname?.startsWith('/interview') || pathname?.startsWith('/liveness')
+    const shouldHide = pathname === '/' || pathname?.startsWith('/interview') || pathname?.startsWith('/liveness')
 
     if (shouldHide) {
         return null

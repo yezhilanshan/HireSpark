@@ -3,7 +3,11 @@
 import { Moon, Sun, Monitor } from 'lucide-react'
 import { useTheme } from './ThemeProvider'
 
-export default function ThemeToggle() {
+type ThemeToggleProps = {
+    mode?: 'floating' | 'inline'
+}
+
+export default function ThemeToggle({ mode = 'floating' }: ThemeToggleProps) {
     const { theme, setTheme } = useTheme()
 
     const toggleTheme = () => {
@@ -31,7 +35,11 @@ export default function ThemeToggle() {
     return (
         <button
             onClick={toggleTheme}
-            className="fixed right-4 top-4 z-50 inline-flex items-center gap-2 rounded-xl border border-slate-300/80 bg-white/85 px-4 py-2 text-sm font-semibold text-slate-700 shadow-xl backdrop-blur transition hover:-translate-y-0.5 hover:bg-white dark:border-slate-700 dark:bg-slate-900/80 dark:text-slate-100 dark:hover:bg-slate-900"
+            className={
+                mode === 'inline'
+                    ? 'inline-flex w-full items-center justify-center gap-2 rounded-xl border border-slate-300/80 bg-white/85 px-4 py-2 text-sm font-semibold text-slate-700 shadow-lg backdrop-blur transition hover:-translate-y-0.5 hover:bg-white dark:border-slate-700 dark:bg-slate-900/80 dark:text-slate-100 dark:hover:bg-slate-900'
+                    : 'fixed right-4 top-4 z-50 inline-flex items-center gap-2 rounded-xl border border-slate-300/80 bg-white/85 px-4 py-2 text-sm font-semibold text-slate-700 shadow-xl backdrop-blur transition hover:-translate-y-0.5 hover:bg-white dark:border-slate-700 dark:bg-slate-900/80 dark:text-slate-100 dark:hover:bg-slate-900'
+            }
             title={`当前主题: ${getLabel()}`}
         >
             {getIcon()}

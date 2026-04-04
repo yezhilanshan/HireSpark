@@ -2,6 +2,33 @@
 # PowerShell 版本
 
 $ErrorActionPreference = "Stop"
+$env:CONDA_NO_PLUGINS = "true"
+$env:CONDA_REPORT_ERRORS = "false"
+
+function Ensure-HomeEnv {
+    $userProfile = $env:USERPROFILE
+    if (-not $userProfile) {
+        $userProfile = [Environment]::GetFolderPath('UserProfile')
+    }
+    if (-not $userProfile -or -not (Test-Path $userProfile)) {
+        if ($env:USERNAME -and (Test-Path "C:\Users\$($env:USERNAME)")) {
+            $userProfile = "C:\Users\$($env:USERNAME)"
+        } else {
+            $userProfile = "C:\Users\Public"
+        }
+    }
+
+    $env:USERPROFILE = $userProfile
+    $env:HOME = $userProfile
+    $homeRoot = [System.IO.Path]::GetPathRoot($userProfile)
+    if (-not $homeRoot) {
+        $homeRoot = "C:\"
+    }
+    $env:HOMEDRIVE = $homeRoot.TrimEnd('\')
+    $env:HOMEPATH = $userProfile.Substring($env:HOMEDRIVE.Length)
+}
+
+Ensure-HomeEnv
 
 $BackendEnv = if ($env:BACKEND_CONDA_ENV) { $env:BACKEND_CONDA_ENV } else { "interview" }
 
@@ -20,7 +47,7 @@ Write-Host ""
 # 检查虚拟环境
 Write-Host "[1/4] 检查虚拟环境..." -ForegroundColor Yellow
 try {
-    $condaEnvs = conda env list 2>$null | Select-String $BackendEnv
+    $condaEnvs = conda --no-plugins env list 2>$null | Select-String $BackendEnv
     if ($condaEnvs) {
         Write-Host "✓ 虚拟环境已存在" -ForegroundColor Green
     } else {
@@ -49,12 +76,12 @@ if (Test-Path "config.yaml") {
 # 检查依赖
 Write-Host ""
 Write-Host "[3/4] 检查依赖..." -ForegroundColor Yellow
-$checkDeps = conda run -n $BackendEnv python -c "import flask, flask_socketio, cv2, mediapipe, psutil, yaml" 2>&1
+$checkDeps = conda --no-plugins run -n $BackendEnv python -c "import flask, flask_socketio, cv2, mediapipe, psutil, yaml" 2>&1
 if ($LASTEXITCODE -eq 0) {
     Write-Host "✓ 所有依赖已安装" -ForegroundColor Green
 } else {
     Write-Host "! 部分依赖缺失，正在安装..." -ForegroundColor Yellow
-    conda run -n $BackendEnv pip install -r ..\requirements.txt
+    conda --no-plugins run -n $BackendEnv pip install -r ..\requirements.txt
     if ($LASTEXITCODE -eq 0) {
         Write-Host "✓ 依赖安装完成" -ForegroundColor Green
     } else {
@@ -77,7 +104,7 @@ Write-Host "============================================================" -Foreg
 Write-Host ""
 
 # 启动
-conda run -n $BackendEnv python app.py
+conda --no-plugins run -n $BackendEnv python app.py
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host ""
