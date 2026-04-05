@@ -6,19 +6,59 @@ import SocketClient from '@/lib/socket'
 import { useFacePhysRppg } from '@/lib/facephys/useFacePhysRppg'
 import { Mic, Loader2, ArrowRight, User, X, CheckCircle2, MessageSquare } from 'lucide-react'
 
+const parseBooleanEnv = (value: string | undefined, fallback: boolean) => {
+    if (value == null) return fallback
+    const normalized = value.trim().toLowerCase()
+    if (['1', 'true', 'yes', 'on'].includes(normalized)) return true
+    if (['0', 'false', 'no', 'off'].includes(normalized)) return false
+    return fallback
+}
+
+const parseNumberEnv = (value: string | undefined, fallback: number) => {
+    if (value == null) return fallback
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : fallback
+}
+
 const BACKEND_API_BASE = (process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000').replace(/\/$/, '')
-const SERVER_ASR_ACTIVE_COOLDOWN_MS = 3200
+const SERVER_ASR_ACTIVE_COOLDOWN_MS = parseNumberEnv(process.env.NEXT_PUBLIC_SERVER_ASR_ACTIVE_COOLDOWN_MS, 350)
 const SERVER_ASR_FALLBACK_DELAY_MS = 3200
 const SERVER_ASR_STALL_WINDOW_MS = 3200
 const SERVER_ASR_RECHECK_DELAY_MS = 1100
 const ENABLE_BROWSER_ASR_STALL_FALLBACK = false
-const ASR_DEBUG_PANEL_ENABLED = process.env.NEXT_PUBLIC_ASR_DEBUG_PANEL !== 'false'
+const ASR_DEBUG_PANEL_ENABLED = false
 const ASR_DEBUG_MAX_ITEMS = 120
 const BASE_SILENCE_MS = 1650
 const BROWSER_SILENCE_BONUS_MS = 220
 const NOISY_ENV_SILENCE_BONUS_MS = 320
 const MIN_ADAPTIVE_SILENCE_MS = 1650
 const MAX_ADAPTIVE_SILENCE_MS = 2600
+const ASR_NOISE_FLOOR_MIN = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_NOISE_FLOOR_MIN, 0.001)
+const ASR_NOISE_FLOOR_MAX = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_NOISE_FLOOR_MAX, 0.03)
+const ASR_ACTIVATION_MULTIPLIER = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_ACTIVATION_MULTIPLIER, 2.35)
+const ASR_ACTIVATION_MIN = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_ACTIVATION_MIN, 0.008)
+const ASR_ACTIVATION_MAX = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_ACTIVATION_MAX, 0.04)
+const ASR_FAST_START_WINDOW_MS = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_FAST_START_WINDOW_MS, 2000)
+const ASR_FAST_START_ACTIVATION_MULTIPLIER = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_FAST_START_ACTIVATION_MULTIPLIER, 1.55)
+const ASR_FAST_START_ACTIVATION_MIN = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_FAST_START_ACTIVATION_MIN, 0.0045)
+const ASR_FAST_START_STRONG_MULTIPLIER = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_FAST_START_STRONG_MULTIPLIER, 1.08)
+const ASR_HOLD_MULTIPLIER = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_HOLD_MULTIPLIER, 1.65)
+const ASR_HOLD_MIN = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_HOLD_MIN, 0.005)
+const ASR_HOLD_MAX = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_HOLD_MAX, 0.028)
+const ASR_STRONG_SPEECH_MULTIPLIER = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_STRONG_SPEECH_MULTIPLIER, 1.22)
+const ASR_AUDIO_CHUNK_MS = 100
+const ASR_PREBUFFER_TARGET_MS = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_PREBUFFER_TARGET_MS, 2200)
+const ASR_PREBUFFER_MAX_CHUNKS = Math.max(
+    8,
+    Math.round(ASR_PREBUFFER_TARGET_MS / ASR_AUDIO_CHUNK_MS)
+)
+const ASR_CAPTURE_CONSTRAINTS: MediaTrackConstraints = {
+    sampleRate: 16000,
+    channelCount: 1,
+    echoCancellation: parseBooleanEnv(process.env.NEXT_PUBLIC_ASR_ECHO_CANCELLATION, true),
+    noiseSuppression: parseBooleanEnv(process.env.NEXT_PUBLIC_ASR_NOISE_SUPPRESSION, true),
+    autoGainControl: parseBooleanEnv(process.env.NEXT_PUBLIC_ASR_AUTO_GAIN_CONTROL, true),
+}
 
 interface ChatMessage {
     role: 'interviewer' | 'candidate'
@@ -162,6 +202,7 @@ export default function InterviewPage() {
     const speechActiveRef = useRef(false)
     const consecutiveSpeechFramesRef = useRef(0)
     const lastSpeechAtRef = useRef(0)
+    const fastStartUntilRef = useRef(0)
     const clientSpeechEpochRef = useRef(0)
     const activeSpeechEpochRef = useRef(0)
     const speechPrebufferRef = useRef<ArrayBuffer[]>([])
@@ -221,6 +262,36 @@ export default function InterviewPage() {
 
     const clearSpeechPrebuffer = () => {
         speechPrebufferRef.current = []
+    }
+
+    const pushLocalAsrDebugEvent = (event: string, fields: Partial<AsrDebugEvent> = {}) => {
+        if (!ASR_DEBUG_PANEL_ENABLED) {
+            return
+        }
+        const fallbackSpeechEpoch = activeSpeechEpochRef.current || clientSpeechEpochRef.current || ''
+        const item: AsrDebugEvent = {
+            event,
+            level: String(fields.level || 'debug'),
+            timestamp: Date.now() / 1000,
+            session_id: sessionIdRef.current,
+            turn_id: currentTurnIdRef.current,
+            source: 'client',
+            reason: fields.reason || '',
+            reason_detail: fields.reason_detail || '',
+            asr_generation: fields.asr_generation ?? '',
+            speech_epoch: fields.speech_epoch ?? fallbackSpeechEpoch,
+            details: fields.details || '',
+            partial_preview: fields.partial_preview || '',
+            final_preview: fields.final_preview || '',
+            segment_preview: fields.segment_preview || '',
+            answer_preview: fields.answer_preview || '',
+            text_snapshot: fields.text_snapshot || '',
+        }
+
+        setAsrDebugEvents((prev) => {
+            const next = [...prev, item]
+            return next.slice(-ASR_DEBUG_MAX_ITEMS)
+        })
     }
 
     const clamp = (value: number, min: number, max: number) => {
@@ -468,7 +539,7 @@ export default function InterviewPage() {
         asrChannelRef.current = 'server'
     }
 
-    const enqueueSpeechPrebuffer = (buffer: ArrayBuffer, maxChunks = 6) => {
+    const enqueueSpeechPrebuffer = (buffer: ArrayBuffer, maxChunks = ASR_PREBUFFER_MAX_CHUNKS) => {
         speechPrebufferRef.current.push(buffer)
         if (speechPrebufferRef.current.length > maxChunks) {
             speechPrebufferRef.current.splice(0, speechPrebufferRef.current.length - maxChunks)
@@ -799,20 +870,6 @@ export default function InterviewPage() {
     }, [chatMessages])
 
     useEffect(() => {
-        if (!showAsrDebugPanel) {
-            return
-        }
-        const panel = asrDebugScrollContainerRef.current
-        if (!panel) {
-            return
-        }
-        panel.scrollTo({
-            top: panel.scrollHeight,
-            behavior: 'smooth',
-        })
-    }, [asrDebugEvents, showAsrDebugPanel])
-
-    useEffect(() => {
         if (!videoRef.current || !cameraStreamRef.current) {
             return
         }
@@ -957,6 +1014,7 @@ export default function InterviewPage() {
                     isTTSSpeakingRef.current = false
                     isAiSpeakingRef.current = false
                     setIsAiSpeaking(false)
+                    resumeAudioRecordingAfterTts()
                 }
                 playNextTtsChunk()
             }
@@ -987,13 +1045,7 @@ export default function InterviewPage() {
 
         try {
             const stream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    sampleRate: 16000,
-                    channelCount: 1,
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true
-                }
+                audio: ASR_CAPTURE_CONSTRAINTS
             })
             microphoneStreamRef.current = stream
 
@@ -1037,16 +1089,37 @@ export default function InterviewPage() {
                     if (!speechActiveRef.current) {
                         noiseFloorRef.current = clamp(
                             noiseFloorRef.current * 0.92 + rms * 0.08,
-                            0.0015,
-                            0.03
+                            ASR_NOISE_FLOOR_MIN,
+                            ASR_NOISE_FLOOR_MAX
                         )
                     }
 
-                    const activationThreshold = clamp(noiseFloorRef.current * 2.8, 0.012, 0.045)
-                    const holdThreshold = clamp(noiseFloorRef.current * 1.9, 0.008, 0.032)
-                    const speechThreshold = speechActiveRef.current ? holdThreshold : activationThreshold
+                    const activationThreshold = clamp(
+                        noiseFloorRef.current * ASR_ACTIVATION_MULTIPLIER,
+                        ASR_ACTIVATION_MIN,
+                        ASR_ACTIVATION_MAX
+                    )
+                    const fastStartActivationThreshold = clamp(
+                        noiseFloorRef.current * ASR_FAST_START_ACTIVATION_MULTIPLIER,
+                        ASR_FAST_START_ACTIVATION_MIN,
+                        ASR_ACTIVATION_MAX
+                    )
+                    const holdThreshold = clamp(
+                        noiseFloorRef.current * ASR_HOLD_MULTIPLIER,
+                        ASR_HOLD_MIN,
+                        ASR_HOLD_MAX
+                    )
+                    const isFastStartWindow = !speechActiveRef.current
+                        && fastStartUntilRef.current > 0
+                        && now <= fastStartUntilRef.current
+                    const startThreshold = isFastStartWindow
+                        ? Math.min(activationThreshold, fastStartActivationThreshold)
+                        : activationThreshold
+                    const speechThreshold = speechActiveRef.current ? holdThreshold : startThreshold
                     const isSpeechChunk = rms >= speechThreshold
-                    const requiredSpeechFrames = rms >= activationThreshold * 1.35 ? 2 : 3
+                    const requiredSpeechFrames = isFastStartWindow
+                        ? (rms >= startThreshold * ASR_FAST_START_STRONG_MULTIPLIER ? 1 : 2)
+                        : (rms >= activationThreshold * ASR_STRONG_SPEECH_MULTIPLIER ? 2 : 3)
                     enqueueSpeechPrebuffer(pcmData)
 
                     if (isSpeechChunk) {
@@ -1063,6 +1136,11 @@ export default function InterviewPage() {
                             const prebufferChunks = [...speechPrebufferRef.current]
                             if (isServerAsrAvailableRef.current) {
                                 asrChannelRef.current = 'server'
+                                const prebufferMs = prebufferChunks.length * ASR_AUDIO_CHUNK_MS
+                                pushLocalAsrDebugEvent('client_speech_start_emit', {
+                                    speech_epoch: activeSpeechEpochRef.current,
+                                    details: `rms=${rms.toFixed(4)} threshold=${speechThreshold.toFixed(4)} channel=server prebuffer_chunks=${prebufferChunks.length} prebuffer_ms=${prebufferMs}`,
+                                })
                                 socketRef.current.emit('speech_start', {
                                     session_id: sessionIdRef.current,
                                     turn_id: currentTurnIdRef.current,
@@ -1097,6 +1175,10 @@ export default function InterviewPage() {
                     if (speechActiveRef.current && now - lastSpeechAtRef.current >= adaptiveSilenceMs) {
                         speechActiveRef.current = false
                         if (isServerAsrAvailableRef.current && asrChannelRef.current === 'server' && activeSpeechEpochRef.current > 0) {
+                            pushLocalAsrDebugEvent('client_speech_end_emit', {
+                                speech_epoch: activeSpeechEpochRef.current,
+                                details: `silence_ms=${Math.round(now - lastSpeechAtRef.current)} channel=server`,
+                            })
                             socketRef.current.emit('speech_end', {
                                 session_id: sessionIdRef.current,
                                 turn_id: currentTurnIdRef.current,
@@ -1174,7 +1256,24 @@ export default function InterviewPage() {
         asrChannelRef.current = 'none'
         setIsRecording(true)
         setIsListening(true)
+        pushLocalAsrDebugEvent('client_recording_started', {
+            details: `server_asr=${String(isServerAsrAvailableRef.current)} browser_asr=${String(isBrowserAsrSupportedRef.current)}`,
+        })
         console.log('[ASR] 开始录音')
+    }
+
+    const resumeAudioRecordingAfterTts = () => {
+        if (
+            !interviewStartedRef.current
+            || isAiSpeakingRef.current
+            || isRecordingRef.current
+            || isAnswerAsrLocked()
+            || ['finalizing', 'finalized'].includes(answerSessionStatusRef.current)
+        ) {
+            return
+        }
+        fastStartUntilRef.current = performance.now() + ASR_FAST_START_WINDOW_MS
+        void startAudioRecording()
     }
 
     const stopAudioRecording = () => {
@@ -1192,6 +1291,10 @@ export default function InterviewPage() {
             && asrChannelRef.current === 'server'
             && activeSpeechEpochRef.current > 0
         ) {
+            pushLocalAsrDebugEvent('client_speech_end_emit', {
+                speech_epoch: activeSpeechEpochRef.current,
+                details: 'stopAudioRecording channel=server',
+            })
             socketRef.current.emit('speech_end', {
                 session_id: sessionIdRef.current,
                 turn_id: currentTurnIdRef.current,
@@ -1202,11 +1305,13 @@ export default function InterviewPage() {
         speechActiveRef.current = false
         consecutiveSpeechFramesRef.current = 0
         activeSpeechEpochRef.current = 0
+        fastStartUntilRef.current = 0
         asrChannelRef.current = 'none'
         clearSpeechPrebuffer()
         isRecordingRef.current = false
         setIsRecording(false)
         setIsListening(false)
+        pushLocalAsrDebugEvent('client_recording_stopped')
         console.log('[ASR] 停止录音')
     }
 
@@ -1496,12 +1601,26 @@ export default function InterviewPage() {
                 if (data?.session_id && sessionIdRef.current && data.session_id !== sessionIdRef.current) return
                 if (typeof data?.interrupt_epoch === 'number' && data.interrupt_epoch < interruptEpochRef.current) return
 
-                speakText(data.spoken_text || data.display_text)
-                setChatMessages(prev => [...prev, {
-                    role: 'interviewer',
-                    content: data.display_text,
-                    timestamp: new Date().toLocaleTimeString()
-                }])
+                const shouldSpeakNotice =
+                    Boolean((data?.spoken_text || '').trim())
+                    && !isRecordingRef.current
+                    && !speechActiveRef.current
+                    && !isAiSpeakingRef.current
+                    && !isAnswerAsrLocked()
+                if (shouldSpeakNotice) {
+                    speakText(data.spoken_text)
+                }
+                setChatMessages(prev => {
+                    const lastMessage = prev[prev.length - 1]
+                    if (lastMessage?.role === 'interviewer' && lastMessage.content.trim() === String(data.display_text).trim()) {
+                        return prev
+                    }
+                    return [...prev, {
+                        role: 'interviewer',
+                        content: data.display_text,
+                        timestamp: new Date().toLocaleTimeString()
+                    }]
+                })
             })
 
             socketClient.on('pipeline_error', (data: any) => {
@@ -1810,7 +1929,6 @@ export default function InterviewPage() {
             || ''
         )
     }
-
     if (interviewStarted) {
         return (
             <div
@@ -2014,7 +2132,7 @@ export default function InterviewPage() {
                                         className="max-h-44 space-y-1.5 overflow-y-auto border-t border-[#E5E5E5] px-3 py-2"
                                     >
                                         {asrDebugEvents.length === 0 ? (
-                                            <p className="text-[11px] text-[#8A8376]">等待 ASR 调试事件...</p>
+                                            <p className="text-[11px] text-[#8A8376]">等待后端 ASR 调试事件...</p>
                                         ) : (
                                             asrDebugEvents.map((item, index) => {
                                                 const preview = buildDebugPreview(item)

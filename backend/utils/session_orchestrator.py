@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional
 
 from utils import DataManager
 
+DETECTION_NOTICE_MIN_INTERVAL_SECONDS = 18.0
+
 
 @dataclass
 class SessionRuntime:
@@ -220,7 +222,7 @@ class StateOrchestrator:
         notice_key = ""
         notice_text = ""
 
-        if "no_face_long" in flags or not has_face:
+        if "no_face_long" in flags:
             notice_key = "no_face_long"
             notice_text = "我暂时看不到你，请调整一下摄像头位置。"
         elif "device_muted" in flags or "mic_issue" in flags:
@@ -232,7 +234,7 @@ class StateOrchestrator:
 
         now = time.time()
         last_notice_at = runtime.last_notice_at.get(notice_key, 0)
-        if now - last_notice_at < 8.0:
+        if now - last_notice_at < DETECTION_NOTICE_MIN_INTERVAL_SECONDS:
             return None
 
         runtime.last_notice_at[notice_key] = now
