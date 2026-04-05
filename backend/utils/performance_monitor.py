@@ -39,6 +39,7 @@ class PerformanceMonitor:
         self.max_fps = config.get('performance.max_fps', 30)
         self.monitoring_interval = config.get('performance.monitoring_interval', 10)
         self.history_size = config.get('performance.history_size', 100)
+        self.log_stats = config.get('performance.log_stats', False)
         
         # FPS 追踪
         self.frame_times = deque(maxlen=self.history_size)
@@ -208,13 +209,14 @@ class PerformanceMonitor:
         """记录性能统计日志"""
         stats = self.get_system_stats()
         
-        logger.info(
-            f"性能统计 - "
-            f"FPS: {stats['fps']}, "
-            f"处理时间: {stats['avg_processing_time_ms']}ms, "
-            f"CPU: {stats['cpu_percent']}%, "
-            f"内存: {stats['memory_percent']}% ({stats['memory_used_mb']}MB)"
-        )
+        if self.log_stats:
+            logger.info(
+                f"性能统计 - "
+                f"FPS: {stats['fps']}, "
+                f"处理时间: {stats['avg_processing_time_ms']}ms, "
+                f"CPU: {stats['cpu_percent']}%, "
+                f"内存: {stats['memory_percent']}% ({stats['memory_used_mb']}MB)"
+            )
         
         # 保存到历史
         self.performance_history.append({

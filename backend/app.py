@@ -53,7 +53,14 @@ except Exception as e:
     evaluation_import_error = str(e)
 from utils.logger import get_logger
 from utils.performance_monitor import performance_monitor, measure_time
-from utils.answer_session import AnswerSession, LONG_PAUSE_SECONDS, SHORT_PAUSE_SECONDS, merge_answer_text
+from utils.answer_session import (
+    AnswerSession,
+    LONG_PAUSE_SECONDS,
+    SHORT_PAUSE_SECONDS,
+    build_live_answer_text,
+    merge_answer_text,
+    stabilize_realtime_asr_text,
+)
 from utils.session_orchestrator import SessionRegistry, StateOrchestrator
 from utils.speech_normalizer import SpeechTextNormalizer
 from utils.speech_metrics import compute_final_speech_metrics, aggregate_expression_metrics
@@ -715,10 +722,7 @@ def _merge_asr_fragments(fragments: list[str]) -> str:
 def _build_pending_asr_text(runtime) -> tuple[str, str, str]:
     final_text = _merge_asr_fragments(runtime.pending_asr_finals)
     partial_text = _merge_asr_fragments(runtime.pending_asr_partials)
-    if final_text and partial_text:
-        merged_text = merge_answer_text(final_text, partial_text)
-    else:
-        merged_text = final_text or partial_text
+    merged_text = build_live_answer_text(final_text, partial_text)
     return final_text, partial_text, str(merged_text or "").strip()
 
 
@@ -1686,23 +1690,41 @@ def _maybe_emit_session_notice(runtime):
 
     notice_text = runtime.notice_queue.pop(0)
     normalized = speech_normalizer.normalize(notice_text)
+    answer_session = getattr(runtime, 'current_answer_session', None)
+    answer_status = str(getattr(answer_session, 'status', '') or '').strip()
+    answer_text_in_progress = bool(
+        str(getattr(answer_session, 'live_text', '') or '').strip()
+        or str(getattr(answer_session, 'merged_text_draft', '') or '').strip()
+        or str(getattr(answer_session, 'current_partial', '') or '').strip()
+    )
+    answer_in_progress = bool(
+        runtime.active_asr_generation
+        or runtime.finalizing_asr_generation
+        or (
+            answer_session
+            and not getattr(answer_session, 'committed', False)
+            and (answer_status in {'recording', 'paused_short', 'finalizing'} or answer_text_in_progress)
+        )
+    )
+    spoken_text = '' if answer_in_progress else normalized['spoken_text']
     _log_runtime_event(
         runtime,
         'session_notice',
         source='detection_state',
         display_text=normalized['display_text'][:120],
-        spoken_text=normalized['spoken_text'][:120],
+        spoken_text=spoken_text[:120],
+        notice_audio_suppressed=answer_in_progress,
     )
     socketio.emit('session_control_notice', {
         'session_id': runtime.session_id,
         'turn_id': runtime.turn_id,
         'job_id': '',
         'display_text': normalized['display_text'],
-        'spoken_text': normalized['spoken_text'],
+        'spoken_text': '',
+        'speak_now': False,
         'interrupt_epoch': runtime.interrupt_epoch,
         'timestamp': time.time()
     }, to=runtime.client_id)
-    _start_runtime_tts(runtime, normalized['spoken_text'], runtime.turn_id, source='session_control')
 
 
 def _start_runtime_tts(runtime, spoken_text: str, turn_id: str, source: str = 'reply'):
@@ -1858,9 +1880,11 @@ def _start_runtime_asr(runtime, reason: str = "speech_start") -> bool:
                     lock_reason=live_runtime.asr_lock_reason,
                 )
                 return
-            partial_text = str(text or '').strip()
+            partial_text = stabilize_realtime_asr_text(text)
             if not partial_text:
                 return
+            previous_partial = _merge_asr_fragments(live_runtime.pending_asr_partials)
+            previous_final = _merge_asr_fragments(live_runtime.pending_asr_finals)
             # partial 只保留最新快照，避免 revision 抖动导致重复累积。
             live_runtime.pending_asr_partials = [partial_text]
             _final_text, _partial_text, preview_text = _build_pending_asr_text(live_runtime)
@@ -1882,6 +1906,22 @@ def _start_runtime_asr(runtime, reason: str = "speech_start") -> bool:
                 stream_id=live_runtime.active_asr_stream_id,
                 asr_generation=asr_generation,
                 partial_preview=partial_text[:120],
+            )
+            _log_runtime_event(
+                live_runtime,
+                'asr_partial_trace',
+                level='info',
+                stream_id=live_runtime.active_asr_stream_id,
+                asr_generation=asr_generation,
+                details=(
+                    f"prev_partial_units={_count_text_units(previous_partial)} "
+                    f"prev_final_units={_count_text_units(previous_final)} "
+                    f"incoming_units={_count_text_units(partial_text)} "
+                    f"preview_units={_count_text_units(preview_text)}"
+                ),
+                partial_preview=partial_text[:160],
+                final_preview=previous_final[:160],
+                text_snapshot=preview_text[:200],
             )
             _emit_answer_session_update(live_runtime, source='asr_partial')
             socketio.emit('asr_partial', {
@@ -1919,12 +1959,15 @@ def _start_runtime_asr(runtime, reason: str = "speech_start") -> bool:
                     lock_reason=live_runtime.asr_lock_reason,
                 )
                 return
-            final_text = str(text or '').strip()
+            final_text = stabilize_realtime_asr_text(text)
             if not final_text:
                 return
+            previous_partial = _merge_asr_fragments(live_runtime.pending_asr_partials)
+            previous_final = _merge_asr_fragments(live_runtime.pending_asr_finals)
             merged_final = _merge_asr_fragments(live_runtime.pending_asr_finals)
             merged_final = merge_answer_text(merged_final, final_text) if merged_final else final_text
             live_runtime.pending_asr_finals = [merged_final]
+            live_runtime.pending_asr_partials.clear()
             _merged_final, _merged_partial, preview_text = _build_pending_asr_text(live_runtime)
             answer_session = _ensure_answer_session(live_runtime)
             answer_session.mark_status('recording')
@@ -1944,6 +1987,23 @@ def _start_runtime_asr(runtime, reason: str = "speech_start") -> bool:
                 asr_generation=asr_generation,
                 final_preview=final_text[:160],
                 final_count=len(live_runtime.pending_asr_finals),
+            )
+            _log_runtime_event(
+                live_runtime,
+                'asr_final_trace',
+                level='info',
+                stream_id=live_runtime.active_asr_stream_id,
+                asr_generation=asr_generation,
+                details=(
+                    f"prev_final_units={_count_text_units(previous_final)} "
+                    f"prev_partial_units={_count_text_units(previous_partial)} "
+                    f"incoming_units={_count_text_units(final_text)} "
+                    f"merged_final_units={_count_text_units(merged_final)} "
+                    f"preview_units={_count_text_units(preview_text)}"
+                ),
+                partial_preview=previous_partial[:160],
+                final_preview=final_text[:160],
+                text_snapshot=preview_text[:200],
             )
             _emit_answer_session_update(live_runtime, source='asr_sentence_final')
             socketio.emit('asr_final', {

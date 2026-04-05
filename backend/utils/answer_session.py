@@ -6,6 +6,7 @@ from __future__ import annotations
 import re
 import time
 import uuid
+from difflib import SequenceMatcher
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -17,6 +18,7 @@ _SPACE_RE = re.compile(r"\s+")
 _DUPLICATE_PUNCT_RE = re.compile(r"([，。！？；,.!?])\1+")
 _PUNCT_ENDINGS = "。！？!?；;"
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_CJK_STUTTER_RUN_RE = re.compile(r"([\u4e00-\u9fff])\1{2,}")
 _EN_WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
 _DIGIT_RE = re.compile(r"\d+")
 _CONTINUATION_PREFIXES = (
@@ -50,10 +52,47 @@ def normalize_answer_text(text: str) -> str:
     return normalized.strip()
 
 
+def stabilize_realtime_asr_text(text: str) -> str:
+    normalized = normalize_answer_text(text)
+    if not normalized:
+        return ""
+    stabilized = _CJK_STUTTER_RUN_RE.sub(r"\1", normalized)
+    return normalize_answer_text(stabilized)
+
+
+def dedupe_answer_text(text: str) -> str:
+    normalized = normalize_answer_text(text)
+    if not normalized:
+        return ""
+
+    parts = re.findall(r"[^。！？!?；;]+[。！？!?；;]?", normalized)
+    if len(parts) <= 1:
+        return normalized
+
+    collapsed: list[str] = []
+    for part in parts:
+        sentence = normalize_answer_text(part)
+        if not sentence:
+            continue
+        if not collapsed:
+            collapsed.append(sentence)
+            continue
+
+        previous = collapsed[-1]
+        if _looks_like_sentence_duplicate(previous, sentence):
+            collapsed[-1] = _prefer_more_complete_sentence(previous, sentence)
+            continue
+        collapsed.append(sentence)
+
+    return normalize_answer_text("".join(collapsed))
+
+
 def build_live_answer_text(draft_text: str, partial_text: str) -> str:
-    draft = normalize_answer_text(draft_text)
-    partial = normalize_answer_text(partial_text)
+    draft = stabilize_realtime_asr_text(draft_text)
+    partial = stabilize_realtime_asr_text(partial_text)
     if not partial:
+        return draft
+    if draft and _count_spoken_tokens(partial) <= 2:
         return draft
     return merge_answer_text(draft, partial)
 
@@ -70,6 +109,8 @@ def merge_answer_text(existing_text: str, incoming_text: str) -> str:
         return existing
     if incoming.startswith(existing):
         return incoming
+    if _looks_like_revision(existing, incoming):
+        return _cleanup_merged_text(_prefer_more_complete_text(existing, incoming))
 
     overlap = _find_overlap(existing, incoming)
     if overlap:
@@ -85,6 +126,84 @@ def _find_overlap(existing: str, incoming: str) -> int:
         if existing[-length:] == incoming[:length]:
             return length
     return 0
+
+
+def _common_prefix_length(left: str, right: str) -> int:
+    limit = min(len(left), len(right))
+    index = 0
+    while index < limit and left[index] == right[index]:
+        index += 1
+    return index
+
+
+def _common_suffix_length(left: str, right: str) -> int:
+    limit = min(len(left), len(right))
+    index = 0
+    while index < limit and left[-(index + 1)] == right[-(index + 1)]:
+        index += 1
+    return index
+
+
+def _prefer_more_complete_text(existing: str, incoming: str) -> str:
+    existing_units = _count_spoken_tokens(existing)
+    incoming_units = _count_spoken_tokens(incoming)
+    if incoming_units > existing_units:
+        return incoming
+    if existing_units > incoming_units:
+        return existing
+    return incoming if len(incoming) >= len(existing) else existing
+
+
+def _strip_sentence_ending(text: str) -> str:
+    return str(text or "").rstrip("。！？!?；; ").strip()
+
+
+def _prefer_more_complete_sentence(existing: str, incoming: str) -> str:
+    preferred = _prefer_more_complete_text(_strip_sentence_ending(existing), _strip_sentence_ending(incoming))
+    ending = ""
+    for candidate in (existing, incoming):
+        stripped = str(candidate or "").rstrip()
+        if stripped and stripped[-1] in "。！？!?；;":
+            ending = stripped[-1]
+            break
+    return f"{preferred}{ending}" if ending and not preferred.endswith(ending) else preferred
+
+
+def _looks_like_sentence_duplicate(existing: str, incoming: str) -> bool:
+    left = _strip_sentence_ending(existing)
+    right = _strip_sentence_ending(incoming)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    if left in right or right in left:
+        min_len = min(len(left), len(right))
+        return min_len >= 10
+    return _looks_like_revision(left, right)
+
+
+def _looks_like_revision(existing: str, incoming: str) -> bool:
+    if not existing or not incoming:
+        return False
+    if existing == incoming or existing in incoming or incoming in existing:
+        return False
+
+    min_len = min(len(existing), len(incoming))
+    max_len = max(len(existing), len(incoming))
+    if min_len < 12:
+        return False
+
+    prefix_len = _common_prefix_length(existing, incoming)
+    suffix_len = _common_suffix_length(existing, incoming)
+    shared_edge = max(prefix_len, suffix_len)
+    similarity = SequenceMatcher(None, existing, incoming).ratio()
+    length_ratio = float(min_len) / float(max_len or 1)
+
+    return (
+        length_ratio >= 0.58
+        and similarity >= 0.72
+        and shared_edge >= max(6, int(min_len * 0.28))
+    )
 
 
 def _looks_like_continuation(existing: str, incoming: str) -> bool:
@@ -185,7 +304,7 @@ class AnswerSession:
             self.ended_at = self.updated_at
 
     def mark_final(self, text: str, reason: str = "", exported_audio_path: str = "") -> str:
-        final_text = normalize_answer_text(text) or self.merged_text_draft
+        final_text = dedupe_answer_text(text) or dedupe_answer_text(self.merged_text_draft)
         self.final_text = final_text
         self.final_transcript = final_text
         self.finalized_reason = reason
@@ -250,7 +369,7 @@ class AnswerSession:
         filler_events: List[Dict[str, Any]],
         speech_metrics_final: Dict[str, Any],
     ) -> Dict[str, Any]:
-        self.final_transcript = normalize_answer_text(final_transcript) or self.final_text or self.merged_text_draft
+        self.final_transcript = dedupe_answer_text(final_transcript) or self.final_text or dedupe_answer_text(self.merged_text_draft)
         self.word_timestamps = list(word_timestamps or [])
         self.pause_events = list(pause_events or [])
         self.filler_events = list(filler_events or [])
