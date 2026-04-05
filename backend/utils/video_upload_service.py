@@ -31,15 +31,68 @@ class VideoUploadService:
         self.default_expires_seconds = int(config.get("video_upload.upload_expires_seconds", 3600))
         self.enable_transcode = bool(config.get("video_upload.enable_transcode", True))
         self.keep_raw = bool(config.get("video_upload.keep_raw", True))
+        self.transcode_preset = str(config.get("video_upload.transcode_preset", "veryfast") or "veryfast").strip()
+        self.transcode_crf = int(config.get("video_upload.transcode_crf", 23))
+        self.transcode_target_fps = max(1, int(config.get("video_upload.transcode_target_fps", 30)))
+        self.transcode_gop_seconds = max(0.25, float(config.get("video_upload.transcode_gop_seconds", 1.0)))
+        self.transcode_audio_bitrate = str(config.get("video_upload.transcode_audio_bitrate", "128k") or "128k").strip()
+        self.transcode_timeout_seconds = max(120, int(config.get("video_upload.transcode_timeout_seconds", 7200)))
+        self._ffmpeg_path = ""
+        self._ffprobe_path = ""
+        self._refresh_transcode_tools(force=True)
 
         self.upload_root.mkdir(parents=True, exist_ok=True)
         self.final_root.mkdir(parents=True, exist_ok=True)
+
+        if self.enable_transcode and not self._ffmpeg_path and self.logger:
+            self.logger.warning("[Replay] ffmpeg 未安装，视频将保留原始容器，拖动体验可能受限")
+        if not self._ffprobe_path and self.logger:
+            self.logger.info("[Replay] ffprobe 未安装，无法精确探测视频时长")
 
         self.signing_secret = str(
             config.get("video_upload.playback_signing_secret", "")
             or config.get("server.secret_key", "")
             or "interview-replay-secret"
         )
+
+    def _resolve_binary(self, binary_name: str) -> str:
+        direct = shutil.which(binary_name)
+        if direct:
+            return direct
+
+        env_key = "FFMPEG_BINARY" if binary_name == "ffmpeg" else "FFPROBE_BINARY"
+        env_path = str(os.getenv(env_key, "")).strip()
+        if env_path and Path(env_path).exists():
+            return env_path
+
+        exe_name = f"{binary_name}.exe"
+        candidates = []
+        local_app_data = str(os.getenv("LOCALAPPDATA", "")).strip()
+        program_files = str(os.getenv("ProgramFiles", "")).strip()
+        chocolatey = str(os.getenv("ChocolateyInstall", "")).strip()
+
+        if local_app_data:
+            candidates.append(Path(local_app_data) / "Microsoft" / "WinGet" / "Links" / exe_name)
+            winget_pkg_root = Path(local_app_data) / "Microsoft" / "WinGet" / "Packages"
+            if winget_pkg_root.exists():
+                for package_dir in winget_pkg_root.glob("Gyan.FFmpeg*"):
+                    candidates.extend(package_dir.glob(f"**/bin/{exe_name}"))
+
+        if program_files:
+            candidates.append(Path(program_files) / "ffmpeg" / "bin" / exe_name)
+        if chocolatey:
+            candidates.append(Path(chocolatey) / "bin" / exe_name)
+
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+        return ""
+
+    def _refresh_transcode_tools(self, force: bool = False) -> None:
+        if force or not self._ffmpeg_path:
+            self._ffmpeg_path = self._resolve_binary("ffmpeg")
+        if force or not self._ffprobe_path:
+            self._ffprobe_path = self._resolve_binary("ffprobe")
 
     @staticmethod
     def _sanitize_filename(value: str) -> str:
@@ -123,16 +176,15 @@ class VideoUploadService:
                 with open(part_path, "rb") as reader:
                     shutil.copyfileobj(reader, writer)
 
-    @staticmethod
-    def _detect_duration_ms(video_path: Path) -> float:
-        ffprobe = shutil.which("ffprobe")
-        if not ffprobe:
+    def _detect_duration_ms(self, video_path: Path) -> float:
+        self._refresh_transcode_tools(force=False)
+        if not self._ffprobe_path:
             return 0.0
 
         try:
             proc = subprocess.run(
                 [
-                    ffprobe,
+                    self._ffprobe_path,
                     "-v", "error",
                     "-show_entries", "format=duration",
                     "-of", "default=noprint_wrappers=1:nokey=1",
@@ -151,26 +203,38 @@ class VideoUploadService:
             return 0.0
 
     def _transcode_to_mp4(self, input_path: Path, output_path: Path) -> bool:
-        ffmpeg = shutil.which("ffmpeg")
-        if not ffmpeg:
+        self._refresh_transcode_tools(force=False)
+        if not self._ffmpeg_path:
             return False
+
+        gop_size = max(1, int(round(self.transcode_gop_seconds * self.transcode_target_fps)))
 
         try:
             proc = subprocess.run(
                 [
-                    ffmpeg,
+                    self._ffmpeg_path,
                     "-y",
                     "-i", str(input_path),
+                    "-map", "0:v:0",
+                    "-map", "0:a:0?",
                     "-c:v", "libx264",
-                    "-preset", "veryfast",
+                    "-preset", self.transcode_preset,
+                    "-crf", str(self.transcode_crf),
+                    "-pix_fmt", "yuv420p",
+                    "-r", str(self.transcode_target_fps),
+                    "-g", str(gop_size),
+                    "-keyint_min", str(gop_size),
+                    "-sc_threshold", "0",
+                    "-force_key_frames", f"expr:gte(t,n_forced*{self.transcode_gop_seconds})",
                     "-movflags", "+faststart",
                     "-c:a", "aac",
+                    "-b:a", self.transcode_audio_bitrate,
                     str(output_path),
                 ],
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=180,
+                timeout=self.transcode_timeout_seconds,
             )
             return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0
         except Exception:
@@ -202,19 +266,27 @@ class VideoUploadService:
         final_path = merged_path
         codec = str(session.get("codec") or "")
         status = "uploaded"
+        self._refresh_transcode_tools(force=False)
 
         if self.enable_transcode and merged_path.suffix.lower() != ".mp4":
-            transcoded_path = self.final_root / self._sanitize_filename(f"{interview_id}_{upload_id}.mp4")
-            ok = self._transcode_to_mp4(merged_path, transcoded_path)
-            if ok:
-                final_path = transcoded_path
-                codec = "mp4"
-                status = "transcoded"
-                if not self.keep_raw:
-                    try:
-                        merged_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+            if not self._ffmpeg_path:
+                status = "uploaded_no_transcode"
+            else:
+                transcoded_path = self.final_root / self._sanitize_filename(f"{interview_id}_{upload_id}.mp4")
+                ok = self._transcode_to_mp4(merged_path, transcoded_path)
+                if ok:
+                    final_path = transcoded_path
+                    codec = "mp4"
+                    status = "transcoded"
+                    if not self.keep_raw:
+                        try:
+                            merged_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
+                else:
+                    status = "transcode_failed_raw"
+                    if self.logger:
+                        self.logger.warning("[Replay] 转码失败，回退原始文件: %s", merged_path)
 
         duration_ms = self._detect_duration_ms(final_path)
 

@@ -235,6 +235,10 @@ class DatabaseManager:
                     status TEXT NOT NULL DEFAULT 'pending',
                     layer1_json TEXT,
                     layer2_json TEXT,
+                    text_layer_json TEXT,
+                    speech_layer_json TEXT,
+                    video_layer_json TEXT,
+                    fusion_json TEXT,
                     rubric_level TEXT,
                     overall_score REAL,
                     confidence REAL,
@@ -420,6 +424,30 @@ class DatabaseManager:
                 conn=conn,
                 table_name='interview_dialogues',
                 column_name='turn_id',
+                column_def='TEXT'
+            )
+            self._ensure_column_exists(
+                conn=conn,
+                table_name='interview_evaluations',
+                column_name='text_layer_json',
+                column_def='TEXT'
+            )
+            self._ensure_column_exists(
+                conn=conn,
+                table_name='interview_evaluations',
+                column_name='speech_layer_json',
+                column_def='TEXT'
+            )
+            self._ensure_column_exists(
+                conn=conn,
+                table_name='interview_evaluations',
+                column_name='video_layer_json',
+                column_def='TEXT'
+            )
+            self._ensure_column_exists(
+                conn=conn,
+                table_name='interview_evaluations',
+                column_name='fusion_json',
                 column_def='TEXT'
             )
             
@@ -2531,6 +2559,7 @@ class DatabaseManager:
             'interview_id', 'turn_id', 'question_id', 'user_id', 'round_type', 'position',
             'question', 'answer', 'evaluation_version', 'rubric_version', 'prompt_version',
             'llm_model', 'eval_task_key', 'status', 'layer1_json', 'layer2_json',
+            'text_layer_json', 'speech_layer_json', 'video_layer_json', 'fusion_json',
             'rubric_level', 'overall_score', 'confidence',
             'technical_accuracy_score', 'knowledge_depth_score', 'completeness_score',
             'logic_score', 'job_match_score',

@@ -173,9 +173,9 @@ def compute_final_speech_metrics(
         speech_ms = max(0.0, audio_duration_ms - pause_ms)
 
     token_count = count_spoken_tokens(transcript)
-    speech_minutes = max(speech_ms / 60000.0, 1e-6)
-    audio_minutes = max(audio_duration_ms / 60000.0, 1e-6)
-    speech_rate_wpm = token_count / speech_minutes if token_count > 0 else 0.0
+    speech_minutes = (speech_ms / 60000.0) if speech_ms > 0 else 0.0
+    audio_minutes = (audio_duration_ms / 60000.0) if audio_duration_ms > 0 else 0.0
+    speech_rate_wpm = token_count / speech_minutes if token_count > 0 and speech_minutes > 0 else 0.0
 
     pause_counter = Counter(item.get("type", "short") for item in pauses)
     long_pause_ratio = pause_counter.get("long", 0) / max(1, len(pauses))
@@ -185,7 +185,7 @@ def compute_final_speech_metrics(
     )
 
     filler_count = len(fillers)
-    fillers_per_min = filler_count / audio_minutes if filler_count else 0.0
+    fillers_per_min = filler_count / audio_minutes if filler_count and audio_minutes > 0 else 0.0
     fillers_per_100_words = (filler_count / token_count) * 100 if token_count else 0.0
     repetition_ratio = _calc_repetition_ratio(words)
 

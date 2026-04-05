@@ -345,7 +345,7 @@ class EvaluationServiceTestCase(unittest.TestCase):
         finally:
             eval_service.shutdown()
 
-    def test_layer2_fuses_speech_only_on_supported_dimensions(self):
+    def test_layer2_keeps_text_scores_even_when_speech_is_available(self):
         self._ensure_interview("i_speech_001")
         self.db.save_or_update_speech_evaluation({
             "interview_id": "i_speech_001",
@@ -374,17 +374,41 @@ class EvaluationServiceTestCase(unittest.TestCase):
                 "question": "Explain a design choice",
                 "answer": "Candidate answer",
                 "prompt_version": "v1",
+                "detection_state": {
+                    "has_face": True,
+                    "face_count": 1,
+                    "off_screen_ratio": 0.1,
+                    "rppg_reliable": True,
+                    "hr": 78,
+                    "risk_score": 18,
+                    "flags": [],
+                },
             }
             layer2 = eval_service.evaluate_layer2(payload, _StubRAG().evaluate_layer1(question_id="q_1"))
-
-            self.assertTrue(layer2.get("speech_used"))
-            self.assertAlmostEqual(layer2.get("speech_expression_score"), 75.0, places=2)
             self.assertAlmostEqual(layer2["text_base_dimension_scores"]["logic"]["score"], 60.0, places=2)
-            self.assertAlmostEqual(layer2["final_dimension_scores"]["logic"]["score"], 63.0, places=2)
-            self.assertAlmostEqual(layer2["speech_adjustments"]["logic"], 3.0, places=2)
-            self.assertAlmostEqual(layer2["final_dimension_scores"]["completeness"]["score"], 70.5, places=2)
+            self.assertAlmostEqual(layer2["final_dimension_scores"]["logic"]["score"], 60.0, places=2)
+            self.assertAlmostEqual(layer2["speech_adjustments"]["logic"], 0.0, places=2)
+            self.assertAlmostEqual(layer2["final_dimension_scores"]["completeness"]["score"], 70.0, places=2)
             self.assertAlmostEqual(layer2["final_dimension_scores"]["technical_accuracy"]["score"], 92.0, places=2)
-            self.assertAlmostEqual(layer2["overall_score_final"], 76.1, places=2)
+            self.assertAlmostEqual(layer2["overall_score_final"], 76.0, places=2)
+            self.assertFalse(layer2.get("speech_used"))
+
+            speech_layer = eval_service.evaluate_speech_layer(payload)
+            self.assertEqual(speech_layer.get("status"), "ready")
+            self.assertAlmostEqual(float(speech_layer.get("overall_score") or 0.0), 75.0, places=2)
+
+            video_layer = eval_service.evaluate_video_layer(payload)
+            self.assertEqual(video_layer.get("status"), "ready")
+            self.assertTrue(isinstance(video_layer.get("overall_score"), (int, float)))
+
+            evaluation_v2 = eval_service.build_evaluation_v2(
+                text_layer=eval_service.build_text_layer_result(layer2),
+                speech_layer=speech_layer,
+                video_layer=video_layer,
+            )
+            self.assertEqual(evaluation_v2.get("schema_version"), "evaluation_v2")
+            self.assertIn("fusion", evaluation_v2)
+            self.assertIsNotNone((evaluation_v2.get("fusion") or {}).get("overall_score"))
         finally:
             eval_service.shutdown()
 
@@ -421,11 +445,15 @@ class EvaluationServiceTestCase(unittest.TestCase):
             layer2 = eval_service.evaluate_layer2(payload, _StubRAG().evaluate_layer1(question_id="q_2"))
 
             self.assertFalse(layer2.get("speech_used"))
-            self.assertIn("audio_duration_below_threshold", layer2.get("speech_context", {}).get("quality_gate", {}).get("reasons", []))
-            self.assertIn("token_count_below_threshold", layer2.get("speech_context", {}).get("quality_gate", {}).get("reasons", []))
             self.assertAlmostEqual(layer2["final_dimension_scores"]["logic"]["score"], 60.0, places=2)
             self.assertAlmostEqual(layer2["speech_adjustments"]["logic"], 0.0, places=2)
             self.assertAlmostEqual(layer2["overall_score_final"], layer2["overall_score_base"], places=2)
+
+            speech_layer = eval_service.evaluate_speech_layer(payload)
+            self.assertEqual(speech_layer.get("status"), "insufficient_data")
+            reasons = ((speech_layer.get("summary") or {}).get("quality_gate") or {}).get("reasons") or []
+            self.assertIn("audio_duration_below_threshold", reasons)
+            self.assertIn("token_count_below_threshold", reasons)
         finally:
             eval_service.shutdown()
 

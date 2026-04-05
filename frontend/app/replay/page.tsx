@@ -143,6 +143,21 @@ function ReplayPageContent() {
         return raw.startsWith('http://') || raw.startsWith('https://') ? raw : `${BACKEND_API_BASE}${raw}`
     }, [payload])
 
+    const videoSeekHint = useMemo(() => {
+        const status = String(payload?.video?.status || '').trim().toLowerCase()
+        const codec = String(payload?.video?.codec || '').trim().toLowerCase()
+        if (!status && !codec) return ''
+        if (status === 'transcoded' || codec === 'mp4') return ''
+
+        if (status === 'uploaded_no_transcode') {
+            return '当前视频为原始容器（未检测到 ffmpeg 转码），进度拖动可能不够精确。安装 ffmpeg 后新录制视频会自动优化。'
+        }
+        if (status === 'transcode_failed_raw') {
+            return '当前视频转码失败，已回退为原始文件，进度拖动可能受限。请检查后端 ffmpeg 日志。'
+        }
+        return '当前视频不是优化后的 MP4 文件，进度拖动体验可能受限。'
+    }, [payload])
+
     const timelineDurationMs = useMemo(() => {
         const fromPayload = Number(payload?.video?.duration_ms || 0)
         return Math.max(fromPayload, videoDurationMs, 1)
@@ -292,6 +307,12 @@ function ReplayPageContent() {
                                         />
                                     </div>
 
+                                    {videoSeekHint ? (
+                                        <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+                                            {videoSeekHint}
+                                        </div>
+                                    ) : null}
+
                                     <div className="mt-5 rounded-2xl border border-[#E5E5E5] bg-[#FAF9F6] p-5">
                                         <div className="flex flex-wrap items-center justify-between gap-2">
                                             <p className="text-sm font-medium text-[#111111]">关键节点时间轴</p>
@@ -374,10 +395,14 @@ function ReplayPageContent() {
                                         }`}
                                     >
                                         <div className="flex flex-wrap items-center justify-between gap-2">
-                                            <p className="text-sm font-semibold text-[#111111]">{item.question || '未记录题目'}</p>
+                                            <p className="whitespace-pre-wrap break-words text-sm font-semibold text-[#111111]">
+                                                {item.question || '未记录题目'}
+                                            </p>
                                             <span className="inline-flex items-center gap-1 text-xs text-[#666666]"><Clock3 className="h-3 w-3" />{formatMs(startMs)}</span>
                                         </div>
-                                        <p className="mt-2 line-clamp-2 text-sm text-[#666666]">{item.answer || '未记录回答'}</p>
+                                        <p className="mt-2 whitespace-pre-wrap break-words text-sm text-[#666666]">
+                                            {item.answer || '未记录回答'}
+                                        </p>
                                         <p className="mt-2 text-xs text-[#999999]">Latency {Number(item.latency_ms || 0).toFixed(0)} ms</p>
                                     </button>
                                     )
