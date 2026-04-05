@@ -145,7 +145,6 @@ export default function InterviewPage() {
     const videoRef = useRef<HTMLVideoElement>(null)
     const cameraStreamRef = useRef<MediaStream | null>(null)
     const microphoneStreamRef = useRef<MediaStream | null>(null)
-    const replayMicrophoneStreamRef = useRef<MediaStream | null>(null)
     const replayCaptureStreamRef = useRef<MediaStream | null>(null)
     const [socket, setSocket] = useState<SocketClient | null>(null)
 
@@ -173,7 +172,7 @@ export default function InterviewPage() {
     })
     const [finalMetricsReady, setFinalMetricsReady] = useState(false)
     const [asrDebugEvents, setAsrDebugEvents] = useState<AsrDebugEvent[]>([])
-    const [showAsrDebugPanel, setShowAsrDebugPanel] = useState(false)
+    const [showAsrDebugPanel, setShowAsrDebugPanel] = useState(true)
     const [isProcessing, setIsProcessing] = useState(false)
     const [isVoiceSupported, setIsVoiceSupported] = useState(true)
     const [isBrowserAsrSupported, setIsBrowserAsrSupported] = useState(false)
@@ -236,6 +235,8 @@ export default function InterviewPage() {
     // TTS 音频播放
     const currentTtsAudioRef = useRef<HTMLAudioElement | null>(null)
     const currentTtsUrlRef = useRef<string | null>(null)
+    const browserTtsUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null)
+    const browserTtsActiveRef = useRef(false)
     const ttsAudioQueueRef = useRef<Array<{ audio: string; jobId: string; turnId: string; mimeType: string; provider?: string }>>([])
     const ttsDoneSignaledRef = useRef(false)
     const isTTSSpeakingRef = useRef(false)
@@ -408,34 +409,9 @@ export default function InterviewPage() {
             return
         }
         const captureTracks: MediaStreamTrack[] = [cameraTrack.clone()]
-        let micTrack = microphoneStreamRef.current?.getAudioTracks?.()[0] || null
-
-        // 录制启动时 ASR 音频流可能尚未就绪，兜底申请一条仅用于回放录制的麦克风流。
-        if (!micTrack || micTrack.readyState !== 'live') {
-            try {
-                const replayMicStream = await navigator.mediaDevices.getUserMedia({
-                    audio: {
-                        echoCancellation: true,
-                        noiseSuppression: true,
-                        autoGainControl: true,
-                    }
-                })
-                replayMicrophoneStreamRef.current = replayMicStream
-                micTrack = replayMicStream.getAudioTracks()[0] || null
-                if (micTrack) {
-                    console.log('[Replay] using dedicated microphone stream for video recording')
-                }
-            } catch (error) {
-                console.warn('[Replay] dedicated microphone stream unavailable, video may be silent:', error)
-            }
-        }
-
+        const micTrack = microphoneStreamRef.current?.getAudioTracks?.()[0]
         if (micTrack && micTrack.readyState === 'live') {
-            const micClone = micTrack.clone()
-            micClone.enabled = true
-            captureTracks.push(micClone)
-        } else {
-            console.warn('[Replay] no live microphone track found, recording will not contain audio')
+            captureTracks.push(micTrack.clone())
         }
         const captureStream = new MediaStream(captureTracks)
         replayCaptureStreamRef.current = captureStream
@@ -505,10 +481,6 @@ export default function InterviewPage() {
         if (replayCaptureStreamRef.current) {
             replayCaptureStreamRef.current.getTracks().forEach(track => track.stop())
             replayCaptureStreamRef.current = null
-        }
-        if (replayMicrophoneStreamRef.current) {
-            replayMicrophoneStreamRef.current.getTracks().forEach(track => track.stop())
-            replayMicrophoneStreamRef.current = null
         }
 
         if (finalize && sessionId) {
@@ -665,6 +637,56 @@ export default function InterviewPage() {
             URL.revokeObjectURL(currentTtsUrlRef.current)
             currentTtsUrlRef.current = null
         }
+
+        if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+            window.speechSynthesis.cancel()
+        }
+        browserTtsUtteranceRef.current = null
+        browserTtsActiveRef.current = false
+    }
+
+    const playBrowserTts = (text: string) => {
+        const normalized = text.trim()
+        if (!normalized || typeof window === 'undefined' || !('speechSynthesis' in window)) {
+            stopCurrentTts()
+            return
+        }
+        if (currentTtsAudioRef.current || ttsAudioQueueRef.current.length > 0) {
+            return
+        }
+
+        window.speechSynthesis.cancel()
+
+        const utterance = new SpeechSynthesisUtterance(normalized)
+        utterance.lang = 'zh-CN'
+        utterance.rate = 1
+        browserTtsUtteranceRef.current = utterance
+        browserTtsActiveRef.current = true
+        isTTSSpeakingRef.current = true
+        isAiSpeakingRef.current = true
+        setIsAiSpeaking(true)
+
+        utterance.onend = () => {
+            browserTtsUtteranceRef.current = null
+            browserTtsActiveRef.current = false
+            pendingTtsTextRef.current = ''
+            isTTSSpeakingRef.current = false
+            isAiSpeakingRef.current = false
+            setIsAiSpeaking(false)
+            resumeAudioRecordingAfterTts()
+        }
+        utterance.onerror = (error) => {
+            const reason = (error as any)?.error || ''
+            // 当服务端音频抢占时，浏览器合成会收到 canceled/interrupted，这属于正常现象。
+            if (reason === 'canceled' || reason === 'interrupted') {
+                return
+            }
+            console.error('[TTS] 浏览器播报失败:', error)
+            stopCurrentTts()
+        }
+
+        console.warn('[TTS] 切换到浏览器语音播报')
+        window.speechSynthesis.speak(utterance)
     }
 
     const stopBrowserSpeechRecognition = (abort = false) => {
@@ -1062,6 +1084,11 @@ export default function InterviewPage() {
                 stopCurrentTts()
             }
 
+            if (browserTtsActiveRef.current && typeof window !== 'undefined' && 'speechSynthesis' in window) {
+                window.speechSynthesis.cancel()
+                browserTtsActiveRef.current = false
+            }
+
             audio.play().catch((err) => {
                 if (currentTtsAudioRef.current !== audio) return
                 if ((err as any)?.name === 'AbortError') {
@@ -1367,10 +1394,6 @@ export default function InterviewPage() {
             microphoneStreamRef.current.getTracks().forEach(track => track.stop())
             microphoneStreamRef.current = null
         }
-        if (replayMicrophoneStreamRef.current) {
-            replayMicrophoneStreamRef.current.getTracks().forEach(track => track.stop())
-            replayMicrophoneStreamRef.current = null
-        }
     }
 
     const initSocket = async () => {
@@ -1613,6 +1636,13 @@ export default function InterviewPage() {
                 if (activeTtsJobIdRef.current && data?.job_id && data.job_id !== activeTtsJobIdRef.current) return
 
                 receivedServerChunkForCurrentSpeakRef.current = true
+
+                // 服务端音频到达后，优先使用服务端流，抢占浏览器播报。
+                if (browserTtsActiveRef.current && typeof window !== 'undefined' && 'speechSynthesis' in window) {
+                    window.speechSynthesis.cancel()
+                    browserTtsUtteranceRef.current = null
+                    browserTtsActiveRef.current = false
+                }
                 ttsAudioQueueRef.current.push({
                     audio: data.audio,
                     jobId: data.job_id || '',
@@ -1685,8 +1715,17 @@ export default function InterviewPage() {
                 clearLlmTimeout()
                 setIsProcessing(false)
                 if (data?.code === 'TTS_SYNTH_FAIL') {
-                    console.error('[TTS] 服务端合成失败（仅允许服务端 TTS，未启用浏览器语音兜底）')
-                    stopCurrentTts()
+                    const shouldFallbackToBrowser =
+                        pendingTtsTextRef.current
+                        && !receivedServerChunkForCurrentSpeakRef.current
+                        && !currentTtsAudioRef.current
+                        && ttsAudioQueueRef.current.length === 0
+                    if (shouldFallbackToBrowser) {
+                        console.warn('[TTS] 服务端合成失败，切换到浏览器语音兜底')
+                        playBrowserTts(pendingTtsTextRef.current)
+                    } else {
+                        console.warn('[TTS] 服务端已开始输出，禁止浏览器语音兜底以避免重复播报')
+                    }
                 } else {
                     stopCurrentTts()
                 }
@@ -2091,9 +2130,9 @@ export default function InterviewPage() {
                     </div>
                 </header>
 
-                <main className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden p-2.5 md:flex-row md:gap-4 md:p-3 lg:gap-5 lg:p-4">
-                    <div className="flex min-w-0 flex-1 flex-col gap-3 md:flex-[1.5] lg:flex-[1.6]">
-                        <div className="relative min-h-0 flex-[1_1_55%] overflow-hidden rounded-2xl border border-[#1D1D1D] bg-[#0B0B0D] shadow-[0_22px_40px_-28px_rgba(0,0,0,0.75)]">
+                <main className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden p-2.5 md:flex-row md:gap-3 md:p-3 lg:gap-4 lg:p-4">
+                    <div className="flex min-w-0 flex-1 flex-col gap-2.5 md:flex-[1.58]">
+                        <div className="relative min-h-0 flex-[1_1_62%] overflow-hidden rounded-2xl border border-[#1D1D1D] bg-[#0B0B0D] shadow-[0_22px_40px_-28px_rgba(0,0,0,0.75)]">
                             <video
                                 ref={videoRef}
                                 autoPlay
@@ -2117,27 +2156,27 @@ export default function InterviewPage() {
                                     </div>
                                 </div>
                             )}
-                            <div className="absolute left-4 top-4 z-20 max-w-[calc(100%-160px)] rounded-xl border border-white/15 bg-black/40 px-4 py-2.5 text-xs text-white backdrop-blur">
-                                <p className="mb-1.5 text-[10px] uppercase tracking-wider text-white/70">Current Question</p>
-                                <p className="line-clamp-2 text-sm leading-relaxed">{displayQuestion}</p>
+                            <div className="absolute left-3 top-3 z-20 max-w-[84%] rounded-xl border border-white/15 bg-black/40 px-3 py-1.5 text-xs text-white backdrop-blur">
+                                <p className="mb-1 text-[10px] uppercase tracking-wider text-white/70">Current Question</p>
+                                <p className="line-clamp-3 text-sm leading-relaxed">{displayQuestion}</p>
                             </div>
-                            <div className="absolute bottom-4 left-4 inline-flex items-center gap-2 rounded-xl border border-white/10 bg-black/45 px-3 py-2 text-xs text-white backdrop-blur">
-                                <span className="flex h-5 w-5 items-center justify-center rounded-full bg-white/20">
-                                    <User size={12} />
+                            <div className="absolute bottom-3 left-3 inline-flex items-center gap-2 rounded-xl border border-white/10 bg-black/45 px-3 py-1.5 text-xs text-white backdrop-blur">
+                                <span className="flex h-6 w-6 items-center justify-center rounded-full bg-white/20">
+                                    <User size={14} />
                                 </span>
                                 You
                             </div>
-                            <div className="absolute bottom-4 right-4 flex h-16 w-32 items-center justify-center overflow-hidden rounded-xl border border-white/10 bg-[#1F1F22] shadow-2xl">
-                                <span className={`h-2.5 w-2.5 rounded-full ${isAiSpeaking ? 'animate-pulse bg-[#E27A5F]' : 'bg-white/75'}`} />
-                                <span className={`absolute h-8 w-8 rounded-full border border-white/20 ${isAiSpeaking ? 'animate-ping' : ''}`} />
-                                <span className="absolute bottom-1.5 left-2 text-[9px] uppercase tracking-wider text-white/70">
+                            <div className="absolute bottom-3 right-3 flex h-20 w-36 items-center justify-center overflow-hidden rounded-xl border border-white/10 bg-[#1F1F22] shadow-2xl">
+                                <span className={`h-3 w-3 rounded-full ${isAiSpeaking ? 'animate-pulse bg-[#E27A5F]' : 'bg-white/75'}`} />
+                                <span className={`absolute h-10 w-10 rounded-full border border-white/20 ${isAiSpeaking ? 'animate-ping' : ''}`} />
+                                <span className="absolute bottom-2 left-2 text-[10px] uppercase tracking-wider text-white/70">
                                     Interviewer · {isAiSpeaking ? 'Speaking' : 'Waiting'}
                                 </span>
                             </div>
                         </div>
 
-                        <div className="shrink-0 rounded-2xl border border-[#E5E5E5] bg-white p-4 shadow-sm lg:p-5">
-                            <div className="flex h-full min-h-[140px] flex-col">
+                        <div className="h-[clamp(148px,24vh,208px)] shrink-0 rounded-2xl border border-[#E5E5E5] bg-white p-4 shadow-sm lg:p-5">
+                            <div className="mb-3 flex h-full flex-col">
                                 <div className="flex-1 overflow-y-auto pr-2">
                                     {userAnswer ? (
                                         <p className="text-base leading-relaxed text-[#111111]">
@@ -2194,7 +2233,7 @@ export default function InterviewPage() {
                         </div>
                     </div>
 
-                    <aside className="flex w-full shrink-0 flex-col overflow-hidden rounded-2xl border border-[#E5E5E5] bg-white/95 shadow-sm md:w-[320px] lg:w-[360px]">
+                    <aside className="flex w-full shrink-0 flex-col overflow-hidden rounded-2xl border border-[#E5E5E5] bg-white/95 shadow-sm md:w-[300px] lg:w-[320px]">
                         <div className="border-b border-[#E5E5E5] bg-[#FAFAFA] px-4 py-3">
                             <h3 className="text-sm font-medium text-[#111111]">Interview Transcript</h3>
                             <p className="mt-1 text-xs text-[#666666]">已记录 {chatMessages.length} 条对话</p>
@@ -2202,12 +2241,12 @@ export default function InterviewPage() {
 
                         <div
                             ref={chatScrollContainerRef}
-                            className="min-h-0 flex-1 space-y-3 overflow-y-auto bg-[#FCFCFB] p-3"
+                            className="min-h-0 flex-1 space-y-4 overflow-y-auto bg-[#FCFCFB] p-4"
                         >
                             {chatMessages.length === 0 ? (
-                                <div className="rounded-lg border border-dashed border-[#D9D4CA] bg-[#FAFAFA] p-5 text-center text-sm text-[#777268]">
-                                    <div className="mx-auto mb-2 inline-flex h-8 w-8 items-center justify-center rounded-full bg-white text-[#777268]">
-                                        <MessageSquare size={14} />
+                                <div className="rounded-lg border border-dashed border-[#D9D4CA] bg-[#FAFAFA] p-6 text-center text-sm text-[#777268]">
+                                    <div className="mx-auto mb-2 inline-flex h-9 w-9 items-center justify-center rounded-full bg-white text-[#777268]">
+                                        <MessageSquare size={16} />
                                     </div>
                                     <p>等待面试官提问...</p>
                                     <p className="mt-1 text-xs text-[#9B9488]">系统会在收到首问后自动开始记录</p>
@@ -2218,14 +2257,14 @@ export default function InterviewPage() {
                                         key={idx}
                                         className={`flex flex-col ${msg.role === 'candidate' ? 'items-end' : 'items-start'}`}
                                     >
-                                        <div className="mb-1 flex items-center gap-2 px-1">
-                                            <span className="text-[10px] font-medium uppercase tracking-wider text-[#111111]">
+                                        <div className="mb-1.5 flex items-center gap-2 px-1">
+                                            <span className="text-[11px] font-medium uppercase tracking-wider text-[#111111]">
                                                 {msg.role === 'interviewer' ? 'Interviewer' : 'You'}
                                             </span>
-                                            <span className="text-[9px] text-[#999999]">{msg.timestamp}</span>
+                                            <span className="text-[10px] text-[#999999]">{msg.timestamp}</span>
                                         </div>
                                         <div
-                                            className={`max-w-[94%] rounded-xl px-3 py-2 text-[13px] leading-relaxed ${
+                                            className={`max-w-[92%] rounded-2xl p-2.5 text-sm leading-relaxed ${
                                                 msg.role === 'candidate'
                                                     ? 'rounded-tr-sm bg-[#111111] text-white shadow-[0_12px_20px_-18px_rgba(0,0,0,0.9)]'
                                                     : 'rounded-tl-sm border border-[#E7E3DB] bg-[#F7F6F2] text-[#111111]'
