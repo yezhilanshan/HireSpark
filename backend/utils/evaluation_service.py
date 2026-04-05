@@ -37,9 +37,14 @@ class EvaluationService:
         "system_design": ["architecture_reasoning", "tradeoff_awareness", "scalability", "logic"],
         "hr": ["clarity", "relevance", "self_awareness", "communication"],
     }
+    LAYER_WEIGHTS = {
+        "text": 0.50,
+        "speech": 0.25,
+        "video": 0.25,
+    }
     SPEECH_GATE_MIN_AUDIO_MS = 8000.0
     SPEECH_GATE_MIN_TOKENS = 20
-    SPEECH_FUSION_VERSION = "speech_fusion_v1"
+    SPEECH_FUSION_VERSION = "speech_decoupled_v2"
     SPEECH_EXPRESSION_WEIGHTS = {
         "clarity_score": 0.30,
         "fluency_score": 0.25,
@@ -228,52 +233,202 @@ class EvaluationService:
                 "reason": str(payload.get("reason", "") or "").strip(),
             }
 
-        blend_weights = self.SPEECH_DIMENSION_BLEND.get(round_type, {})
-        speech_used = bool((speech_context or {}).get("speech_used"))
-        expression_score = self._safe_float((speech_context or {}).get("expression_score"))
-        if expression_score is None:
-            speech_used = False
-
-        speech_adjustments = {}
-        final_dimension_scores = {}
-        for dim in dimensions:
-            base_score = float(text_base_dimension_scores[dim]["score"])
-            blend_weight = float(blend_weights.get(dim, 0.0)) if speech_used else 0.0
-            if blend_weight > 0.0:
-                final_score = self._clamp_score(base_score * (1.0 - blend_weight) + float(expression_score) * blend_weight)
-            else:
-                final_score = round(base_score, 2)
-
-            speech_adjustments[dim] = round(final_score - base_score, 2)
-            final_dimension_scores[dim] = {
-                "score": final_score,
+        # 三层解耦：文本层分数完全由文本语义与 rubric 决定，不叠加语音修正。
+        speech_adjustments = {dim: 0.0 for dim in dimensions}
+        final_dimension_scores = {
+            dim: {
+                "score": round(float(text_base_dimension_scores[dim]["score"]), 2),
                 "reason": text_base_dimension_scores[dim]["reason"],
             }
+            for dim in dimensions
+        }
 
         overall_score_base = round(
             sum(item["score"] for item in text_base_dimension_scores.values()) / len(text_base_dimension_scores),
             2,
         ) if text_base_dimension_scores else 0.0
-        overall_score_final = round(
-            sum(item["score"] for item in final_dimension_scores.values()) / len(final_dimension_scores),
-            2,
-        ) if final_dimension_scores else overall_score_base
+        overall_score_final = overall_score_base
 
         layer2_result.update({
             "text_base_dimension_scores": text_base_dimension_scores,
-            "speech_context": speech_context or {},
+            "speech_context": {},
             "speech_adjustments": speech_adjustments,
             "final_dimension_scores": final_dimension_scores,
             "overall_score_base": overall_score_base,
             "overall_score_final": overall_score_final,
-            "speech_used": speech_used,
+            "speech_used": False,
             "speech_fusion_version": self.SPEECH_FUSION_VERSION,
             "dimension_scores": final_dimension_scores,
             "overall_score": overall_score_final,
         })
-        if expression_score is not None:
-            layer2_result["speech_expression_score"] = round(float(expression_score), 2)
         return layer2_result
+
+    def evaluate_speech_layer(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        speech_context = self.build_speech_context(payload)
+        expression_dimensions = (speech_context or {}).get("expression_dimensions") or {}
+        expression_score = self._safe_float((speech_context or {}).get("expression_score"))
+        speech_used = bool((speech_context or {}).get("speech_used")) and expression_score is not None
+
+        return {
+            "status": "ready" if speech_used else ("insufficient_data" if (speech_context or {}).get("available") else "unavailable"),
+            "overall_score": round(float(expression_score), 2) if speech_used else None,
+            "dimension_scores": {
+                key: {"score": self._clamp_score(value), "reason": ""}
+                for key, value in (expression_dimensions or {}).items()
+                if self._safe_float(value) is not None
+            },
+            "summary": {
+                "audio_duration_ms": float((speech_context or {}).get("audio_duration_ms") or 0.0),
+                "token_count": int((speech_context or {}).get("token_count") or 0),
+                "quality_gate": (speech_context or {}).get("quality_gate") or {},
+            },
+            "evidence": {
+                "final_transcript_excerpt": str((speech_context or {}).get("final_transcript_excerpt", "") or "").strip(),
+                "quality_gate_reasons": list(((speech_context or {}).get("quality_gate") or {}).get("reasons") or []),
+            },
+            "source": "speech_metrics_final",
+        }
+
+    def evaluate_video_layer(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        video_context = dict((payload or {}).get("video_context") or (payload or {}).get("detection_state") or {})
+        if not video_context:
+            return {
+                "status": "unavailable",
+                "overall_score": None,
+                "dimension_scores": {},
+                "summary": {"reason": "missing_video_context"},
+                "evidence": {},
+                "source": "detection_state",
+            }
+
+        has_face = bool(video_context.get("has_face", True))
+        face_count = int(video_context.get("face_count", 1) or 1)
+        raw_off_screen = self._safe_float(video_context.get("off_screen_ratio")) or 0.0
+        off_screen_ratio = raw_off_screen * 100.0 if raw_off_screen <= 1.0 else raw_off_screen
+        off_screen_ratio = max(0.0, min(100.0, off_screen_ratio))
+        hr = self._safe_float(video_context.get("hr"))
+        rppg_reliable = bool(video_context.get("rppg_reliable", False))
+        risk_score = self._safe_float(video_context.get("risk_score"))
+        flags = [str(flag).strip() for flag in (video_context.get("flags") or []) if str(flag).strip()]
+
+        gaze_focus_score = self._clamp_score(100.0 - off_screen_ratio)
+        posture_compliance_score = self._clamp_score(100.0 - (40.0 if face_count > 1 else 0.0) - (25.0 if not has_face else 0.0))
+        physiology_score = 55.0
+        if rppg_reliable and hr is not None:
+            physiology_score = 85.0 if 50.0 <= hr <= 120.0 else 65.0
+        risk_penalty = 0.0 if risk_score is None else min(30.0, (risk_score if risk_score > 1 else risk_score * 100.0) * 0.2)
+        physiology_score = self._clamp_score(physiology_score - risk_penalty)
+
+        dimension_scores = {
+            "gaze_focus": {"score": gaze_focus_score, "reason": "基于离屏比例与在镜状态估计。"},
+            "posture_compliance": {"score": posture_compliance_score, "reason": "基于同框人数与镜头在位稳定性估计。"},
+            "physiology_stability": {"score": physiology_score, "reason": "基于心率可用性与异常风险估计。"},
+        }
+        overall_score = round(sum(item["score"] for item in dimension_scores.values()) / len(dimension_scores), 2)
+
+        return {
+            "status": "ready",
+            "overall_score": overall_score,
+            "dimension_scores": dimension_scores,
+            "summary": {
+                "video_features_snapshot": (video_context.get("video_features") if isinstance(video_context.get("video_features"), dict) else {}),
+            },
+            "evidence": {
+                "flags": flags,
+                "has_face": has_face,
+                "face_count": face_count,
+                "off_screen_ratio": round(off_screen_ratio, 2),
+                "hr": hr,
+                "rppg_reliable": rppg_reliable,
+                "risk_score": risk_score,
+            },
+            "source": "detection_state",
+        }
+
+    def build_text_layer_result(self, layer2_result: Dict[str, Any]) -> Dict[str, Any]:
+        result = dict(layer2_result or {})
+        dimension_scores = result.get("final_dimension_scores") or result.get("dimension_scores") or {}
+        score = self._safe_float(result.get("overall_score_final"))
+        if score is None:
+            score = self._safe_float(result.get("overall_score"))
+        return {
+            "status": "ready" if dimension_scores else "unavailable",
+            "overall_score": round(float(score), 2) if score is not None else None,
+            "dimension_scores": dimension_scores,
+            "rubric_eval": result.get("rubric_eval") or {},
+            "summary": result.get("summary") or {},
+            "source": "rubric_llm",
+        }
+
+    def fuse_layer_scores(
+        self,
+        text_layer: Dict[str, Any],
+        speech_layer: Dict[str, Any],
+        video_layer: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        layers = {
+            "text": text_layer or {},
+            "speech": speech_layer or {},
+            "video": video_layer or {},
+        }
+        base_weights = dict(self.LAYER_WEIGHTS)
+        available_scores = {}
+        missing_layers = []
+        for name, layer in layers.items():
+            score = self._safe_float((layer or {}).get("overall_score"))
+            if score is None:
+                missing_layers.append(name)
+                continue
+            available_scores[name] = self._clamp_score(score)
+
+        if not available_scores:
+            return {
+                "status": "unavailable",
+                "overall_score": None,
+                "base_weights": base_weights,
+                "effective_weights": {},
+                "missing_layers": missing_layers,
+                "formula": "weighted_mean(available_layer_scores)",
+            }
+
+        weight_sum = sum(base_weights.get(name, 0.0) for name in available_scores.keys())
+        if weight_sum <= 0:
+            uniform = round(1.0 / len(available_scores), 4)
+            effective_weights = {name: uniform for name in available_scores.keys()}
+        else:
+            effective_weights = {
+                name: round(base_weights.get(name, 0.0) / weight_sum, 4)
+                for name in available_scores.keys()
+            }
+
+        overall_score = round(
+            sum(available_scores[name] * effective_weights.get(name, 0.0) for name in available_scores.keys()),
+            2,
+        )
+        return {
+            "status": "ready",
+            "overall_score": overall_score,
+            "base_weights": base_weights,
+            "effective_weights": effective_weights,
+            "missing_layers": missing_layers,
+            "formula": "weighted_mean(available_layer_scores)",
+        }
+
+    def build_evaluation_v2(
+        self,
+        text_layer: Dict[str, Any],
+        speech_layer: Dict[str, Any],
+        video_layer: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        return {
+            "schema_version": "evaluation_v2",
+            "layers": {
+                "text": text_layer or {},
+                "speech": speech_layer or {},
+                "video": video_layer or {},
+            },
+            "fusion": self.fuse_layer_scores(text_layer, speech_layer, video_layer),
+        }
 
     def _build_task_key(self, interview_id: str, turn_id: str, evaluation_version: str) -> str:
         raw = f"{interview_id}|{turn_id}|{evaluation_version}"
@@ -321,6 +476,10 @@ class EvaluationService:
             "status": status,
             "layer1_json": self._json_dumps(payload.get("layer1_json", {})),
             "layer2_json": self._json_dumps(payload.get("layer2_json", {})),
+            "text_layer_json": self._json_dumps(payload.get("text_layer_json", {})),
+            "speech_layer_json": self._json_dumps(payload.get("speech_layer_json", {})),
+            "video_layer_json": self._json_dumps(payload.get("video_layer_json", {})),
+            "fusion_json": self._json_dumps(payload.get("fusion_json", {})),
             "rubric_level": payload.get("rubric_level"),
             "overall_score": self._safe_float(payload.get("overall_score")),
             "confidence": self._safe_float(payload.get("confidence")),
@@ -414,7 +573,6 @@ class EvaluationService:
         if not scoring_rubric:
             scoring_rubric = payload.get("scoring_rubric", {})
 
-        speech_context = self.build_speech_context(payload)
         layer2_result = self.llm_manager.evaluate_answer_with_rubric(
             user_answer=payload.get("answer", ""),
             question=payload.get("question", ""),
@@ -423,7 +581,7 @@ class EvaluationService:
             scoring_rubric=scoring_rubric,
             layer1_result=layer1_result,
             prompt_version=payload.get("prompt_version", self.prompt_version),
-            speech_context=speech_context,
+            speech_context={},
         )
         if layer2_result.get("error"):
             return layer2_result
@@ -431,7 +589,7 @@ class EvaluationService:
         return self.fuse_speech_with_dimension_scores(
             round_type=payload.get("round_type", "technical"),
             layer2_result=layer2_result,
-            speech_context=speech_context,
+            speech_context={},
         )
 
     def _derive_rubric_level(self, layer1_result: Dict[str, Any], layer2_result: Dict[str, Any]) -> Optional[str]:
@@ -552,6 +710,8 @@ class EvaluationService:
         question: str,
         answer: str,
         evaluation_version: Optional[str] = None,
+        detection_state: Optional[Dict[str, Any]] = None,
+        video_context: Optional[Dict[str, Any]] = None,
         force: bool = False,
     ) -> Dict[str, Any]:
         interview_id = str(interview_id or "").strip()
@@ -573,6 +733,8 @@ class EvaluationService:
             "prompt_version": self.prompt_version,
             "llm_model": str(getattr(self.llm_manager, "model", "") or "").strip(),
             "rubric_version": "unknown",
+            "detection_state": detection_state or {},
+            "video_context": video_context or {},
         }
         payload["eval_task_key"] = self._build_task_key(
             payload["interview_id"],
@@ -638,6 +800,10 @@ class EvaluationService:
         final_error_message = ""
         layer1_result: Dict[str, Any] = {}
         layer2_result: Dict[str, Any] = {}
+        text_layer_result: Dict[str, Any] = {}
+        speech_layer_result: Dict[str, Any] = {}
+        video_layer_result: Dict[str, Any] = {}
+        evaluation_v2: Dict[str, Any] = {}
 
         try:
             running_record = self._default_record(payload, self.STATUS_RUNNING)
@@ -707,6 +873,16 @@ class EvaluationService:
             final_error_message = str(e)
             self.logger.error(f"评估任务异常: {e}", exc_info=True)
         finally:
+            text_layer_result = self.build_text_layer_result(layer2_result or {})
+            speech_layer_result = self.evaluate_speech_layer(payload)
+            video_layer_result = self.evaluate_video_layer(payload)
+            evaluation_v2 = self.build_evaluation_v2(
+                text_layer=text_layer_result,
+                speech_layer=speech_layer_result,
+                video_layer=video_layer_result,
+            )
+            fusion_score = self._safe_float((evaluation_v2.get("fusion") or {}).get("overall_score"))
+
             rubric_eval = (layer2_result or {}).get("rubric_eval", {}) or {}
             dimension_columns = self._extract_dimension_columns(
                 payload.get("round_type", "technical"),
@@ -719,8 +895,12 @@ class EvaluationService:
                     "status": final_status,
                     "layer1_json": layer1_result or {},
                     "layer2_json": layer2_result or {},
+                    "text_layer_json": text_layer_result or {},
+                    "speech_layer_json": speech_layer_result or {},
+                    "video_layer_json": video_layer_result or {},
+                    "fusion_json": (evaluation_v2.get("fusion") or {}),
                     "rubric_level": self._derive_rubric_level(layer1_result or {}, layer2_result or {}),
-                    "overall_score": (layer2_result or {}).get("overall_score"),
+                    "overall_score": fusion_score if fusion_score is not None else (layer2_result or {}).get("overall_score"),
                     "confidence": rubric_eval.get("confidence"),
                     "retry_count_layer1": retry_count_layer1,
                     "retry_count_layer2": retry_count_layer2,

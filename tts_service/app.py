@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from pathlib import Path
 import random
 import tempfile
 import threading
 import uuid
-from typing import Optional
+from typing import Any, Optional, cast
 
 from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
@@ -16,6 +17,43 @@ from backend.tts_text import prepare_tts_text
 
 app = FastAPI(title="Standalone TTS Service", version="1.0.0")
 logger = logging.getLogger("tts_service")
+
+
+def _as_bool(value: Optional[str], default: bool) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _load_env_from_repo_root() -> None:
+    """Load root .env for standalone service launches that miss shell env vars."""
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    if not env_path.exists():
+        return
+
+    try:
+        content = env_path.read_text(encoding="utf-8")
+    except Exception:
+        return
+
+    loaded_any = False
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        normalized_value = value.strip().strip('"').strip("'")
+        os.environ[key] = normalized_value
+        loaded_any = True
+
+    if loaded_any:
+        logger.info("[TTS Service] Loaded missing runtime environment from repository .env")
+
+
+_load_env_from_repo_root()
 
 
 class SynthesizeRequest(BaseModel):
@@ -28,6 +66,137 @@ class SynthesizeRequest(BaseModel):
     voice: Optional[str] = None
     rate: Optional[str] = None
     volume: Optional[str] = None
+
+
+class CosyVoiceProvider:
+    name = "cosyvoice"
+
+    _MEDIA_TYPE_BY_AUDIO_FORMAT = {
+        "mp3": "audio/mpeg",
+        "wav": "audio/wav",
+        "pcm": "audio/pcm",
+        "opus": "audio/ogg",
+    }
+
+    def __init__(self):
+        import dashscope
+        from dashscope.audio.tts_v2 import AudioFormat, SpeechSynthesizer
+
+        self.dashscope = dashscope
+        self.audio_format_enum = AudioFormat
+        self.speech_synthesizer = SpeechSynthesizer
+        self.model = os.environ.get("TTS_COSYVOICE_MODEL", "cosyvoice-v3-flash").strip() or "cosyvoice-v3-flash"
+        self.voice = os.environ.get("TTS_COSYVOICE_VOICE", "longanyang").strip()
+        self.timeout = float(os.environ.get("TTS_COSYVOICE_TIMEOUT", "30"))
+        self.retry_count = max(int(os.environ.get("TTS_COSYVOICE_RETRIES", "1")), 0)
+        self.audio_format_name = (
+            os.environ.get("TTS_COSYVOICE_FORMAT", "MP3_22050HZ_MONO_256KBPS").strip()
+            or "MP3_22050HZ_MONO_256KBPS"
+        )
+        self.audio_format = self._resolve_audio_format(self.audio_format_name)
+        inferred_media_type = self._infer_media_type(self.audio_format)
+        configured_media_type = os.environ.get("TTS_COSYVOICE_MEDIA_TYPE", "").strip()
+        self.media_type = configured_media_type or inferred_media_type
+
+        api_key = (
+            os.environ.get("DASHSCOPE_API_KEY")
+            or os.environ.get("BAILIAN_API_KEY")
+            or ""
+        ).strip()
+        if not api_key:
+            raise RuntimeError("Missing DASHSCOPE_API_KEY or BAILIAN_API_KEY for CosyVoice")
+        self.dashscope.api_key = api_key
+
+    def _resolve_audio_format(self, format_name: str):
+        candidate = format_name.strip().upper()
+        resolved = getattr(self.audio_format_enum, candidate, None)
+        if resolved is not None:
+            return resolved
+        logger.warning(
+            "[TTS Service] Unknown TTS_COSYVOICE_FORMAT=%s, fallback to MP3_22050HZ_MONO_256KBPS",
+            format_name,
+        )
+        return self.audio_format_enum.MP3_22050HZ_MONO_256KBPS
+
+    def _infer_media_type(self, audio_format) -> str:
+        fmt = str(getattr(audio_format, "format", "") or "").strip().lower()
+        return self._MEDIA_TYPE_BY_AUDIO_FORMAT.get(fmt, "audio/mpeg")
+
+    def _validate_audio_payload(self, audio_data: Any) -> bytes:
+        if isinstance(audio_data, memoryview):
+            audio_data = audio_data.tobytes()
+        elif isinstance(audio_data, bytearray):
+            audio_data = bytes(audio_data)
+
+        if not isinstance(audio_data, bytes) or not audio_data:
+            raise RuntimeError("DashScope TTS returned empty audio")
+
+        if self.media_type == "audio/mpeg":
+            is_mp3 = audio_data.startswith(b"ID3") or (
+                len(audio_data) >= 2 and audio_data[0] == 0xFF and (audio_data[1] & 0xE0) == 0xE0
+            )
+            if not is_mp3:
+                raise RuntimeError("DashScope TTS returned invalid MP3 payload")
+        elif self.media_type == "audio/wav":
+            is_wav = len(audio_data) >= 12 and audio_data[:4] == b"RIFF" and audio_data[8:12] == b"WAVE"
+            if not is_wav:
+                raise RuntimeError("DashScope TTS returned invalid WAV payload")
+
+        return audio_data
+
+    async def synthesize(self, req: SynthesizeRequest) -> bytes:
+        selected_voice = (req.voice or "").strip() or self.voice
+        if not selected_voice:
+            raise ValueError("CosyVoice voice is required")
+
+        timeout_millis: Optional[int]
+        if self.timeout > 0:
+            timeout_millis = int(self.timeout * 1000)
+        else:
+            timeout_millis = None
+
+        def _invoke_synthesizer() -> Any:
+            synthesizer = cast(Any, self.speech_synthesizer)(
+                model=self.model,
+                voice=selected_voice,
+                format=self.audio_format,
+            )
+            return synthesizer.call(req.text, timeout_millis=timeout_millis)
+
+        last_error: Optional[Exception] = None
+        for attempt in range(self.retry_count + 1):
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(_invoke_synthesizer),
+                    timeout=max(self.timeout + 5.0, 10.0),
+                )
+                return self._validate_audio_payload(response)
+            except Exception as exc:
+                last_error = exc
+                if attempt >= self.retry_count:
+                    raise
+                logger.warning(
+                    "[TTS Service] CosyVoice synthesis attempt %s/%s failed, retrying: %s",
+                    attempt + 1,
+                    self.retry_count + 1,
+                    str(exc)[:180],
+                )
+                await asyncio.sleep(0.2 * (attempt + 1))
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("CosyVoice synthesis failed")
+
+    def health(self) -> dict:
+        return {
+            "provider": self.name,
+            "model": self.model,
+            "voice": self.voice or None,
+            "format": self.audio_format.name,
+            "timeout": self.timeout,
+            "retries": self.retry_count,
+            "media_type": self.media_type,
+        }
 
 
 class EdgeTTSProvider:
@@ -136,98 +305,6 @@ class EdgeTTSProvider:
         }
 
 
-class MeloTTSProvider:
-    name = "melo"
-    media_type = "audio/wav"
-
-    def __init__(self):
-        from melo.api import TTS
-
-        self.tts_cls = TTS
-        self.device = os.environ.get("TTS_MELO_DEVICE", "auto")
-        self.default_language = os.environ.get("TTS_MELO_LANGUAGE", "ZH").upper()
-        self.default_speaker = os.environ.get("TTS_MELO_SPEAKER", "").strip()
-        self.default_speed = float(os.environ.get("TTS_MELO_SPEED", "1.0"))
-        self._models = {}
-        self._lock = threading.Lock()
-
-    def _get_model(self, language: str):
-        language = (language or self.default_language).upper()
-        if language not in self._models:
-            self._models[language] = self.tts_cls(language=language, device=self.device)
-        return self._models[language]
-
-    def _synthesize_sync(self, req: SynthesizeRequest) -> bytes:
-        language = (req.language or self.default_language).upper()
-        model = self._get_model(language)
-        speakers = dict(model.hps.data.spk2id or {})
-        if not speakers:
-            raise ValueError("Melo model has no available speakers")
-
-        raw_speaker = req.speaker if req.speaker not in (None, "") else self.default_speaker
-        speaker_key = next(iter(speakers.keys()))
-        if raw_speaker not in (None, ""):
-            candidate = raw_speaker.strip() if isinstance(raw_speaker, str) else raw_speaker
-            if candidate in speakers:
-                speaker_key = candidate
-            elif isinstance(candidate, str) and candidate.isdigit() and int(candidate) in speakers:
-                speaker_key = int(candidate)
-            else:
-                available = ", ".join(map(str, speakers.keys()))
-                raise ValueError(
-                    f"Unknown Melo speaker '{raw_speaker}'. Available speakers: {available}"
-                )
-
-        speaker_id = speakers[speaker_key]
-        if not isinstance(speaker_id, int):
-            try:
-                speaker_id = int(speaker_id)
-            except Exception as exc:
-                raise ValueError(
-                    f"Invalid Melo speaker id '{speaker_id}' for key '{speaker_key}'"
-                ) from exc
-
-        speed = req.speed or self.default_speed
-        if not isinstance(speed, (float, int)):
-            raise ValueError("Melo speed must be a number")
-
-        tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        tmp_path = tmp_file.name
-        tmp_file.close()
-        try:
-            with self._lock:
-                model.tts_to_file(
-                    req.text,
-                    speaker_id,
-                    output_path=tmp_path,
-                    speed=float(speed),
-                    format="wav",
-                    quiet=True,
-                )
-            with open(tmp_path, "rb") as f:
-                audio_data = f.read()
-            if not audio_data:
-                raise RuntimeError("Melo returned empty wav")
-            return audio_data
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
-    async def synthesize(self, req: SynthesizeRequest) -> bytes:
-        return await asyncio.to_thread(self._synthesize_sync, req)
-
-    def health(self) -> dict:
-        return {
-            "provider": self.name,
-            "device": self.device,
-            "default_language": self.default_language,
-            "default_speaker": self.default_speaker or None,
-            "loaded_languages": sorted(self._models.keys()),
-        }
-
-
 class ProviderRuntime:
     def __init__(self, provider):
         self.provider = provider
@@ -251,25 +328,30 @@ class ProviderRuntime:
 
 
 def _resolve_provider_order() -> list[str]:
-    provider_name = os.environ.get("TTS_PROVIDER", "auto").strip().lower()
-    strict_mode = str(os.environ.get("TTS_PROVIDER_STRICT", "")).strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    if provider_name == "auto":
-        return ["edge"] if strict_mode else ["edge", "melo"]
-    if provider_name == "melo":
-        return ["melo"] if strict_mode else ["melo", "edge"]
-    if provider_name == "edge":
-        return ["edge"] if strict_mode else ["edge", "melo"]
-    raise RuntimeError(f"Unsupported TTS_PROVIDER: {provider_name}")
+    requested = str(os.environ.get("TTS_PROVIDER", "auto") or "auto").strip().lower()
+    strict = _as_bool(os.environ.get("TTS_PROVIDER_STRICT"), False)
+
+    if requested in {"", "auto"}:
+        order = ["cosyvoice", "edge"]
+    elif requested in {"cosyvoice", "cosy", "dashscope", "cosyvoice-v3-flash"}:
+        order = ["cosyvoice", "edge"]
+    elif requested in {"edge", "edge-tts", "edge_tts"}:
+        order = ["edge"]
+    else:
+        logger.warning(
+            "[TTS Service] Unknown TTS_PROVIDER=%s, fallback to auto(cosyvoice->edge)",
+            requested,
+        )
+        order = ["cosyvoice", "edge"]
+
+    if strict and order:
+        return [order[0]]
+    return order
 
 
 def _load_single_provider(name: str) -> ProviderRuntime:
-    if name == "melo":
-        return ProviderRuntime(MeloTTSProvider())
+    if name == "cosyvoice":
+        return ProviderRuntime(CosyVoiceProvider())
     if name == "edge":
         return ProviderRuntime(EdgeTTSProvider())
     raise RuntimeError(f"Unsupported provider: {name}")
@@ -287,6 +369,19 @@ def _load_providers():
             load_errors[name] = str(exc)
 
     return loaded_providers, load_errors, provider_order
+
+
+def _classify_tts_error(error_message: str) -> str:
+    message = (error_message or "").strip().lower()
+    if not message:
+        return "upstream_error"
+    if "timeout" in message:
+        return "upstream_timeout"
+    if "api key" in message or "unauthorized" in message or "forbidden" in message:
+        return "upstream_auth_error"
+    if "empty audio" in message or "invalid mp3" in message or "invalid wav" in message:
+        return "upstream_invalid_audio"
+    return "upstream_error"
 
 
 providers, provider_errors, provider_order = _load_providers()
@@ -307,7 +402,7 @@ async def health():
     return {
         "status": "healthy" if ready else "degraded",
         "ready": ready,
-        "provider_strict": str(os.environ.get("TTS_PROVIDER_STRICT", "")).strip().lower() in {"1", "true", "yes", "on"},
+        "provider_strict": _as_bool(os.environ.get("TTS_PROVIDER_STRICT"), False),
         "provider_order": provider_order,
         "active_provider": providers[0].name if providers else None,
         "providers": [runtime.health() for runtime in providers],
@@ -329,6 +424,9 @@ async def synthesize(req: SynthesizeRequest):
 
     normalized_req = req.model_copy(update={"text": prepared_text})
     synth_errors: list[dict[str, str]] = []
+    primary_provider = providers[0].name if providers else ""
+    primary_error: str = ""
+    primary_error_code: str = "upstream_error"
 
     for runtime in providers:
         try:
@@ -336,10 +434,20 @@ async def synthesize(req: SynthesizeRequest):
             if not audio_data:
                 raise RuntimeError("TTS provider returned empty audio")
             runtime.error = None
+            headers = {"X-TTS-Provider": runtime.name}
+            if primary_provider and runtime.name != primary_provider and primary_error:
+                headers["X-TTS-Fallback-From"] = primary_provider
+                headers["X-TTS-Fallback-Reason"] = primary_error_code
+                logger.warning(
+                    "[TTS Service] fallback applied: %s -> %s, reason_code=%s",
+                    primary_provider,
+                    runtime.name,
+                    primary_error_code,
+                )
             return Response(
                 content=audio_data,
                 media_type=runtime.media_type,
-                headers={"X-TTS-Provider": runtime.name},
+                headers=headers,
             )
         except ValueError as exc:
             runtime.error = str(exc)[:300]
@@ -347,5 +455,8 @@ async def synthesize(req: SynthesizeRequest):
         except Exception as exc:
             runtime.error = str(exc)[:300]
             synth_errors.append({"provider": runtime.name, "error": runtime.error})
+            if not primary_error:
+                primary_error = runtime.error
+                primary_error_code = _classify_tts_error(primary_error)
 
     raise HTTPException(status_code=502, detail=synth_errors)

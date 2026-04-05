@@ -205,6 +205,12 @@ video_upload:
   upload_expires_seconds: 3600
   enable_transcode: true
   keep_raw: true
+  transcode_preset: "veryfast"
+  transcode_crf: 23
+  transcode_target_fps: 30
+  transcode_gop_seconds: 1.0
+  transcode_audio_bitrate: "128k"
+  transcode_timeout_seconds: 7200
   playback_signing_secret: "CHANGE-THIS-VIDEO-SIGNING-SECRET"
 
 # ====================================

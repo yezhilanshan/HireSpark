@@ -1667,6 +1667,7 @@ def _record_runtime_dialogue(
                 position=runtime.position,
                 question=question,
                 answer=answer,
+                detection_state=dict(runtime.pending_detection_state or {}),
             )
             if not enqueue_result.get('success'):
                 _log_runtime_event(
@@ -3049,7 +3050,25 @@ def handle_utterance_commit(data=None):
         _set_runtime_asr_lock(runtime, True, 'manual_submit')
         answer_session = runtime.current_answer_session
         if answer_session and answer_session.turn_id == turn_id and not answer_session.committed:
-            answer_session.mark_final(text_override or answer_session.merged_text_draft, reason='manual_submit')
+            final_text = (text_override or answer_session.merged_text_draft or answer_session.live_text).strip()
+            audio_path = _persist_answer_audio(runtime, answer_session)
+            answer_session.mark_final(final_text, reason='manual_submit', exported_audio_path=audio_path)
+            try:
+                _build_answer_session_final_metrics(
+                    runtime,
+                    answer_session,
+                    audio_path=audio_path,
+                    final_text=answer_session.final_text or final_text,
+                )
+            except Exception as exc:
+                logger.warning(f"手动提交语音指标计算失败：{exc}")
+            _emit_realtime_speech_metrics(
+                runtime,
+                answer_session,
+                is_speaking=False,
+                text_snapshot=answer_session.final_text or final_text,
+                source='manual_submit',
+            )
             answer_session.committed = True
             _emit_answer_session_update(runtime, source='manual_commit')
         _emit_orchestrator_state(runtime)
@@ -3249,7 +3268,7 @@ def _decode_evaluation_rows(raw_rows):
     decoded = []
     for row in raw_rows or []:
         item = dict(row)
-        for key in ('layer1_json', 'layer2_json'):
+        for key in ('layer1_json', 'layer2_json', 'text_layer_json', 'speech_layer_json', 'video_layer_json', 'fusion_json'):
             raw_value = item.get(key)
             if not raw_value:
                 item[key.replace('_json', '')] = {}
@@ -3276,6 +3295,422 @@ def _score_to_level(score: float) -> str:
 def _safe_avg(values):
     valid = [float(v) for v in values if isinstance(v, (int, float))]
     return (sum(valid) / len(valid)) if valid else 0.0
+
+
+def _dimension_label_map():
+    return {
+        'technical_accuracy': '技术准确性',
+        'knowledge_depth': '知识深度',
+        'completeness': '回答完整度',
+        'logic': '逻辑严谨性',
+        'job_match': '岗位匹配度',
+        'authenticity': '项目真实性',
+        'ownership': '项目 ownership',
+        'technical_depth': '项目技术深度',
+        'reflection': '复盘反思',
+        'architecture_reasoning': '架构推理',
+        'tradeoff_awareness': '权衡意识',
+        'scalability': '扩展性设计',
+        'clarity': '表达清晰度',
+        'relevance': '回答相关性',
+        'self_awareness': '自我认知',
+        'communication': '沟通表现',
+    }
+
+
+def _compact_text(value, limit=120):
+    text = re.sub(r'\s+', ' ', str(value or '')).strip()
+    if len(text) <= limit:
+        return text
+    clipped = text[:max(0, int(limit) - 1)].rstrip()
+    return f'{clipped}…'
+
+
+def _classify_reason_tags(dim_key: str, reason_text: str):
+    dim = str(dim_key or '').strip().lower()
+    reason = str(reason_text or '').strip()
+    merged = f"{dim} {reason}"
+    merged_lower = merged.lower()
+
+    tags = set()
+    dim_to_tag = {
+        'technical_accuracy': '技术',
+        'knowledge_depth': '技术',
+        'job_match': '技术',
+        'authenticity': '技术',
+        'ownership': '技术',
+        'technical_depth': '技术',
+        'architecture_reasoning': '技术',
+        'tradeoff_awareness': '技术',
+        'scalability': '技术',
+        'clarity': '表达',
+        'relevance': '表达',
+        'communication': '表达',
+        'logic': '结构',
+        'completeness': '结构',
+        'reflection': '结构',
+        'self_awareness': '结构',
+    }
+    if dim in dim_to_tag:
+        tags.add(dim_to_tag[dim])
+
+    tech_keywords = [
+        '技术', '算法', '架构', '原理', '准确', '深度', '实现', '扩展', 'tradeoff', 'scalability',
+        'technical', 'knowledge', 'authenticity', 'ownership', 'job match',
+    ]
+    expression_keywords = [
+        '表达', '沟通', '清晰', '语速', '停顿', '口头词', '流畅', 'clarity', 'communication',
+        'speech', 'fluency', 'filler', 'pause', 'relevance',
+    ]
+    structure_keywords = [
+        '结构', '逻辑', '完整', '条理', '结论', '框架', '组织', 'completeness', 'logic',
+        'structure', 'reasoning', 'reflection', 'self-awareness',
+    ]
+
+    if any(keyword in merged for keyword in tech_keywords if any('\u4e00' <= ch <= '\u9fff' for ch in keyword)) or any(keyword in merged_lower for keyword in tech_keywords if not any('\u4e00' <= ch <= '\u9fff' for ch in keyword)):
+        tags.add('技术')
+    if any(keyword in merged for keyword in expression_keywords if any('\u4e00' <= ch <= '\u9fff' for ch in keyword)) or any(keyword in merged_lower for keyword in expression_keywords if not any('\u4e00' <= ch <= '\u9fff' for ch in keyword)):
+        tags.add('表达')
+    if any(keyword in merged for keyword in structure_keywords if any('\u4e00' <= ch <= '\u9fff' for ch in keyword)) or any(keyword in merged_lower for keyword in structure_keywords if not any('\u4e00' <= ch <= '\u9fff' for ch in keyword)):
+        tags.add('结构')
+
+    if not tags:
+        tags.add('结构')
+    return [tag for tag in ('技术', '表达', '结构') if tag in tags]
+
+
+def _normalize_event_offset_seconds(timestamp_value, started_at):
+    """将事件时间标准化为“会话内偏移秒”；若无法判断则回退原值。"""
+    raw_seconds = float(timestamp_value or 0.0)
+    if raw_seconds <= 0:
+        return 0.0
+    # 大于该阈值通常是 Unix 时间戳（秒）。
+    if raw_seconds > 1_000_000 and started_at is not None:
+        try:
+            session_start_epoch = float(started_at.timestamp())
+            return max(0.0, raw_seconds - session_start_epoch)
+        except Exception:
+            return raw_seconds
+    return raw_seconds
+
+
+def _build_content_performance_snapshot(interview_id: str, dialogues=None):
+    total_questions = len(dialogues or [])
+    if not hasattr(db_manager, 'get_interview_evaluations'):
+        return {
+            'status': 'unavailable',
+            'status_message': '评估能力未启用，无法生成内容表现依据。',
+            'question_evidence': [],
+            'weak_dimensions': [],
+            'scoring_basis': {
+                'overall_formula': 'session_overall_score = mean(question.overall_score_final)',
+                'question_formula': 'question.overall_score_final = mean(final_dimension_scores)',
+                'sample_size': 0,
+            },
+        }
+
+    raw_rows = db_manager.get_interview_evaluations(interview_id=interview_id) or []
+    decoded_rows = _decode_evaluation_rows(raw_rows)
+    valid_turn_ids = {
+        str(item.get('turn_id') or '').strip()
+        for item in (dialogues or [])
+        if str(item.get('turn_id') or '').strip()
+    }
+    if valid_turn_ids:
+        decoded_rows = [
+            row for row in decoded_rows
+            if str(row.get('turn_id') or '').strip() in valid_turn_ids
+        ]
+
+    status_priority = {
+        'ok': 2,
+        'partial_ok': 1,
+    }
+    scored_by_turn = {}
+    for index, row in enumerate(decoded_rows):
+        status = str(row.get('status') or '').strip().lower()
+        if status not in {'ok', 'partial_ok'}:
+            continue
+        turn_id = str(row.get('turn_id') or '').strip()
+        dedupe_key = turn_id or str(row.get('eval_task_key') or f'row_{index}')
+        existing = scored_by_turn.get(dedupe_key)
+        if not existing:
+            scored_by_turn[dedupe_key] = row
+            continue
+        existing_status = str(existing.get('status') or '').strip().lower()
+        current_priority = int(status_priority.get(status, 0))
+        existing_priority = int(status_priority.get(existing_status, 0))
+        if current_priority >= existing_priority:
+            scored_by_turn[dedupe_key] = row
+    scored_rows = list(scored_by_turn.values())
+    if not scored_rows:
+        pending_message = '结构化评分处理中，请稍后刷新。' if total_questions > 0 else '暂无可追溯评分样本。'
+        return {
+            'status': 'processing' if total_questions > 0 else 'empty',
+            'status_message': pending_message,
+            'question_evidence': [],
+            'weak_dimensions': [],
+            'scoring_basis': {
+                'overall_formula': 'session_overall_score = mean(question.overall_score_final)',
+                'question_formula': 'question.overall_score_final = mean(final_dimension_scores)',
+                'sample_size': 0,
+            },
+        }
+
+    dialogue_by_turn = {
+        str(item.get('turn_id') or '').strip(): item
+        for item in (dialogues or [])
+        if str(item.get('turn_id') or '').strip()
+    }
+    dim_labels = _dimension_label_map()
+    dim_scores = {}
+    dim_reasons = {}
+    question_evidence = []
+
+    for row in scored_rows:
+        layer1 = row.get('layer1') or {}
+        layer2 = row.get('layer2') or {}
+        turn_id = str(row.get('turn_id') or '').strip()
+        dialogue_ref = dialogue_by_turn.get(turn_id) or {}
+
+        question = str(row.get('question') or dialogue_ref.get('question') or '').strip()
+        answer = str(row.get('answer') or dialogue_ref.get('answer') or '').strip()
+        round_type = str(row.get('round_type') or dialogue_ref.get('round_type') or 'unknown').strip() or 'unknown'
+        overall_score = (
+            layer2.get('overall_score_final')
+            or row.get('overall_score')
+            or layer2.get('overall_score')
+            or 0.0
+        )
+
+        final_dims = layer2.get('final_dimension_scores') or layer2.get('dimension_scores') or {}
+        weak_dims = []
+        for dim_key, dim_payload in (final_dims or {}).items():
+            score = float((dim_payload or {}).get('score') or 0.0)
+            reason = str((dim_payload or {}).get('reason') or '').strip()
+            reason_tags = _classify_reason_tags(dim_key, reason)
+            dim_scores.setdefault(dim_key, []).append(score)
+            if reason:
+                dim_reasons.setdefault(dim_key, []).append(reason)
+            weak_dims.append({
+                'key': dim_key,
+                'label': dim_labels.get(dim_key, dim_key),
+                'score': round(score, 1),
+                'reason': reason,
+                'reason_tags': reason_tags,
+            })
+
+        weak_dims_sorted = sorted(weak_dims, key=lambda item: float(item.get('score') or 0.0))[:2]
+        key_points = layer1.get('key_points') or {}
+        missing_points = [
+            str(item).strip()
+            for item in (key_points.get('missing') or [])
+            if str(item).strip()
+        ]
+        signals = layer1.get('signals') or {}
+        red_flags = [
+            str(item).strip()
+            for item in (signals.get('red_flags') or [])
+            if str(item).strip()
+        ]
+        evidence_tags = (missing_points[:3] + red_flags[:3])[:6]
+
+        question_evidence.append({
+            'turn_id': turn_id,
+            'round_type': round_type,
+            'question_excerpt': _compact_text(question, limit=100),
+            'answer_excerpt': _compact_text(answer, limit=180),
+            'overall_score': round(float(overall_score or 0.0), 1),
+            'weak_dimensions': weak_dims_sorted,
+            'reason_tags': sorted({
+                tag
+                for dim_item in weak_dims_sorted
+                for tag in (dim_item.get('reason_tags') or [])
+            }, key=lambda item: ('技术', '表达', '结构').index(item) if item in {'技术', '表达', '结构'} else 99),
+            'evidence_tags': evidence_tags,
+            'trace_source': f"interview_evaluations/{str(row.get('evaluation_version') or 'v1').strip() or 'v1'}",
+        })
+
+    weak_dimensions = []
+    for dim_key, values in sorted(dim_scores.items(), key=lambda item: _safe_avg(item[1])):
+        reasons = []
+        reason_tags = set()
+        for reason in dim_reasons.get(dim_key, []):
+            if reason and reason not in reasons:
+                reasons.append(reason)
+            for tag in _classify_reason_tags(dim_key, reason):
+                reason_tags.add(tag)
+        weak_dimensions.append({
+            'key': dim_key,
+            'label': dim_labels.get(dim_key, dim_key),
+            'avg_score': round(_safe_avg(values), 1),
+            'sample_count': len(values),
+            'reasons': reasons[:2],
+            'reason_tags': [
+                tag for tag in ('技术', '表达', '结构')
+                if tag in reason_tags
+            ],
+        })
+
+    return {
+        'status': 'ready',
+        'status_message': '已基于单题结构化评估生成内容表现依据。',
+        'question_evidence': sorted(
+            question_evidence,
+            key=lambda item: float(item.get('overall_score') or 0.0)
+        )[:6],
+        'weak_dimensions': weak_dimensions[:6],
+        'scoring_basis': {
+            'overall_formula': 'session_overall_score = mean(question.overall_score_final)',
+            'question_formula': 'question.overall_score_final = mean(final_dimension_scores)',
+            'sample_size': len(question_evidence),
+        },
+    }
+
+
+def _build_speech_performance_snapshot(interview_id: str):
+    if not hasattr(db_manager, 'get_speech_evaluations'):
+        return {
+            'status': 'unavailable',
+            'status_message': '语音评估能力未启用。',
+            'dimensions': [],
+            'summary': {},
+            'evidence_samples': [],
+            'diagnosis': [],
+        }
+
+    raw_rows = db_manager.get_speech_evaluations(interview_id=interview_id) or []
+    decoded_rows = _decode_speech_rows(raw_rows)
+    if not decoded_rows:
+        return {
+            'status': 'empty',
+            'status_message': '暂无语音评估样本。',
+            'dimensions': [],
+            'summary': {},
+            'evidence_samples': [],
+            'diagnosis': [],
+        }
+
+    speech_summary = aggregate_expression_metrics(decoded_rows)
+    dimension_labels = {
+        'speech_rate_score': '语速节奏',
+        'pause_anomaly_score': '停顿稳定性',
+        'filler_frequency_score': '口头词控制',
+        'fluency_score': '流畅度',
+        'clarity_score': '清晰度',
+    }
+
+    dimensions = []
+    for key, value in (speech_summary.get('dimensions') or {}).items():
+        dimensions.append({
+            'key': key,
+            'label': dimension_labels.get(key, key),
+            'score': round(float(value or 0.0), 1),
+        })
+    dimensions.sort(key=lambda item: float(item.get('score') or 0.0))
+
+    evidence_samples = []
+    for row in decoded_rows:
+        metrics = row.get('speech_metrics_final') or {}
+        pause_data = (metrics or {}).get('pause') or {}
+        filler_data = (metrics or {}).get('fillers') or {}
+        transcript = str(row.get('final_transcript') or '').strip()
+        sample = {
+            'turn_id': str(row.get('turn_id') or '').strip(),
+            'transcript_excerpt': _compact_text(transcript, limit=120),
+            'speech_rate_wpm': round(float((metrics or {}).get('speech_rate_wpm') or 0.0), 1),
+            'fillers_per_100_words': round(float((filler_data or {}).get('per_100_words') or 0.0), 2),
+            'pause_anomaly_ratio': round(float((pause_data or {}).get('anomaly_ratio') or 0.0), 4),
+            'long_pause_count': int((pause_data or {}).get('long_count') or 0),
+            'token_count': int((metrics or {}).get('token_count') or 0),
+        }
+        sample['_issue_score'] = (
+            abs(sample['speech_rate_wpm'] - 165.0) * 0.06
+            + sample['fillers_per_100_words'] * 2.2
+            + sample['pause_anomaly_ratio'] * 100.0
+            + sample['long_pause_count'] * 1.8
+        )
+        evidence_samples.append(sample)
+
+    evidence_samples.sort(key=lambda item: float(item.get('_issue_score') or 0.0), reverse=True)
+    trimmed_samples = []
+    for item in evidence_samples[:5]:
+        copied = dict(item)
+        copied.pop('_issue_score', None)
+        trimmed_samples.append(copied)
+
+    summary = speech_summary.get('summary') or {}
+    avg_speech_rate = float(summary.get('avg_speech_rate_wpm') or 0.0)
+    avg_fillers = float(summary.get('avg_fillers_per_100_words') or 0.0)
+    avg_pause_ratio = float(summary.get('avg_pause_anomaly_ratio') or 0.0)
+    diagnosis = []
+    if avg_speech_rate > 0 and avg_speech_rate < 110:
+        diagnosis.append('整体语速偏慢，建议先给结论再展开，以减少停顿。')
+    elif avg_speech_rate > 230:
+        diagnosis.append('整体语速偏快，建议在关键结论处放慢节奏。')
+    if avg_fillers > 6.0:
+        diagnosis.append('口头词偏多，建议回答前先用 1 句话组织主线。')
+    if avg_pause_ratio > 0.45:
+        diagnosis.append('异常停顿比例较高，建议按“结论-依据-结果”模板回答。')
+    if not diagnosis:
+        diagnosis.append('语音表达整体稳定，可持续保持当前节奏。')
+
+    return {
+        'status': 'ready',
+        'status_message': '语音指标已完成聚合。',
+        'dimensions': dimensions,
+        'summary': summary,
+        'evidence_samples': trimmed_samples,
+        'diagnosis': diagnosis,
+    }
+
+
+def _build_camera_performance_snapshot(statistics, event_type_counter, top_events, max_probability: float):
+    stats = statistics or {}
+    total_deviations = int(stats.get('total_deviations') or 0)
+    total_mouth_open = int(stats.get('total_mouth_open') or 0)
+    total_multi_person = int(stats.get('total_multi_person') or 0)
+    off_screen_ratio = float(stats.get('off_screen_ratio') or 0.0)
+
+    focus_score = max(0.0, min(100.0, 100.0 - off_screen_ratio * 2.6 - max(0, total_deviations - 2) * 1.4))
+    compliance_score = max(0.0, min(100.0, 100.0 - total_mouth_open * 2.2 - total_multi_person * 40.0))
+    anti_cheat_score = max(0.0, min(100.0, 100.0 - float(max_probability or 0.0)))
+    overall_score = round((focus_score + compliance_score + anti_cheat_score) / 3.0, 1)
+
+    notes = []
+    if total_multi_person > 0:
+        notes.append('检测到多人同框，属于高风险违规行为。')
+    if off_screen_ratio >= 20:
+        notes.append(f'屏幕外注视占比 {off_screen_ratio:.1f}%，注意力稳定性不足。')
+    elif off_screen_ratio >= 10:
+        notes.append(f'屏幕外注视占比 {off_screen_ratio:.1f}%，建议减少视线偏离。')
+    if total_mouth_open >= 4:
+        notes.append(f'检测到 {total_mouth_open} 次异常口型，建议确认环境无干扰。')
+    if total_deviations >= 6:
+        notes.append(f'累计 {total_deviations} 次偏移事件，建议固定坐姿并保持正对镜头。')
+    if not notes:
+        notes.append('镜头前行为总体稳定，未见明显异常模式。')
+
+    return {
+        'status': 'ready',
+        'status_message': '镜头行为指标已完成聚合。',
+        'overall_score': overall_score,
+        'focus_score': round(focus_score, 1),
+        'compliance_score': round(compliance_score, 1),
+        'anti_cheat_score': round(anti_cheat_score, 1),
+        'statistics': {
+            'total_deviations': total_deviations,
+            'total_mouth_open': total_mouth_open,
+            'total_multi_person': total_multi_person,
+            'off_screen_ratio': round(off_screen_ratio, 2),
+        },
+        'event_type_breakdown': [
+            {'event_type': key, 'count': int(count)}
+            for key, count in sorted(event_type_counter.items(), key=lambda item: item[1], reverse=True)
+        ],
+        'top_risk_events': top_events[:6],
+        'notes': notes,
+    }
 
 
 def _build_legacy_score_breakdown_from_dimensions(dimension_items):
@@ -3726,6 +4161,34 @@ def _build_structured_snapshot(interview_id: str, dialogues=None):
             if str(row.get('turn_id') or '').strip() in valid_turn_ids
         ]
 
+    status_priority = {
+        'ok': 5,
+        'partial_ok': 4,
+        'running': 3,
+        'pending': 2,
+        'queued': 1,
+        'skipped': 0,
+        'failed': 0,
+        'unknown': 0,
+    }
+    deduped_rows = {}
+    for index, row in enumerate(decoded_rows):
+        turn_id = str(row.get('turn_id') or '').strip()
+        dedupe_key = turn_id or str(row.get('eval_task_key') or f'row_{index}')
+        existing = deduped_rows.get(dedupe_key)
+        if not existing:
+            deduped_rows[dedupe_key] = row
+            continue
+
+        current_status = str(row.get('status') or 'unknown').strip().lower() or 'unknown'
+        existing_status = str(existing.get('status') or 'unknown').strip().lower() or 'unknown'
+        current_priority = int(status_priority.get(current_status, 0))
+        existing_priority = int(status_priority.get(existing_status, 0))
+        # 同优先级时用后到记录覆盖，保证同状态下取较新版本。
+        if current_priority >= existing_priority:
+            deduped_rows[dedupe_key] = row
+    decoded_rows = list(deduped_rows.values())
+
     if not decoded_rows:
         pending_message = '结构化评分处理中，请稍后刷新。' if total_questions > 0 else '暂无可评分题目。'
         return {
@@ -3842,6 +4305,172 @@ def _build_structured_snapshot(interview_id: str, dialogues=None):
     }
 
 
+def _build_evaluation_v2_snapshot(interview_id: str, dialogues=None):
+    total_questions = len(dialogues or [])
+    if not hasattr(db_manager, 'get_interview_evaluations'):
+        return {
+            'status': 'unavailable',
+            'status_message': '评估能力未启用',
+            'layers': {},
+            'fusion': {},
+            'total_questions': total_questions,
+            'evaluated_questions': 0,
+            'questions': [],
+        }
+
+    raw_rows = db_manager.get_interview_evaluations(interview_id=interview_id) or []
+    decoded_rows = _decode_evaluation_rows(raw_rows)
+
+    valid_turn_ids = {
+        str(item.get('turn_id') or '').strip()
+        for item in (dialogues or [])
+        if str(item.get('turn_id') or '').strip()
+    }
+    if valid_turn_ids:
+        decoded_rows = [
+            row for row in decoded_rows
+            if str(row.get('turn_id') or '').strip() in valid_turn_ids
+        ]
+
+    if not decoded_rows:
+        pending_message = '结构化评分处理中，请稍后刷新。' if total_questions > 0 else '暂无可评分题目。'
+        return {
+            'status': 'processing' if total_questions > 0 else 'empty',
+            'status_message': pending_message,
+            'layers': {},
+            'fusion': {},
+            'total_questions': total_questions,
+            'evaluated_questions': 0,
+            'questions': [],
+        }
+
+    status_priority = {
+        'ok': 5,
+        'partial_ok': 4,
+        'running': 3,
+        'pending': 2,
+        'queued': 1,
+        'skipped': 0,
+        'failed': 0,
+        'unknown': 0,
+    }
+    deduped_rows = {}
+    for index, row in enumerate(decoded_rows):
+        turn_id = str(row.get('turn_id') or '').strip()
+        dedupe_key = turn_id or str(row.get('eval_task_key') or f'row_{index}')
+        existing = deduped_rows.get(dedupe_key)
+        if not existing:
+            deduped_rows[dedupe_key] = row
+            continue
+        current_status = str(row.get('status') or 'unknown').strip().lower() or 'unknown'
+        existing_status = str(existing.get('status') or 'unknown').strip().lower() or 'unknown'
+        if int(status_priority.get(current_status, 0)) >= int(status_priority.get(existing_status, 0)):
+            deduped_rows[dedupe_key] = row
+    decoded_rows = list(deduped_rows.values())
+
+    valid_score_status = {'ok', 'partial_ok'}
+    layer_scores = {'text': [], 'speech': [], 'video': []}
+    fusion_scores = []
+    questions = []
+    scored_turns = set()
+    base_weights = {'text': 0.5, 'speech': 0.25, 'video': 0.25}
+    status_counts = Counter()
+
+    for row in decoded_rows:
+        row_status = str(row.get('status') or 'unknown').strip().lower() or 'unknown'
+        status_counts[row_status] += 1
+        if row_status not in valid_score_status:
+            continue
+
+        turn_id = str(row.get('turn_id') or '').strip()
+        if turn_id:
+            scored_turns.add(turn_id)
+
+        text_layer = row.get('text_layer') or {}
+        speech_layer = row.get('speech_layer') or {}
+        video_layer = row.get('video_layer') or {}
+        fusion = row.get('fusion') or {}
+
+        if not text_layer:
+            layer2 = row.get('layer2') or {}
+            text_layer = {
+                'overall_score': layer2.get('overall_score_final') or layer2.get('overall_score')
+            }
+
+        for layer_name, layer_data in (('text', text_layer), ('speech', speech_layer), ('video', video_layer)):
+            score = (layer_data or {}).get('overall_score')
+            if isinstance(score, (int, float)):
+                layer_scores[layer_name].append(float(score))
+
+        if isinstance((fusion or {}).get('base_weights'), dict):
+            base_weights = {
+                'text': float((fusion.get('base_weights') or {}).get('text') or base_weights['text']),
+                'speech': float((fusion.get('base_weights') or {}).get('speech') or base_weights['speech']),
+                'video': float((fusion.get('base_weights') or {}).get('video') or base_weights['video']),
+            }
+
+        fusion_score = (fusion or {}).get('overall_score')
+        if fusion_score is None:
+            fusion_score = row.get('overall_score')
+        if isinstance(fusion_score, (int, float)):
+            fusion_scores.append(float(fusion_score))
+
+        questions.append({
+            'turn_id': turn_id,
+            'round_type': str(row.get('round_type') or 'unknown').strip() or 'unknown',
+            'text_score': (text_layer or {}).get('overall_score'),
+            'speech_score': (speech_layer or {}).get('overall_score'),
+            'video_score': (video_layer or {}).get('overall_score'),
+            'fusion_score': fusion_score,
+            'status': row_status,
+        })
+
+    evaluated_questions = len(scored_turns) if scored_turns else len(fusion_scores)
+    has_pending_status = any(key in {'queued', 'pending', 'running'} for key in status_counts.keys())
+
+    if evaluated_questions > 0:
+        status = 'ready'
+        status_message = '三层解耦评分已就绪。'
+        if total_questions > evaluated_questions or has_pending_status:
+            status = 'partial'
+            status_message = '部分题目三层评分已完成，剩余题目仍在处理中。'
+    else:
+        status = 'processing' if total_questions > 0 else 'empty'
+        status_message = '三层评分处理中，请稍后刷新。' if total_questions > 0 else '暂无可评分题目。'
+
+    layers = {
+        'text': {
+            'overall_score': round(_safe_avg(layer_scores['text']), 1) if layer_scores['text'] else None,
+            'sample_size': len(layer_scores['text']),
+        },
+        'speech': {
+            'overall_score': round(_safe_avg(layer_scores['speech']), 1) if layer_scores['speech'] else None,
+            'sample_size': len(layer_scores['speech']),
+        },
+        'video': {
+            'overall_score': round(_safe_avg(layer_scores['video']), 1) if layer_scores['video'] else None,
+            'sample_size': len(layer_scores['video']),
+        },
+    }
+    missing_layers = [name for name, payload in layers.items() if payload.get('overall_score') is None]
+
+    return {
+        'status': status,
+        'status_message': status_message,
+        'total_questions': total_questions,
+        'evaluated_questions': int(evaluated_questions),
+        'layers': layers,
+        'fusion': {
+            'overall_score': round(_safe_avg(fusion_scores), 1) if fusion_scores else None,
+            'base_weights': base_weights,
+            'missing_layers': missing_layers,
+            'formula': 'weighted_mean(available_layer_scores)',
+        },
+        'questions': questions[:8],
+        'status_counts': dict(status_counts),
+    }
+
+
 def _build_immediate_report_payload(interview_id: str):
     """按 interview_id 生成即时报告聚合数据（不含复盘数据）。"""
     normalized_id = str(interview_id or '').strip()
@@ -3855,6 +4484,8 @@ def _build_immediate_report_payload(interview_id: str):
     statistics = db_manager.get_statistics_by_interview(normalized_id) if hasattr(db_manager, 'get_statistics_by_interview') else None
     dialogues = db_manager.get_interview_dialogues(normalized_id) if hasattr(db_manager, 'get_interview_dialogues') else []
     events = db_manager.get_events(normalized_id) if hasattr(db_manager, 'get_events') else []
+    started_at = _parse_db_datetime(interview.get('start_time'))
+    ended_at = _parse_db_datetime(interview.get('end_time'))
 
     report_path = str(interview.get('report_path') or '').strip()
     report_file_path = Path(report_path)
@@ -3874,14 +4505,21 @@ def _build_immediate_report_payload(interview_id: str):
             'event_type': str(item.get('event_type') or 'unknown'),
             'score': float(item.get('score') or 0.0),
             'description': str(item.get('description') or ''),
-            'timestamp': float(item.get('timestamp') or 0.0),
+            'timestamp': _normalize_event_offset_seconds(item.get('timestamp'), started_at),
         }
         for item in sorted_events[:8]
     ]
 
     structured_snapshot = _build_structured_snapshot(normalized_id, dialogues=dialogues)
-    started_at = _parse_db_datetime(interview.get('start_time'))
-    ended_at = _parse_db_datetime(interview.get('end_time'))
+    evaluation_v2 = _build_evaluation_v2_snapshot(normalized_id, dialogues=dialogues)
+    content_performance = _build_content_performance_snapshot(normalized_id, dialogues=dialogues)
+    speech_performance = _build_speech_performance_snapshot(normalized_id)
+    camera_performance = _build_camera_performance_snapshot(
+        statistics=statistics,
+        event_type_counter=event_type_counter,
+        top_events=top_events,
+        max_probability=float(interview.get('max_probability') or 0.0),
+    )
     if started_at and ended_at:
         duration_seconds = int(max(0, (ended_at - started_at).total_seconds()))
     else:
@@ -3920,6 +4558,10 @@ def _build_immediate_report_payload(interview_id: str):
             },
         },
         'structured_evaluation': structured_snapshot,
+        'evaluation_v2': evaluation_v2,
+        'content_performance': content_performance,
+        'speech_performance': speech_performance,
+        'camera_performance': camera_performance,
         'next_steps': {
             'review_url': f'/review?interviewId={normalized_id}',
             'replay_url': f'/replay?interviewId={normalized_id}',
@@ -4354,11 +4996,14 @@ def api_video_raw(interview_id):
         if not local_path or not Path(local_path).exists():
             return jsonify({'success': False, 'error': 'video file missing'}), 404
 
-        return send_file(
+        response = send_file(
             local_path,
             mimetype='video/mp4' if local_path.lower().endswith('.mp4') else 'video/webm',
             conditional=True,
         )
+        response.headers['Accept-Ranges'] = 'bytes'
+        response.headers['Cache-Control'] = 'private, max-age=0, must-revalidate'
+        return response
     except Exception as e:
         logger.error(f"本地视频回放失败：{e}", exc_info=True)
         return jsonify({'success': False, 'error': str(e)}), 500
