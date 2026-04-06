@@ -10,6 +10,10 @@ const FACE_TIMEOUT_MS = 500
 const MODEL_BASE = '/facephys/models'
 const WORKER_BASE = '/facephys'
 const MEDIAPIPE_WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21/wasm'
+const DELEGATE_INFO_SNIPPETS = [
+    'Created TensorFlow Lite XNNPACK delegate for CPU',
+    'INFO: Created TensorFlow Lite XNNPACK delegate for CPU'
+]
 
 type RppgStatus = 'idle' | 'loading' | 'tracking' | 'unstable' | 'no_face' | 'error'
 
@@ -54,6 +58,36 @@ type SessionRefs = {
     dval: number
     lastFaceDetectTime: number
     latencyMs: number | null
+    detectorErrorCount: number
+}
+
+const shouldSuppressDelegateLog = (args: unknown[]): boolean => {
+    if (!args || args.length === 0) return false
+    const text = args
+        .map((item) => String(item ?? ''))
+        .join(' ')
+        .trim()
+    if (!text) return false
+    return DELEGATE_INFO_SNIPPETS.some((snippet) => text.includes(snippet))
+}
+
+const withFilteredDelegateLogs = <T,>(run: () => T): T => {
+    const originalError = console.error
+    const originalWarn = console.warn
+    try {
+        console.error = (...args: unknown[]) => {
+            if (shouldSuppressDelegateLog(args)) return
+            originalError(...args)
+        }
+        console.warn = (...args: unknown[]) => {
+            if (shouldSuppressDelegateLog(args)) return
+            originalWarn(...args)
+        }
+        return run()
+    } finally {
+        console.error = originalError
+        console.warn = originalWarn
+    }
 }
 
 class KalmanFilter1D {
@@ -162,7 +196,8 @@ function createSessionRefs(): SessionRefs {
         virtualTime: 0,
         dval: 1 / 30,
         lastFaceDetectTime: 0,
-        latencyMs: null
+        latencyMs: null,
+        detectorErrorCount: 0
     }
 }
 
@@ -423,7 +458,22 @@ export function useFacePhysRppg(videoRef: RefObject<HTMLVideoElement>, enabled: 
             session.virtualTime = captureTime
         }
 
-        const detections = faceDetector.detectForVideo(video, performance.now())
+        let detections: any
+        try {
+            detections = withFilteredDelegateLogs(() => faceDetector.detectForVideo(video, performance.now()))
+            session.detectorErrorCount = 0
+        } catch (error) {
+            session.detectorErrorCount += 1
+            if (session.detectorErrorCount <= 3) {
+                const message = error instanceof Error ? error.message : String(error)
+                console.warn('[FacePhysRppg] detectForVideo 单帧失败，已跳过：', message)
+            }
+            if (session.detectorErrorCount >= 15) {
+                throw error
+            }
+            session.currentCaptureTime = captureTime
+            return
+        }
         const detection = detections?.detections?.[0]
 
         if (!detection?.boundingBox) {

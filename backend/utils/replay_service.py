@@ -1,5 +1,5 @@
 """
-Replay analysis service for interview post-mortem.
+面试复盘的回放分析服务。
 """
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from utils.speech_metrics import aggregate_expression_metrics
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
+    """安全地将值转换为浮点数，转换失败时返回默认值。"""
     try:
         return float(value)
     except Exception:
@@ -24,6 +25,7 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 
 def _safe_json_loads(value: Any, default: Any):
+    """安全地解析 JSON 字符串，解析失败时返回默认值。"""
     if value in (None, ""):
         return default
     if isinstance(value, (dict, list)):
@@ -35,15 +37,18 @@ def _safe_json_loads(value: Any, default: Any):
 
 
 def _avg(values: List[float]) -> float:
+    """计算数值列表的平均值，忽略无效值。"""
     valid = [float(item) for item in values if isinstance(item, (int, float)) and not math.isnan(float(item))]
     return (sum(valid) / len(valid)) if valid else 0.0
 
 
 def _clamp(value: float, min_value: float, max_value: float) -> float:
+    """将值限制在指定范围内。"""
     return max(min_value, min(max_value, float(value)))
 
 
 def _count_tokens(text: str) -> int:
+    """估算文本的 token 数量，中文字符和单词分别计数。"""
     content = str(text or "").strip()
     if not content:
         return 0
@@ -57,9 +62,10 @@ def _count_tokens(text: str) -> int:
 
 
 class ReplayService:
-    """Generate replay artifacts (A/B/C/D) and persist them."""
+    """生成回放产物（A/B/C/D）并持久化。"""
 
     def __init__(self, db_manager, llm_manager=None, rag_service=None, logger=None):
+        """初始化回放服务，配置 LLM 和数据库管理器。"""
         self.db_manager = db_manager
         self.llm_manager = llm_manager
         self.rag_service = rag_service
@@ -71,6 +77,7 @@ class ReplayService:
         self.review_version = str(config.get("replay.version", "v2_gemma_fallback") or "v2_gemma_fallback")
 
     def _decode_evaluations(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """解码评估数据行，解析 JSON 字段。"""
         decoded = []
         for row in rows or []:
             item = dict(row)
@@ -80,6 +87,7 @@ class ReplayService:
         return decoded
 
     def _decode_speech_rows(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """解码语音评估数据行，解析各类 JSON 字段。"""
         decoded = []
         for row in rows or []:
             item = dict(row)
@@ -98,6 +106,7 @@ class ReplayService:
         speech_rows: List[Dict[str, Any]],
         existing: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+        """构建回合时间线，包含问答时间戳和延迟信息。"""
         if existing:
             normalized = []
             for row in existing:
@@ -170,6 +179,7 @@ class ReplayService:
         evaluations: List[Dict[str, Any]],
         timeline_rows: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+        """构建高亮标签，标记高分、低分和转折点。"""
         score_by_turn: Dict[str, float] = {}
         coverage_by_turn: Dict[str, float] = {}
         for row in evaluations:
@@ -245,6 +255,7 @@ class ReplayService:
         return tags
 
     def _build_deep_audit(self, evaluations: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """构建深度审核报告，包含事实检查、维度差距和轮次诊断。"""
         fact_checks = []
         dimension_gaps = []
         round_diag = defaultdict(lambda: {"count": 0, "avg_score": 0.0, "coverage": 0.0})
@@ -321,6 +332,7 @@ class ReplayService:
         resume_data: Optional[Dict[str, Any]] = None,
         version: str = "v1",
     ) -> List[Dict[str, Any]]:
+        """构建影子回答，为低分题目生成优化后的参考回答。"""
         dialogue_by_turn = {str(item.get("turn_id") or "").strip(): item for item in dialogues if str(item.get("turn_id") or "").strip()}
         resume_skills = [str(item).strip() for item in ((resume_data or {}).get("skills") or []) if str(item).strip()]
 
@@ -380,6 +392,7 @@ class ReplayService:
         evaluations: List[Dict[str, Any]],
         speech_rows: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
+        """构建可视化指标，包含延迟、覆盖率、语音语调等数据。"""
         latencies = []
         for row in timeline_rows:
             latencies.append({
@@ -437,6 +450,7 @@ class ReplayService:
         evaluations: List[Dict[str, Any]],
         timeline_rows: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+        """构建回合证据，整合对话、评估和时间线数据。"""
         dialogue_by_turn = {
             str(item.get("turn_id") or "").strip(): item
             for item in (dialogues or [])
@@ -483,6 +497,7 @@ class ReplayService:
         return evidences[: self.review_max_turns]
 
     def _normalize_llm_tags(self, tags: Any, timeline_by_turn: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """标准化 LLM 生成的标签数据。"""
         if not isinstance(tags, list):
             return []
         normalized = []
@@ -516,6 +531,7 @@ class ReplayService:
 
     @staticmethod
     def _normalize_llm_deep_audit(payload: Any) -> Dict[str, Any]:
+        """标准化 LLM 生成的深度审核数据。"""
         if not isinstance(payload, dict):
             return {}
 
@@ -567,6 +583,7 @@ class ReplayService:
         evaluations: List[Dict[str, Any]],
         resume_data: Optional[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+        """标准化 LLM 生成的影子回答数据。"""
         if not isinstance(records, list):
             return []
         valid_turns = {str(item.get("turn_id") or "").strip() for item in evaluations}
@@ -600,6 +617,7 @@ class ReplayService:
         timeline_rows: List[Dict[str, Any]],
         resume_data: Optional[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
+        """尝试使用 LLM 生成标签、深度审核和影子回答。"""
         if not self.review_llm_enabled:
             return None
         if self.llm_manager is None or not hasattr(self.llm_manager, "generate_structured_json"):
@@ -661,6 +679,7 @@ class ReplayService:
         }
 
     def generate_replay(self, interview_id: str, force: bool = False) -> Dict[str, Any]:
+        """生成完整的面试回放数据，包含时间线、标签、审核和影子回答。"""
         interview_id = str(interview_id or "").strip()
         if not interview_id:
             return {"success": False, "error": "invalid_interview_id"}
@@ -758,6 +777,7 @@ class ReplayService:
         }
 
     def build_replay_payload(self, interview_id: str) -> Dict[str, Any]:
+        """构建回放数据的前端展示载荷。"""
         interview_id = str(interview_id or "").strip()
         if not interview_id:
             return {"success": False, "error": "invalid_interview_id"}
@@ -833,9 +853,10 @@ class ReplayService:
 
 
 class ReplayTaskManager:
-    """Async task manager for replay generation."""
+    """用于回放生成的异步任务管理器。"""
 
     def __init__(self, replay_service: ReplayService, max_workers: int = 2, logger=None):
+        """初始化任务管理器，配置线程池和锁。"""
         self.replay_service = replay_service
         self.max_workers = max(1, int(max_workers or 1))
         self.logger = logger
@@ -845,6 +866,7 @@ class ReplayTaskManager:
         self._inflight: Dict[str, str] = {}
 
     def enqueue(self, interview_id: str, force: bool = False) -> Dict[str, Any]:
+        """将回放生成任务加入队列，支持去重。"""
         interview_id = str(interview_id or "").strip()
         if not interview_id:
             return {"success": False, "error": "invalid_interview_id"}
@@ -893,6 +915,7 @@ class ReplayTaskManager:
         return {"success": True, "task_id": task_id, "status": "pending", "interview_id": interview_id}
 
     def _set_status(self, task_id: str, status: str, error: str = "", result: Optional[Dict[str, Any]] = None) -> None:
+        """设置任务状态，更新任务信息。"""
         with self._lock:
             task = self._tasks.get(task_id)
             if not task:
@@ -904,6 +927,7 @@ class ReplayTaskManager:
                 task["result"] = result
 
     def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """获取任务状态和信息。"""
         with self._lock:
             task = self._tasks.get(str(task_id or "").strip())
             return dict(task) if task else None

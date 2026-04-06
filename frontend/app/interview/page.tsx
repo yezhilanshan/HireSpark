@@ -4,6 +4,8 @@ import { useEffect, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import SocketClient from '@/lib/socket'
 import { useFacePhysRppg } from '@/lib/facephys/useFacePhysRppg'
+import { useFaceBehaviorMetrics } from '@/lib/facephys/useFaceBehaviorMetrics'
+import { getBackendBaseUrl } from '@/lib/backend'
 import { Mic, Loader2, ArrowRight, User, X, CheckCircle2, MessageSquare } from 'lucide-react'
 
 const parseBooleanEnv = (value: string | undefined, fallback: boolean) => {
@@ -20,7 +22,7 @@ const parseNumberEnv = (value: string | undefined, fallback: number) => {
     return Number.isFinite(parsed) ? parsed : fallback
 }
 
-const BACKEND_API_BASE = (process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000').replace(/\/$/, '')
+const BACKEND_API_BASE = getBackendBaseUrl()
 const SERVER_ASR_ACTIVE_COOLDOWN_MS = parseNumberEnv(process.env.NEXT_PUBLIC_SERVER_ASR_ACTIVE_COOLDOWN_MS, 350)
 const SERVER_ASR_FALLBACK_DELAY_MS = 3200
 const SERVER_ASR_STALL_WINDOW_MS = 3200
@@ -235,9 +237,21 @@ export default function InterviewPage() {
     const currentTtsAudioRef = useRef<HTMLAudioElement | null>(null)
     const currentTtsUrlRef = useRef<string | null>(null)
     const ttsAudioQueueRef = useRef<Array<{ audio: string; jobId: string; turnId: string; mimeType: string; provider?: string }>>([])
+    const ttsDoneSignaledRef = useRef(false)
     const isTTSSpeakingRef = useRef(false)
     const receivedServerChunkForCurrentSpeakRef = useRef(false)
     const rppgMetrics = useFacePhysRppg(videoRef, cameraReady && interviewStarted)
+    const faceBehaviorMetrics = useFaceBehaviorMetrics(videoRef, cameraReady && interviewStarted)
+    const rppgMetricsRef = useRef(rppgMetrics)
+    const faceBehaviorMetricsRef = useRef(faceBehaviorMetrics)
+
+    useEffect(() => {
+        rppgMetricsRef.current = rppgMetrics
+    }, [rppgMetrics])
+
+    useEffect(() => {
+        faceBehaviorMetricsRef.current = faceBehaviorMetrics
+    }, [faceBehaviorMetrics])
 
     const clearLlmTimeout = () => {
         if (llmTimeoutRef.current) {
@@ -296,6 +310,18 @@ export default function InterviewPage() {
 
     const clamp = (value: number, min: number, max: number) => {
         return Math.min(max, Math.max(min, value))
+    }
+
+    const toFiniteNumber = (value: unknown, fallback = 0) => {
+        const parsed = Number(value)
+        return Number.isFinite(parsed) ? parsed : fallback
+    }
+
+    const roundMetric = (value: unknown, digits = 4, fallback: number | null = null): number | null => {
+        const parsed = Number(value)
+        if (!Number.isFinite(parsed)) return fallback
+        const factor = 10 ** digits
+        return Math.round(parsed * factor) / factor
     }
 
     const buildInterviewId = (sessionId: string) => {
@@ -608,10 +634,21 @@ export default function InterviewPage() {
         })
     }
 
+    const finalizeCurrentTtsPlayback = () => {
+        pendingTtsTextRef.current = ''
+        receivedServerChunkForCurrentSpeakRef.current = false
+        ttsDoneSignaledRef.current = false
+        isTTSSpeakingRef.current = false
+        isAiSpeakingRef.current = false
+        setIsAiSpeaking(false)
+        resumeAudioRecordingAfterTts()
+    }
+
     const stopCurrentTts = () => {
         ttsAudioQueueRef.current = []
         pendingTtsTextRef.current = ''
         receivedServerChunkForCurrentSpeakRef.current = false
+        ttsDoneSignaledRef.current = false
         isTTSSpeakingRef.current = false
         isAiSpeakingRef.current = false
         setIsAiSpeaking(false)
@@ -971,6 +1008,7 @@ export default function InterviewPage() {
 
         pendingTtsTextRef.current = text.trim()
         receivedServerChunkForCurrentSpeakRef.current = false
+        ttsDoneSignaledRef.current = false
         setIsAiSpeaking(true)
         isAiSpeakingRef.current = true
         isTTSSpeakingRef.current = true
@@ -1010,11 +1048,11 @@ export default function InterviewPage() {
                 }
                 currentTtsAudioRef.current = null
                 if (ttsAudioQueueRef.current.length === 0) {
-                    pendingTtsTextRef.current = ''
-                    isTTSSpeakingRef.current = false
-                    isAiSpeakingRef.current = false
-                    setIsAiSpeaking(false)
-                    resumeAudioRecordingAfterTts()
+                    if (ttsDoneSignaledRef.current) {
+                        finalizeCurrentTtsPlayback()
+                    } else {
+                        console.log('[TTS] 播放队列已空，等待服务端完成信号')
+                    }
                 }
                 playNextTtsChunk()
             }
@@ -1352,6 +1390,7 @@ export default function InterviewPage() {
             socketClient.off('asr_final')
             socketClient.off('asr_debug')
             socketClient.off('tts_chunk')
+            socketClient.off('tts_done')
             socketClient.off('tts_stop')
             socketClient.off('session_control_notice')
             socketClient.off('pipeline_error')
@@ -1585,6 +1624,18 @@ export default function InterviewPage() {
                     console.log('[TTS] 收到服务端音频:', data.provider, data.mime_type || 'audio/mpeg')
                 }
                 playNextTtsChunk()
+            })
+
+            socketClient.on('tts_done', (data: any) => {
+                if (!data?.session_id) return
+                if (data.session_id !== sessionIdRef.current) return
+                if (typeof data?.interrupt_epoch === 'number' && data.interrupt_epoch < interruptEpochRef.current) return
+                if (activeTtsJobIdRef.current && data?.job_id && data.job_id !== activeTtsJobIdRef.current) return
+
+                ttsDoneSignaledRef.current = true
+                if (!currentTtsAudioRef.current && ttsAudioQueueRef.current.length === 0) {
+                    finalizeCurrentTtsPlayback()
+                }
             })
 
             socketClient.on('tts_stop', (data: any) => {
@@ -1836,7 +1887,9 @@ export default function InterviewPage() {
 
         const emitDetectionState = () => {
             const now = Date.now()
-            const hasFace = Boolean(rppgMetrics.hasFace)
+            const pulseMetrics = rppgMetricsRef.current
+            const behaviorMetrics = faceBehaviorMetricsRef.current
+            const hasFace = Boolean(behaviorMetrics.hasFace || pulseMetrics.hasFace)
             if (hasFace) {
                 noFaceSinceRef.current = null
             } else if (noFaceSinceRef.current === null) {
@@ -1844,32 +1897,109 @@ export default function InterviewPage() {
             }
 
             const noFaceLong = !hasFace && noFaceSinceRef.current !== null && now - noFaceSinceRef.current >= 3000
-            const offScreen = hasFace ? 0 : 1
-            const faceCount = hasFace ? 1 : 0
+            const faceCount = hasFace ? Math.max(1, Math.floor(toFiniteNumber(behaviorMetrics.faceCount, 1))) : 0
+
+            const headPose = behaviorMetrics.headPose
+            const absYaw = Math.abs(toFiniteNumber(headPose?.yaw, 0))
+            const absPitch = Math.abs(toFiniteNumber(headPose?.pitch, 0))
+            const absRoll = Math.abs(toFiniteNumber(headPose?.roll, 0))
+            const gazeMagnitude = clamp(toFiniteNumber(behaviorMetrics.irisTracking.gaze_offset_magnitude, 0), 0, 1)
+            const driftCount = Math.max(0, Math.floor(toFiniteNumber(behaviorMetrics.irisTracking.drift_count, 0)))
+            const blinkRate = Math.max(0, toFiniteNumber(behaviorMetrics.blendshapes.blink_rate_per_min, 0))
+            const jawOpenAvg = clamp(toFiniteNumber(behaviorMetrics.blendshapes.jaw_open_avg, 0), 0, 1)
+            const faceDistanceZ = roundMetric(behaviorMetrics.landmarks3d.face_distance_z, 6, null)
+            const microMovementVariance = roundMetric(behaviorMetrics.landmarks3d.micro_movement_variance, 6, null)
+            const mouthOpenRatio = roundMetric(behaviorMetrics.landmarks3d.mouth_open_ratio, 4, null)
+            const offScreen = hasFace ? clamp(gazeMagnitude * 130, 0, 100) : 100
+
+            const hasLandmarks = toFiniteNumber(behaviorMetrics.landmarks3d.landmark_count, 0) >= 468
+            const poseUnstable = absYaw >= 28 || absPitch >= 20 || absRoll >= 20
+            const gazeDriftHigh = driftCount >= 8 || offScreen >= 35
+            const blinkHigh = blinkRate >= 45
+            const distanceTooClose = faceDistanceZ !== null && faceDistanceZ < -0.12
+            const distanceTooFar = faceDistanceZ !== null && faceDistanceZ > -0.02
 
             let riskScore = 18
             if (!hasFace) {
                 riskScore = noFaceLong ? 88 : 58
-            } else if (rppgMetrics.status === 'unstable') {
-                riskScore = 46
-            } else if (rppgMetrics.status === 'error') {
-                riskScore = 66
-            } else if (!rppgMetrics.isReliable) {
-                riskScore = 28
-            } else if (rppgMetrics.hr !== null && (rppgMetrics.hr < 48 || rppgMetrics.hr > 125)) {
-                riskScore = 52
+            } else {
+                if (poseUnstable) riskScore = Math.max(riskScore, 54)
+                if (gazeDriftHigh) riskScore = Math.max(riskScore, 62)
+                if (blinkHigh) riskScore = Math.max(riskScore, 50)
+                if (distanceTooClose || distanceTooFar) riskScore = Math.max(riskScore, 47)
+                if (faceCount > 1) riskScore = Math.max(riskScore, 85)
+                if (!hasLandmarks) riskScore = Math.max(riskScore, 40)
+
+                if (pulseMetrics.status === 'unstable') {
+                    riskScore = Math.max(riskScore, 46)
+                } else if (pulseMetrics.status === 'error') {
+                    riskScore = Math.max(riskScore, 66)
+                } else if (!pulseMetrics.isReliable) {
+                    riskScore = Math.max(riskScore, 28)
+                } else if (pulseMetrics.hr !== null && (pulseMetrics.hr < 48 || pulseMetrics.hr > 125)) {
+                    riskScore = Math.max(riskScore, 52)
+                }
             }
+            riskScore = clamp(riskScore, 0, 100)
 
             const nextRiskLevel = riskScore >= 75 ? 'HIGH' : riskScore >= 40 ? 'MEDIUM' : 'LOW'
-            const nextGazeStatus = hasFace ? 'Normal' : 'Face Missing'
-            const nextMouthStatus = speechActiveRef.current ? 'Speaking' : 'Closed'
+            const nextGazeStatus = !hasFace ? 'Face Missing' : offScreen >= 35 ? 'Drifting' : 'Normal'
+            const nextMouthStatus = speechActiveRef.current ? 'Speaking' : jawOpenAvg >= 0.14 ? 'Open' : 'Closed'
             const flags = [
                 ...(noFaceLong ? ['no_face_long'] : []),
                 ...(!hasFace ? ['face_missing'] : []),
-                ...(rppgMetrics.status === 'error' ? ['sensor_error'] : []),
-                ...(rppgMetrics.status === 'unstable' ? ['signal_unstable'] : []),
+                ...(faceCount > 1 ? ['multi_person'] : []),
+                ...(poseUnstable ? ['pose_unstable'] : []),
+                ...(gazeDriftHigh ? ['gaze_drift_high'] : []),
+                ...(blinkHigh ? ['blink_rate_high'] : []),
+                ...(distanceTooClose ? ['too_close_to_camera'] : []),
+                ...(distanceTooFar ? ['too_far_from_camera'] : []),
+                ...(!hasLandmarks ? ['landmark_low_confidence'] : []),
+                ...(pulseMetrics.status === 'error' ? ['sensor_error'] : []),
+                ...(pulseMetrics.status === 'unstable' ? ['signal_unstable'] : []),
                 ...(nextRiskLevel === 'HIGH' ? ['high_risk'] : [])
             ]
+
+            const speechExpressiveness = roundMetric(
+                speechActiveRef.current ? jawOpenAvg * 100 : jawOpenAvg * 65,
+                2,
+                null,
+            )
+
+            const cameraInsights = {
+                schema_version: 'face_insights_v1',
+                landmarks_3d: {
+                    landmark_count: Math.floor(toFiniteNumber(behaviorMetrics.landmarks3d.landmark_count, 0)),
+                    mouth_open_ratio: mouthOpenRatio,
+                    micro_movement_variance: microMovementVariance,
+                    face_distance_z: faceDistanceZ,
+                },
+                blendshapes: {
+                    available_count: Math.floor(toFiniteNumber(behaviorMetrics.blendshapes.available_count, 0)),
+                    key_current: behaviorMetrics.blendshapes.key_current || {},
+                    averages: behaviorMetrics.blendshapes.averages || {},
+                    blink_rate_per_min: roundMetric(behaviorMetrics.blendshapes.blink_rate_per_min, 2, null),
+                    brow_inner_up_avg: roundMetric(behaviorMetrics.blendshapes.brow_inner_up_avg, 4, null),
+                    smile_avg: roundMetric(behaviorMetrics.blendshapes.smile_avg, 4, null),
+                    jaw_open_avg: roundMetric(behaviorMetrics.blendshapes.jaw_open_avg, 4, null),
+                    speech_expressiveness: speechExpressiveness,
+                },
+                head_pose: headPose
+                    ? {
+                        pitch: roundMetric(headPose.pitch, 2, 0),
+                        yaw: roundMetric(headPose.yaw, 2, 0),
+                        roll: roundMetric(headPose.roll, 2, 0),
+                    }
+                    : null,
+                iris_tracking: {
+                    gaze_offset_x: roundMetric(behaviorMetrics.irisTracking.gaze_offset_x, 4, null),
+                    gaze_offset_y: roundMetric(behaviorMetrics.irisTracking.gaze_offset_y, 4, null),
+                    gaze_offset_magnitude: roundMetric(behaviorMetrics.irisTracking.gaze_offset_magnitude, 4, null),
+                    gaze_focus_score: roundMetric(behaviorMetrics.irisTracking.gaze_focus_score, 2, null),
+                    drift_count: Math.floor(toFiniteNumber(behaviorMetrics.irisTracking.drift_count, 0)),
+                },
+                sample_count: Math.floor(toFiniteNumber(behaviorMetrics.sampleCount, 0)),
+            }
 
             socket.emit('detection_state', {
                 session_id: sessionIdRef.current,
@@ -1877,12 +2007,20 @@ export default function InterviewPage() {
                 has_face: hasFace,
                 face_count: faceCount,
                 off_screen_ratio: offScreen,
-                rppg_reliable: rppgMetrics.isReliable,
-                hr: rppgMetrics.hr,
+                rppg_reliable: pulseMetrics.isReliable,
+                hr: pulseMetrics.hr,
                 risk_level: nextRiskLevel,
                 risk_score: riskScore,
                 gaze_status: nextGazeStatus,
                 mouth_status: nextMouthStatus,
+                landmark_count: cameraInsights.landmarks_3d.landmark_count,
+                blendshape_count: cameraInsights.blendshapes.available_count,
+                gaze_drift_count: cameraInsights.iris_tracking.drift_count,
+                pitch: cameraInsights.head_pose?.pitch,
+                yaw: cameraInsights.head_pose?.yaw,
+                roll: cameraInsights.head_pose?.roll,
+                speech_expressiveness: cameraInsights.blendshapes.speech_expressiveness,
+                camera_insights: cameraInsights,
                 flags
             })
         }
@@ -1894,11 +2032,7 @@ export default function InterviewPage() {
     }, [
         cameraReady,
         socket,
-        interviewStarted,
-        rppgMetrics.hasFace,
-        rppgMetrics.hr,
-        rppgMetrics.isReliable,
-        rppgMetrics.status
+        interviewStarted
     ])
 
     const difficultyText = interviewConfig.difficulty === 'easy'

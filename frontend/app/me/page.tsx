@@ -2,8 +2,9 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Upload, FileText, Save, Trash2, RefreshCw, CheckCircle, AlertCircle, Loader2 } from 'lucide-react'
+import { getBackendBaseUrl } from '@/lib/backend'
 
-const BACKEND_API_BASE = (process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000').replace(/\/$/, '')
+const BACKEND_API_BASE = getBackendBaseUrl()
 
 type ProfileForm = {
     nickname: string

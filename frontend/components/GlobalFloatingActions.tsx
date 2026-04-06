@@ -3,21 +3,24 @@
 import { usePathname } from 'next/navigation'
 import MyEntry from './MyEntry'
 import ThemeToggle from './ThemeToggle'
+import AssistantFloatingChat from './AssistantFloatingChat'
 
 export default function GlobalFloatingActions() {
     const pathname = usePathname()
 
-    // 这些页面有自己的顶部操作区，避免右上角浮层遮挡。
-    const shouldHide = pathname === '/' || pathname?.startsWith('/interview') || pathname?.startsWith('/liveness')
+    const isInterviewScene = pathname?.startsWith('/interview') || pathname?.startsWith('/liveness')
+    // 登录页只隐藏顶部按钮，保留助理入口。
+    const hideTopActions = pathname === '/'
 
-    if (shouldHide) {
+    if (isInterviewScene) {
         return null
     }
 
     return (
         <>
-            <MyEntry />
-            <ThemeToggle />
+            <AssistantFloatingChat />
+            {!hideTopActions ? <MyEntry /> : null}
+            {!hideTopActions ? <ThemeToggle /> : null}
         </>
     )
 }

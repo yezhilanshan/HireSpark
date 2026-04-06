@@ -454,10 +454,10 @@ class LLMManager:
         speech_context: Optional[Dict] = None
     ) -> Dict:
         """
-        ??????????????rubric?????????????????? JSON?
+        基于 rubric 输出结构化评分结果与维度级证据链。
         """
         if not self.check_enabled():
-            return {"error": "LLM_NOT_READY", "message": "LLM ?????"}
+            return {"error": "LLM_NOT_READY", "message": "LLM 未启用"}
 
         round_dimensions = {
             "technical": ["technical_accuracy", "knowledge_depth", "completeness", "logic", "job_match"],
@@ -472,7 +472,18 @@ class LLMManager:
         speech_text = json.dumps(speech_context or {}, ensure_ascii=False, indent=2)
 
         dim_schema = ", ".join(
-            f'"{name}": {{"score": 0-100, "reason": "..."}}'
+            (
+                f'"{name}": {{'
+                '"score": 0-100, '
+                '"reason": "...", '
+                '"evidence": {'
+                '"hit_rubric_points": ["..."], '
+                '"missed_rubric_points": ["..."], '
+                '"source_quotes": ["..."], '
+                '"deduction_rationale": "..."'
+                '}'
+                '}}'
+            )
             for name in dimensions
         )
 
@@ -480,9 +491,10 @@ class LLMManager:
             "You are an interview grading assistant. "
             "Return valid JSON only. "
             "Your dimension scores must be text-semantic base scores derived from the answer content, rubric, and layer1 evidence. "
+            "For every dimension, you must also return structured evidence. "
             "Do not apply speech weighting inside dimension scores or overall_score. "
             "If speech_context is present, you may reference it only in reasons and summary wording. "
-            "Keep scores calibrated to 0-100 and ensure reasons are concise."
+            "Keep scores calibrated to 0-100 and ensure reasons are concise, evidence is concrete, and quotes come from the candidate answer."
         )
         user_prompt = (
             f"prompt_version: {prompt_version}\n"
@@ -497,7 +509,9 @@ class LLMManager:
             "1. `dimension_scores` must be text-base scores only.\n"
             "2. `overall_score` should be the mean of the text-base dimension scores.\n"
             "3. `rubric_eval` should reflect rubric alignment.\n"
-            "4. `summary` can mention speaking strengths/weaknesses only if supported by speech_context.\n\n"
+            "4. `summary` can mention speaking strengths/weaknesses only if supported by speech_context.\n"
+            "5. Every dimension must include `evidence.hit_rubric_points`, `evidence.missed_rubric_points`, `evidence.source_quotes`, and `evidence.deduction_rationale`.\n"
+            "6. `source_quotes` must quote the candidate answer verbatim when possible; use short excerpts only.\n\n"
             "Return JSON with this schema:\n"
             "{\n"
             '  "rubric_eval": {\n'
@@ -542,7 +556,7 @@ class LLMManager:
             import re
             json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
             if not json_match:
-                return {"error": "INVALID_JSON", "message": "????? JSON", "raw_text": raw_text}
+                return {"error": "INVALID_JSON", "message": "未找到有效 JSON", "raw_text": raw_text}
 
             parsed = json.loads(json_match.group())
             rubric_eval = parsed.get("rubric_eval", {}) or {}
@@ -567,12 +581,22 @@ class LLMManager:
                 normalized_rubric_eval["final_level"] = "basic"
 
             normalized_dimensions = {}
+            normalized_dimension_evidence = {}
             for dim in dimensions:
                 dim_payload = dimension_scores.get(dim, {}) or {}
+                evidence = dim_payload.get("evidence") if isinstance(dim_payload.get("evidence"), dict) else {}
+                reason = str(dim_payload.get("reason", "")).strip()
                 normalized_dimensions[dim] = {
                     "score": _clamp_100(dim_payload.get("score", 0)),
-                    "reason": str(dim_payload.get("reason", "")).strip(),
+                    "reason": reason,
+                    "evidence": {
+                        "hit_rubric_points": [str(x).strip() for x in (evidence.get("hit_rubric_points") or []) if str(x).strip()][:5],
+                        "missed_rubric_points": [str(x).strip() for x in (evidence.get("missed_rubric_points") or []) if str(x).strip()][:5],
+                        "source_quotes": [str(x).strip() for x in (evidence.get("source_quotes") or []) if str(x).strip()][:3],
+                        "deduction_rationale": str(evidence.get("deduction_rationale") or reason).strip(),
+                    },
                 }
+                normalized_dimension_evidence[dim] = normalized_dimensions[dim]["evidence"]
 
             overall_score = parsed.get("overall_score")
             if overall_score is None:
@@ -582,6 +606,7 @@ class LLMManager:
             normalized = {
                 "rubric_eval": normalized_rubric_eval,
                 "dimension_scores": normalized_dimensions,
+                "dimension_evidence": normalized_dimension_evidence,
                 "overall_score": _clamp_100(overall_score),
                 "summary": {
                     "strengths": [str(x) for x in (summary.get("strengths", []) or [])][:5],
@@ -591,7 +616,7 @@ class LLMManager:
             }
             return normalized
         except Exception as e:
-            logger.error(f"??? rubric ????: {str(e)}")
+            logger.error(f"rubric 评分失败: {str(e)}")
             return {"error": "EVALUATION_EXCEPTION", "message": str(e)}
 
     def set_interview_round(self, round_type: str, resume_data: Optional[Dict] = None):

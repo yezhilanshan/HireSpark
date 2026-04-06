@@ -7,8 +7,9 @@ import { motion, type Variants } from 'motion/react'
 import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { getBackendBaseUrl } from '@/lib/backend'
 
-const BACKEND_API_BASE = (process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000').replace(/\/$/, '')
+const BACKEND_API_BASE = getBackendBaseUrl()
 
 type GrowthDimension = {
     key: string

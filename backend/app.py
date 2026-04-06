@@ -51,6 +51,12 @@ try:
 except Exception as e:
     EvaluationService = None
     evaluation_import_error = str(e)
+try:
+    from utils.assistant_service import assistant_service
+    assistant_import_error = None
+except Exception as e:
+    assistant_service = None
+    assistant_import_error = str(e)
 from utils.logger import get_logger
 from utils.performance_monitor import performance_monitor, measure_time
 from utils.answer_session import (
@@ -151,7 +157,10 @@ def _parse_cors_origins():
         origins.append(value.rstrip('/'))
 
     if FLASK_DEBUG:
-        frontend_url = os.environ.get('NEXT_PUBLIC_BACKEND_URL', '').strip()
+        frontend_url = (
+            os.environ.get('NEXT_PUBLIC_BACKEND_URL', '').strip()
+            or os.environ.get('NEXT_PUBLIC_API_URL', '').strip()
+        )
         if frontend_url:
             try:
                 parsed = urlparse(frontend_url)
@@ -195,10 +204,28 @@ elif getattr(rag_service, 'enabled', False):
 else:
     logger.info("RAG 模块未启用或未配置")
 
+if assistant_service is None:
+    logger.error(f"Assistant 初始化失败，相关功能不可用：{assistant_import_error}")
+elif getattr(assistant_service, 'enabled', False):
+    logger.info("Assistant 模块初始化成功")
+else:
+    logger.info("Assistant 模块未启用")
+
 # 初始化工具类
 logger.info("初始化工具模块...")
 data_manager = DataManager()
-report_generator = ReportGenerator()
+
+if callable(ReportGenerator):
+    report_generator = ReportGenerator()
+else:
+    logger.error("ReportGenerator 不可用，已降级为 no-op（仅影响报告文件导出）")
+
+    class _NoopReportGenerator:
+        def generate_report(self, report_data):
+            return ""
+
+    report_generator = _NoopReportGenerator()
+
 db_manager = DatabaseManager()
 session_registry = SessionRegistry()
 state_orchestrator = StateOrchestrator(session_registry)
@@ -1553,8 +1580,19 @@ def _derive_detection_events_and_stats(report_data: dict) -> tuple[list[dict], d
         score = int(max(0.0, min(100.0, risk_score * 100.0 if risk_score <= 1.0 else risk_score)))
         has_face = bool(item.get('has_face', True))
         face_count = int(item.get('face_count', 1) or 1)
-        off_screen_ratio = float(item.get('off_screen_ratio') or 0.0)
+        raw_off_screen_ratio = float(item.get('off_screen_ratio') or 0.0)
+        off_screen_ratio = raw_off_screen_ratio * 100.0 if raw_off_screen_ratio <= 1.0 else raw_off_screen_ratio
         flags = [str(flag).strip().lower() for flag in (item.get('flags') or []) if str(flag).strip()]
+        camera_insights = item.get('camera_insights') if isinstance(item.get('camera_insights'), dict) else {}
+        blendshapes = camera_insights.get('blendshapes') if isinstance(camera_insights.get('blendshapes'), dict) else {}
+        head_pose = camera_insights.get('head_pose') if isinstance(camera_insights.get('head_pose'), dict) else {}
+
+        jaw_open_avg = float(blendshapes.get('jaw_open_avg') or 0.0)
+        mouth_status = str(item.get('mouth_status') or '').strip().lower()
+        abs_pitch = abs(float(head_pose.get('pitch') or item.get('pitch') or 0.0))
+        abs_yaw = abs(float(head_pose.get('yaw') or item.get('yaw') or 0.0))
+        abs_roll = abs(float(head_pose.get('roll') or item.get('roll') or 0.0))
+        pose_unstable = abs_yaw >= 28.0 or abs_pitch >= 20.0 or abs_roll >= 20.0 or ('pose_unstable' in flags)
         offscreen_values.append(off_screen_ratio)
 
         if face_count > 1 or 'multi_person' in flags:
@@ -1569,6 +1607,30 @@ def _derive_detection_events_and_stats(report_data: dict) -> tuple[list[dict], d
                 'off_screen_ratio': off_screen_ratio,
             })
 
+        if (jaw_open_avg >= 0.2 and mouth_status == 'open') or ('mouth_open' in flags):
+            total_mouth_open += 1
+            events.append({
+                'type': 'mouth_open',
+                'timestamp': timestamp,
+                'score': score,
+                'description': '检测到明显口型张开行为',
+                'jaw_open_avg': jaw_open_avg,
+                'mouth_status': mouth_status,
+                'flags': flags,
+            })
+
+        if pose_unstable:
+            events.append({
+                'type': 'posture_shift',
+                'timestamp': timestamp,
+                'score': score,
+                'description': '头部姿态偏移较大，存在频繁转头/低头迹象',
+                'pitch': abs_pitch,
+                'yaw': abs_yaw,
+                'roll': abs_roll,
+                'flags': flags,
+            })
+
         if (not has_face) or off_screen_ratio >= 30.0 or ('no_face_long' in flags):
             total_deviations += 1
             events.append({
@@ -1580,6 +1642,7 @@ def _derive_detection_events_and_stats(report_data: dict) -> tuple[list[dict], d
                 'face_count': face_count,
                 'flags': flags,
                 'off_screen_ratio': off_screen_ratio,
+                'gaze_drift_count': int(item.get('gaze_drift_count') or 0),
             })
 
     avg_off_screen_ratio = (sum(offscreen_values) / len(offscreen_values)) if offscreen_values else 0.0
@@ -1824,6 +1887,14 @@ def _start_runtime_tts(runtime, spoken_text: str, turn_id: str, source: str = 'r
             if current and current.session_id == runtime.session_id:
                 if state_orchestrator.finish_speaking(current, tts_job_id):
                     _log_runtime_event(current, 'tts_finish', job_id=tts_job_id, source=source)
+                    socketio.emit('tts_done', {
+                        'session_id': current.session_id,
+                        'turn_id': turn_id,
+                        'job_id': tts_job_id,
+                        'interrupt_epoch': interrupt_epoch,
+                        'source': source,
+                        'timestamp': time.time(),
+                    }, to=current.client_id)
                     _emit_orchestrator_state(current)
                     _maybe_emit_session_notice(current)
 
@@ -2361,8 +2432,19 @@ if config.get('performance.enable_monitoring', True):
 # 初始化速率限制器
 answer_rate_limiter = RateLimiter(max_calls=5, time_window=1.0)    # 回答提交：5 次/秒
 interview_rate_limiter = RateLimiter(max_calls=2, time_window=10.0) # 面试操作：2 次/10 秒
+assistant_rate_limiter = RateLimiter(max_calls=20, time_window=60.0) # 助手问答：20 次/60 秒
 
 logger.info("速率限制器初始化完成")
+
+
+def _assistant_client_key() -> str:
+    forwarded_for = str(request.headers.get('X-Forwarded-For', '') or '').split(',')[0].strip()
+    if forwarded_for:
+        return forwarded_for
+    remote_addr = str(getattr(request, 'remote_addr', '') or '').strip()
+    if remote_addr:
+        return remote_addr
+    return 'assistant_unknown_client'
 
 
 # ==================== 基础路由 ====================
@@ -2396,6 +2478,7 @@ def health():
             'llm': bool(llm_manager and getattr(llm_manager, 'enabled', False)),
             'rag': bool(rag_service),
             'asr': bool(asr_manager and getattr(asr_manager, 'enabled', False)),
+            'assistant': bool(assistant_service and getattr(assistant_service, 'enabled', False)),
             'tts': tts_manager.get_status() if tts_manager else {
                 'enabled': False,
                 'error': tts_import_error or 'tts manager unavailable'
@@ -2454,6 +2537,169 @@ def api_prewarm():
         'success': True,
         'data': _snapshot_service_prewarm_state(),
     })
+
+
+@app.route('/api/assistant/health')
+def api_assistant_health():
+    """检查全局助手可用状态。"""
+    if assistant_service is None:
+        return jsonify({
+            'success': False,
+            'error': 'assistant service unavailable',
+            'details': assistant_import_error or '',
+        }), 503
+
+    status_payload = assistant_service.health()
+    success = bool(status_payload.get('success'))
+    return jsonify({
+        'success': success,
+        'data': status_payload,
+    }), (200 if success else 503)
+
+
+@app.route('/api/assistant/chat', methods=['POST'])
+def api_assistant_chat():
+    """全局助手对话（仅非面试场景调用）。"""
+    if assistant_service is None:
+        return jsonify({
+            'success': False,
+            'error': 'assistant service unavailable',
+            'details': assistant_import_error or '',
+        }), 503
+
+    if not bool(getattr(assistant_service, 'enabled', False)):
+        return jsonify({
+            'success': False,
+            'error': 'assistant disabled',
+        }), 503
+
+    client_key = _assistant_client_key()
+    if not assistant_rate_limiter.is_allowed(client_key):
+        return jsonify({
+            'success': False,
+            'error': 'rate limit exceeded',
+            'retry_after_seconds': int(assistant_rate_limiter.time_window),
+        }), 429
+
+    payload = request.get_json(silent=True) or {}
+    raw_message = str(payload.get('message', '') or '')
+    raw_messages = payload.get('messages', [])
+    raw_system_prompt = str(payload.get('system_prompt', '') or '')
+    raw_temperature = payload.get('temperature', 0.3)
+    raw_max_tokens = payload.get(
+        'max_tokens',
+        int(getattr(assistant_service, 'default_max_tokens', 320) or 320),
+    )
+
+    try:
+        message = validate_string(
+            raw_message,
+            'message',
+            min_length=1,
+            max_length=4000,
+            allow_empty=False,
+        ).strip()
+
+        system_prompt = ''
+        if raw_system_prompt.strip():
+            system_prompt = validate_string(
+                raw_system_prompt,
+                'system_prompt',
+                min_length=0,
+                max_length=4000,
+                allow_empty=True,
+            ).strip()
+
+        if not isinstance(raw_messages, list):
+            raise ValidationError('messages 必须是数组')
+
+        messages = []
+        for item in raw_messages[-20:]:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get('role', '') or '').strip().lower()
+            content = str(item.get('content', '') or '').strip()
+            if role not in {'user', 'assistant', 'system'}:
+                continue
+            if not content:
+                continue
+            messages.append({
+                'role': role,
+                'content': content[:4000],
+            })
+
+        try:
+            temperature = float(raw_temperature)
+        except Exception:
+            temperature = 0.3
+        temperature = max(0.0, min(1.2, temperature))
+
+        try:
+            max_tokens = int(raw_max_tokens)
+        except Exception:
+            max_tokens = 640
+        max_tokens = max(64, min(2048, max_tokens))
+
+        result = assistant_service.chat(
+            user_message=message,
+            messages=messages,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        if not result.get('success'):
+            error_code = str(result.get('error', 'assistant error') or 'assistant error')
+            error_message = str(result.get('message', '') or '')
+            status_code = 502
+            lowered_message = error_message.lower()
+            if error_code == 'ASSISTANT_EXCEPTION' and ('timed out' in lowered_message or 'timeout' in lowered_message):
+                status_code = 504
+            elif error_code == 'ASSISTANT_NOT_READY':
+                status_code = 503
+            elif error_code.startswith('OLLAMA_HTTP_') or error_code.startswith('OPENROUTER_HTTP_'):
+                try:
+                    upstream = int(error_code.split('_')[-1].strip())
+                    if upstream in {401, 403, 429}:
+                        status_code = upstream
+                    elif 400 <= upstream < 600:
+                        status_code = 502
+                except Exception:
+                    status_code = 502
+
+            logger.warning(
+                f"[assistant] chat failed: code={error_code}, status={status_code}, message={error_message[:200]}"
+            )
+            return jsonify({
+                'success': False,
+                'error': error_code,
+                'message': error_message,
+                'latency_ms': result.get('latency_ms', 0.0),
+            }), status_code
+
+        return jsonify({
+            'success': True,
+            'reply': result.get('reply', ''),
+            'provider': result.get('provider', ''),
+            'model': result.get('model', ''),
+            'latency_ms': result.get('latency_ms', 0.0),
+            'done_reason': result.get('done_reason', ''),
+            'usage': {
+                'prompt_eval_count': int(result.get('prompt_eval_count') or 0),
+                'eval_count': int(result.get('eval_count') or 0),
+            },
+        })
+    except ValidationError as exc:
+        return jsonify({
+            'success': False,
+            'error': str(exc),
+        }), 400
+    except Exception as exc:
+        logger.error(f"assistant chat error: {exc}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': 'internal server error',
+            'details': str(exc),
+        }), 500
 
 
 @app.route('/api/performance')
@@ -3109,15 +3355,27 @@ def handle_detection_state(data=None):
     )
     notice_text = state_orchestrator.update_detection_state(runtime, payload)
     if runtime.data_manager:
+        camera_insights = payload.get('camera_insights') if isinstance(payload.get('camera_insights'), dict) else {}
         runtime.data_manager.add_frame_data({
             'type': 'detection_state',
             'probability': float(payload.get('risk_score', 0) or 0),
+            'risk_score': float(payload.get('risk_score', 0) or 0),
             'risk_level': payload.get('risk_level', 'LOW'),
             'has_face': payload.get('has_face', True),
             'face_count': payload.get('face_count', 1),
             'off_screen_ratio': payload.get('off_screen_ratio', 0),
             'flags': payload.get('flags', []),
-            'timestamp': time.time()
+            # 兼容前端毫秒时间戳，缺失时回退服务端时间（秒）。
+            'timestamp': payload.get('ts') or time.time(),
+            # 关键镜头指标：用于报告端聚合 3D 关键点/表情系数/头姿/虹膜追踪。
+            'camera_insights': camera_insights,
+            'landmark_count': payload.get('landmark_count', 0),
+            'blendshape_count': payload.get('blendshape_count', 0),
+            'gaze_drift_count': payload.get('gaze_drift_count', 0),
+            'pitch': payload.get('pitch', 0),
+            'yaw': payload.get('yaw', 0),
+            'roll': payload.get('roll', 0),
+            'speech_expressiveness': payload.get('speech_expressiveness', 0),
         })
 
     _emit_orchestrator_state(runtime)
@@ -3268,7 +3526,7 @@ def _decode_evaluation_rows(raw_rows):
     decoded = []
     for row in raw_rows or []:
         item = dict(row)
-        for key in ('layer1_json', 'layer2_json', 'text_layer_json', 'speech_layer_json', 'video_layer_json', 'fusion_json'):
+        for key in ('layer1_json', 'layer2_json', 'text_layer_json', 'speech_layer_json', 'video_layer_json', 'fusion_json', 'scoring_snapshot_json'):
             raw_value = item.get(key)
             if not raw_value:
                 item[key.replace('_json', '')] = {}
@@ -3279,6 +3537,61 @@ def _decode_evaluation_rows(raw_rows):
                 item[key.replace('_json', '')] = {}
         decoded.append(item)
     return decoded
+
+
+def _filter_evaluation_rows_by_dialogues(decoded_rows, dialogues):
+    """按当前会话 turn_id 过滤评估记录；若完全不匹配则回退到原始记录。"""
+    rows = list(decoded_rows or [])
+    if not rows:
+        return rows
+
+    valid_turn_ids = {
+        str(item.get('turn_id') or '').strip()
+        for item in (dialogues or [])
+        if str(item.get('turn_id') or '').strip()
+    }
+    if not valid_turn_ids:
+        return rows
+
+    matched_rows = [
+        row for row in rows
+        if str(row.get('turn_id') or '').strip() in valid_turn_ids
+    ]
+    # 兼容历史数据：例如 backfill 生成 legacy_dialogue_xxx，不与 turn_id 对齐。
+    return matched_rows if matched_rows else rows
+
+
+def _decode_evaluation_traces(raw_rows):
+    decoded = []
+    for row in raw_rows or []:
+        item = dict(row)
+        raw_payload = item.get('payload_json')
+        if raw_payload:
+            try:
+                item['payload'] = json.loads(raw_payload)
+            except Exception:
+                item['payload'] = {}
+        else:
+            item['payload'] = {}
+        decoded.append(item)
+    return decoded
+
+
+def _normalize_turn_scorecard(scorecard):
+    payload = dict(scorecard or {})
+
+    evaluation = payload.get('evaluation')
+    if evaluation:
+        decoded = _decode_evaluation_rows([evaluation])
+        payload['evaluation'] = decoded[0] if decoded else dict(evaluation)
+
+    speech = payload.get('speech_evaluation')
+    if speech:
+        decoded = _decode_speech_rows([speech])
+        payload['speech_evaluation'] = decoded[0] if decoded else dict(speech)
+
+    payload['traces'] = _decode_evaluation_traces(payload.get('traces') or [])
+    return payload
 
 
 def _score_to_level(score: float) -> str:
@@ -3295,6 +3608,15 @@ def _score_to_level(score: float) -> str:
 def _safe_avg(values):
     valid = [float(v) for v in values if isinstance(v, (int, float))]
     return (sum(valid) / len(valid)) if valid else 0.0
+
+
+def _safe_float(value, default=0.0):
+    try:
+        if value is None:
+            return float(default)
+        return float(value)
+    except Exception:
+        return float(default)
 
 
 def _dimension_label_map():
@@ -3394,6 +3716,270 @@ def _normalize_event_offset_seconds(timestamp_value, started_at):
     return raw_seconds
 
 
+def _load_detection_timeline_from_report(report_file_path: Path):
+    if not report_file_path or not report_file_path.exists():
+        return []
+    try:
+        with open(report_file_path, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+    except Exception as exc:
+        logger.warning(f'读取报告时间轴失败: {report_file_path} | {exc}')
+        return []
+
+    timeline = payload.get('timeline') if isinstance(payload, dict) else []
+    if not isinstance(timeline, list):
+        return []
+
+    return [
+        item for item in timeline
+        if isinstance(item, dict) and str(item.get('type') or '').strip() == 'detection_state'
+    ]
+
+
+def _build_camera_insights_snapshot_from_timeline(timeline):
+    rows = [item for item in (timeline or []) if isinstance(item, dict)]
+    if not rows:
+        return {
+            'sample_count': 0,
+            'landmarks_3d': {},
+            'blendshapes': {},
+            'head_pose': {},
+            'iris_tracking': {},
+        }
+
+    landmark_counts = []
+    mouth_open_ratios = []
+    micro_variances = []
+    face_distance_z = []
+
+    blink_rates = []
+    brow_inner_up = []
+    smile_avg = []
+    jaw_open_avg = []
+    speech_expressiveness = []
+    blendshape_count_values = []
+    blendshape_averages_acc = {}
+
+    abs_pitch_values = []
+    abs_yaw_values = []
+    abs_roll_values = []
+    high_pose_frames = 0
+
+    gaze_offsets = []
+    gaze_focus_scores = []
+    max_gaze_drift_count = 0
+    last_gaze_drift = 0
+    drift_jumps = 0
+
+    gaze_focus_trend_full = []
+    first_ts_sec = None
+    low_focus_frames = 0
+    min_focus_score = 100.0
+
+    close_frames = 0
+    far_frames = 0
+
+    for item in rows:
+        camera_insights = item.get('camera_insights') if isinstance(item.get('camera_insights'), dict) else {}
+        landmarks = camera_insights.get('landmarks_3d') if isinstance(camera_insights.get('landmarks_3d'), dict) else {}
+        blendshapes = camera_insights.get('blendshapes') if isinstance(camera_insights.get('blendshapes'), dict) else {}
+        head_pose = camera_insights.get('head_pose') if isinstance(camera_insights.get('head_pose'), dict) else {}
+        iris = camera_insights.get('iris_tracking') if isinstance(camera_insights.get('iris_tracking'), dict) else {}
+
+        landmark_count = int(_safe_float(landmarks.get('landmark_count'), _safe_float(item.get('landmark_count'), 0)))
+        if landmark_count > 0:
+            landmark_counts.append(landmark_count)
+
+        mouth_ratio = landmarks.get('mouth_open_ratio')
+        if not isinstance(mouth_ratio, (int, float)):
+            mouth_ratio = item.get('mouth_open_ratio')
+        if isinstance(mouth_ratio, (int, float)):
+            mouth_open_ratios.append(float(mouth_ratio))
+
+        micro_var = landmarks.get('micro_movement_variance')
+        if not isinstance(micro_var, (int, float)):
+            micro_var = item.get('micro_movement_variance')
+        if isinstance(micro_var, (int, float)):
+            micro_variances.append(float(micro_var))
+
+        z_value = landmarks.get('face_distance_z')
+        if not isinstance(z_value, (int, float)):
+            z_value = item.get('face_distance_z')
+        if isinstance(z_value, (int, float)):
+            z = float(z_value)
+            face_distance_z.append(z)
+            if z < -0.12:
+                close_frames += 1
+            elif z > -0.02:
+                far_frames += 1
+
+        blend_count = int(_safe_float(blendshapes.get('available_count'), _safe_float(item.get('blendshape_count'), 0)))
+        if blend_count > 0:
+            blendshape_count_values.append(blend_count)
+
+        blink_rate = blendshapes.get('blink_rate_per_min')
+        if not isinstance(blink_rate, (int, float)):
+            blink_rate = item.get('blink_rate_per_min')
+        if isinstance(blink_rate, (int, float)):
+            blink_rates.append(float(blink_rate))
+
+        brow_value = blendshapes.get('brow_inner_up_avg')
+        if not isinstance(brow_value, (int, float)):
+            brow_value = item.get('brow_inner_up_avg')
+        if isinstance(brow_value, (int, float)):
+            brow_inner_up.append(float(brow_value))
+
+        smile_value = blendshapes.get('smile_avg')
+        if not isinstance(smile_value, (int, float)):
+            smile_value = item.get('smile_avg')
+        if isinstance(smile_value, (int, float)):
+            smile_avg.append(float(smile_value))
+
+        jaw_value = blendshapes.get('jaw_open_avg')
+        if not isinstance(jaw_value, (int, float)):
+            jaw_value = item.get('jaw_open_avg')
+        if isinstance(jaw_value, (int, float)):
+            jaw_open_avg.append(float(jaw_value))
+
+        speech_value = blendshapes.get('speech_expressiveness')
+        if not isinstance(speech_value, (int, float)):
+            speech_value = item.get('speech_expressiveness')
+        if isinstance(speech_value, (int, float)):
+            speech_expressiveness.append(float(speech_value))
+
+        blend_avg_map = blendshapes.get('averages') if isinstance(blendshapes.get('averages'), dict) else {}
+        if not blend_avg_map:
+            blend_avg_map = blendshapes.get('key_current') if isinstance(blendshapes.get('key_current'), dict) else {}
+        for key, value in blend_avg_map.items():
+            if not isinstance(value, (int, float)):
+                continue
+            blendshape_averages_acc.setdefault(str(key), []).append(float(value))
+
+        pitch = abs(_safe_float(head_pose.get('pitch'), _safe_float(item.get('pitch'), 0.0)))
+        yaw = abs(_safe_float(head_pose.get('yaw'), _safe_float(item.get('yaw'), 0.0)))
+        roll = abs(_safe_float(head_pose.get('roll'), _safe_float(item.get('roll'), 0.0)))
+        if pitch or yaw or roll:
+            abs_pitch_values.append(pitch)
+            abs_yaw_values.append(yaw)
+            abs_roll_values.append(roll)
+            if yaw >= 28 or pitch >= 20 or roll >= 20:
+                high_pose_frames += 1
+
+        gaze_offset_mag = iris.get('gaze_offset_magnitude')
+        if not isinstance(gaze_offset_mag, (int, float)):
+            gaze_offset_mag = item.get('gaze_offset_magnitude')
+        if isinstance(gaze_offset_mag, (int, float)):
+            gaze_offsets.append(float(gaze_offset_mag))
+
+        gaze_focus = iris.get('gaze_focus_score')
+        if not isinstance(gaze_focus, (int, float)):
+            gaze_focus = item.get('gaze_focus_score')
+        if isinstance(gaze_focus, (int, float)):
+            gaze_focus_scores.append(float(gaze_focus))
+
+        raw_off_screen = _safe_float(item.get('off_screen_ratio'), 0.0)
+        off_screen_percent = raw_off_screen * 100.0 if raw_off_screen <= 1.0 else raw_off_screen
+
+        gaze_focus_value = float(gaze_focus) if isinstance(gaze_focus, (int, float)) else max(0.0, 100.0 - off_screen_percent)
+        gaze_focus_value = max(0.0, min(100.0, gaze_focus_value))
+        if gaze_focus_value < 60.0:
+            low_focus_frames += 1
+        min_focus_score = min(min_focus_score, gaze_focus_value)
+
+        raw_ts = _safe_float(item.get('timestamp'), 0.0)
+        if raw_ts > 0:
+            ts_sec = raw_ts / 1000.0 if raw_ts > 1_000_000_000_000 else raw_ts
+            if first_ts_sec is None:
+                first_ts_sec = ts_sec
+            sec_offset = max(0.0, ts_sec - first_ts_sec)
+        else:
+            # detection_state 默认约 250ms 一帧，缺时间戳时按采样序号估算。
+            sec_offset = len(gaze_focus_trend_full) * 0.25
+
+        raw_risk_score = _safe_float(item.get('risk_score'), _safe_float(item.get('probability'), 0.0))
+        risk_percent = raw_risk_score * 100.0 if raw_risk_score <= 1.0 else raw_risk_score
+        risk_percent = max(0.0, min(100.0, risk_percent))
+
+        gaze_focus_trend_full.append({
+            'second': round(sec_offset, 1),
+            'focus_score': round(gaze_focus_value, 2),
+            'off_screen_ratio': round(max(0.0, min(100.0, off_screen_percent)), 2),
+            'risk_score': round(risk_percent, 2),
+        })
+
+        drift_count = int(_safe_float(iris.get('drift_count'), _safe_float(item.get('gaze_drift_count'), 0)))
+        max_gaze_drift_count = max(max_gaze_drift_count, drift_count)
+        if drift_count > last_gaze_drift:
+            drift_jumps += (drift_count - last_gaze_drift)
+        last_gaze_drift = drift_count
+
+    sample_count = len(rows)
+    blendshape_averages = {
+        key: round(_safe_avg(values), 4)
+        for key, values in blendshape_averages_acc.items()
+        if values
+    }
+
+    landmarks_snapshot = {
+        'avg_landmark_count': round(_safe_avg(landmark_counts), 2) if landmark_counts else 0.0,
+        'max_landmark_count': max(landmark_counts) if landmark_counts else 0,
+        'avg_mouth_open_ratio': round(_safe_avg(mouth_open_ratios), 4) if mouth_open_ratios else 0.0,
+        'avg_micro_movement_variance': round(_safe_avg(micro_variances), 6) if micro_variances else 0.0,
+        'avg_face_distance_z': round(_safe_avg(face_distance_z), 6) if face_distance_z else 0.0,
+        'close_ratio': round((close_frames / sample_count) * 100.0, 2) if sample_count else 0.0,
+        'far_ratio': round((far_frames / sample_count) * 100.0, 2) if sample_count else 0.0,
+    }
+
+    blendshape_snapshot = {
+        'tracked_count_max': max(blendshape_count_values) if blendshape_count_values else 0,
+        'avg_blink_rate_per_min': round(_safe_avg(blink_rates), 2) if blink_rates else 0.0,
+        'avg_brow_inner_up': round(_safe_avg(brow_inner_up), 4) if brow_inner_up else 0.0,
+        'avg_smile': round(_safe_avg(smile_avg), 4) if smile_avg else 0.0,
+        'avg_jaw_open': round(_safe_avg(jaw_open_avg), 4) if jaw_open_avg else 0.0,
+        'avg_speech_expressiveness': round(_safe_avg(speech_expressiveness), 2) if speech_expressiveness else 0.0,
+        'blendshape_averages': blendshape_averages,
+    }
+
+    head_pose_snapshot = {
+        'avg_abs_pitch': round(_safe_avg(abs_pitch_values), 2) if abs_pitch_values else 0.0,
+        'avg_abs_yaw': round(_safe_avg(abs_yaw_values), 2) if abs_yaw_values else 0.0,
+        'avg_abs_roll': round(_safe_avg(abs_roll_values), 2) if abs_roll_values else 0.0,
+        'high_pose_ratio': round((high_pose_frames / sample_count) * 100.0, 2) if sample_count else 0.0,
+    }
+
+    iris_snapshot = {
+        'avg_gaze_offset_magnitude': round(_safe_avg(gaze_offsets), 4) if gaze_offsets else 0.0,
+        'avg_gaze_focus_score': round(_safe_avg(gaze_focus_scores), 2) if gaze_focus_scores else 0.0,
+        'max_drift_count': int(max_gaze_drift_count),
+        'drift_jumps': int(drift_jumps),
+    }
+
+    # 下采样，避免报告载荷过大（保留首尾点）。
+    gaze_focus_trend = gaze_focus_trend_full
+    max_points = 180
+    if len(gaze_focus_trend_full) > max_points:
+        stride = max(1, len(gaze_focus_trend_full) // max_points)
+        gaze_focus_trend = [gaze_focus_trend_full[i] for i in range(0, len(gaze_focus_trend_full), stride)]
+        if gaze_focus_trend[-1].get('second') != gaze_focus_trend_full[-1].get('second'):
+            gaze_focus_trend.append(gaze_focus_trend_full[-1])
+
+    gaze_focus_summary = {
+        'avg_focus_score': round(_safe_avg([item.get('focus_score') for item in gaze_focus_trend_full]), 2) if gaze_focus_trend_full else 0.0,
+        'low_focus_ratio': round((low_focus_frames / sample_count) * 100.0, 2) if sample_count else 0.0,
+        'min_focus_score': round(min_focus_score if gaze_focus_trend_full else 0.0, 2),
+    }
+
+    return {
+        'sample_count': sample_count,
+        'landmarks_3d': landmarks_snapshot,
+        'blendshapes': blendshape_snapshot,
+        'head_pose': head_pose_snapshot,
+        'iris_tracking': iris_snapshot,
+        'gaze_focus_summary': gaze_focus_summary,
+        'gaze_focus_trend': gaze_focus_trend,
+    }
+
+
 def _build_content_performance_snapshot(interview_id: str, dialogues=None):
     total_questions = len(dialogues or [])
     if not hasattr(db_manager, 'get_interview_evaluations'):
@@ -3411,16 +3997,7 @@ def _build_content_performance_snapshot(interview_id: str, dialogues=None):
 
     raw_rows = db_manager.get_interview_evaluations(interview_id=interview_id) or []
     decoded_rows = _decode_evaluation_rows(raw_rows)
-    valid_turn_ids = {
-        str(item.get('turn_id') or '').strip()
-        for item in (dialogues or [])
-        if str(item.get('turn_id') or '').strip()
-    }
-    if valid_turn_ids:
-        decoded_rows = [
-            row for row in decoded_rows
-            if str(row.get('turn_id') or '').strip() in valid_turn_ids
-        ]
+    decoded_rows = _filter_evaluation_rows_by_dialogues(decoded_rows, dialogues)
 
     status_priority = {
         'ok': 2,
@@ -3642,7 +4219,14 @@ def _build_speech_performance_snapshot(interview_id: str):
     summary = speech_summary.get('summary') or {}
     avg_speech_rate = float(summary.get('avg_speech_rate_wpm') or 0.0)
     avg_fillers = float(summary.get('avg_fillers_per_100_words') or 0.0)
-    avg_pause_ratio = float(summary.get('avg_pause_anomaly_ratio') or 0.0)
+    raw_pause_ratio = summary.get('avg_pause_anomaly_ratio')
+    avg_pause_ratio = float(raw_pause_ratio) if isinstance(raw_pause_ratio, (int, float)) else None
+    pause_reliable_samples = int(summary.get('pause_metric_reliable_samples') or 0)
+    quality_warnings = [
+        str(item).strip()
+        for item in (summary.get('quality_warnings') or [])
+        if str(item).strip()
+    ]
     diagnosis = []
     if avg_speech_rate > 0 and avg_speech_rate < 110:
         diagnosis.append('整体语速偏慢，建议先给结论再展开，以减少停顿。')
@@ -3650,8 +4234,10 @@ def _build_speech_performance_snapshot(interview_id: str):
         diagnosis.append('整体语速偏快，建议在关键结论处放慢节奏。')
     if avg_fillers > 6.0:
         diagnosis.append('口头词偏多，建议回答前先用 1 句话组织主线。')
-    if avg_pause_ratio > 0.45:
+    if avg_pause_ratio is not None and avg_pause_ratio > 0.45:
         diagnosis.append('异常停顿比例较高，建议按“结论-依据-结果”模板回答。')
+    if pause_reliable_samples <= 0 and quality_warnings:
+        diagnosis.append('当前停顿数据置信度不足，建议结合语音回放人工确认停顿问题。')
     if not diagnosis:
         diagnosis.append('语音表达整体稳定，可持续保持当前节奏。')
 
@@ -3665,15 +4251,37 @@ def _build_speech_performance_snapshot(interview_id: str):
     }
 
 
-def _build_camera_performance_snapshot(statistics, event_type_counter, top_events, max_probability: float):
+def _build_camera_performance_snapshot(statistics, event_type_counter, top_events, max_probability: float, camera_insights=None):
     stats = statistics or {}
+    deep = camera_insights or {}
     total_deviations = int(stats.get('total_deviations') or 0)
     total_mouth_open = int(stats.get('total_mouth_open') or 0)
     total_multi_person = int(stats.get('total_multi_person') or 0)
     off_screen_ratio = float(stats.get('off_screen_ratio') or 0.0)
 
+    head_pose = deep.get('head_pose') if isinstance(deep.get('head_pose'), dict) else {}
+    iris_tracking = deep.get('iris_tracking') if isinstance(deep.get('iris_tracking'), dict) else {}
+    blendshapes = deep.get('blendshapes') if isinstance(deep.get('blendshapes'), dict) else {}
+    landmarks = deep.get('landmarks_3d') if isinstance(deep.get('landmarks_3d'), dict) else {}
+
+    avg_gaze_focus = _safe_float(iris_tracking.get('avg_gaze_focus_score'), 0.0)
+    high_pose_ratio = _safe_float(head_pose.get('high_pose_ratio'), 0.0)
+    avg_blink_rate = _safe_float(blendshapes.get('avg_blink_rate_per_min'), 0.0)
+    avg_jaw_open = _safe_float(blendshapes.get('avg_jaw_open'), 0.0)
+
     focus_score = max(0.0, min(100.0, 100.0 - off_screen_ratio * 2.6 - max(0, total_deviations - 2) * 1.4))
+    if avg_gaze_focus > 0:
+        focus_score = (focus_score * 0.55) + (avg_gaze_focus * 0.45)
+
     compliance_score = max(0.0, min(100.0, 100.0 - total_mouth_open * 2.2 - total_multi_person * 40.0))
+    if high_pose_ratio > 0:
+        compliance_score -= min(24.0, high_pose_ratio * 0.26)
+    if avg_blink_rate > 45:
+        compliance_score -= min(8.0, (avg_blink_rate - 45.0) * 0.25)
+    if avg_jaw_open > 0.25:
+        compliance_score -= min(8.0, (avg_jaw_open - 0.25) * 30.0)
+    compliance_score = max(0.0, min(100.0, compliance_score))
+
     anti_cheat_score = max(0.0, min(100.0, 100.0 - float(max_probability or 0.0)))
     overall_score = round((focus_score + compliance_score + anti_cheat_score) / 3.0, 1)
 
@@ -3688,14 +4296,25 @@ def _build_camera_performance_snapshot(statistics, event_type_counter, top_event
         notes.append(f'检测到 {total_mouth_open} 次异常口型，建议确认环境无干扰。')
     if total_deviations >= 6:
         notes.append(f'累计 {total_deviations} 次偏移事件，建议固定坐姿并保持正对镜头。')
+    if high_pose_ratio >= 25:
+        notes.append(f'头部姿态异常帧占比 {high_pose_ratio:.1f}%，建议回答时减少频繁转头/低头。')
+    if avg_blink_rate >= 45:
+        notes.append(f'眨眼频率约 {avg_blink_rate:.1f} 次/分钟，存在明显紧张迹象。')
+    drift_jumps = int(_safe_float(iris_tracking.get('drift_jumps'), 0.0))
+    if drift_jumps >= 8:
+        notes.append(f'虹膜漂移累计 {drift_jumps} 次，核心题回答时眼神稳定性不足。')
+    avg_landmark_count = _safe_float(landmarks.get('avg_landmark_count'), 0.0)
+    tracked_count_max = int(_safe_float(blendshapes.get('tracked_count_max'), 0.0))
+    if avg_landmark_count < 468 or tracked_count_max < 40:
+        notes.append('面部关键点或表情系数采样不足，建议保证光线均匀并保持正脸。')
     if not notes:
         notes.append('镜头前行为总体稳定，未见明显异常模式。')
 
     return {
         'status': 'ready',
-        'status_message': '镜头行为指标已完成聚合。',
+        'status_message': '镜头行为指标已完成聚合（含 3D 关键点/表情系数/头姿/虹膜追踪）。',
         'overall_score': overall_score,
-        'focus_score': round(focus_score, 1),
+        'focus_score': round(max(0.0, min(100.0, focus_score)), 1),
         'compliance_score': round(compliance_score, 1),
         'anti_cheat_score': round(anti_cheat_score, 1),
         'statistics': {
@@ -3704,6 +4323,7 @@ def _build_camera_performance_snapshot(statistics, event_type_counter, top_event
             'total_multi_person': total_multi_person,
             'off_screen_ratio': round(off_screen_ratio, 2),
         },
+        'camera_insights': deep,
         'event_type_breakdown': [
             {'event_type': key, 'count': int(count)}
             for key, count in sorted(event_type_counter.items(), key=lambda item: item[1], reverse=True)
@@ -4149,17 +4769,7 @@ def _build_structured_snapshot(interview_id: str, dialogues=None):
 
     raw_rows = db_manager.get_interview_evaluations(interview_id=interview_id) or []
     decoded_rows = _decode_evaluation_rows(raw_rows)
-
-    valid_turn_ids = {
-        str(item.get('turn_id') or '').strip()
-        for item in (dialogues or [])
-        if str(item.get('turn_id') or '').strip()
-    }
-    if valid_turn_ids:
-        decoded_rows = [
-            row for row in decoded_rows
-            if str(row.get('turn_id') or '').strip() in valid_turn_ids
-        ]
+    decoded_rows = _filter_evaluation_rows_by_dialogues(decoded_rows, dialogues)
 
     status_priority = {
         'ok': 5,
@@ -4320,17 +4930,7 @@ def _build_evaluation_v2_snapshot(interview_id: str, dialogues=None):
 
     raw_rows = db_manager.get_interview_evaluations(interview_id=interview_id) or []
     decoded_rows = _decode_evaluation_rows(raw_rows)
-
-    valid_turn_ids = {
-        str(item.get('turn_id') or '').strip()
-        for item in (dialogues or [])
-        if str(item.get('turn_id') or '').strip()
-    }
-    if valid_turn_ids:
-        decoded_rows = [
-            row for row in decoded_rows
-            if str(row.get('turn_id') or '').strip() in valid_turn_ids
-        ]
+    decoded_rows = _filter_evaluation_rows_by_dialogues(decoded_rows, dialogues)
 
     if not decoded_rows:
         pending_message = '结构化评分处理中，请稍后刷新。' if total_questions > 0 else '暂无可评分题目。'
@@ -4374,6 +4974,9 @@ def _build_evaluation_v2_snapshot(interview_id: str, dialogues=None):
     questions = []
     scored_turns = set()
     base_weights = {'text': 0.5, 'speech': 0.25, 'video': 0.25}
+    fusion_formula = 'W_effective_i = (W_base_i * C_i) / sum(W_base_j * C_j)'
+    shortboard_applied_count = 0
+    integrity_flagged_count = 0
     status_counts = Counter()
 
     for row in decoded_rows:
@@ -4403,11 +5006,33 @@ def _build_evaluation_v2_snapshot(interview_id: str, dialogues=None):
                 layer_scores[layer_name].append(float(score))
 
         if isinstance((fusion or {}).get('base_weights'), dict):
-            base_weights = {
-                'text': float((fusion.get('base_weights') or {}).get('text') or base_weights['text']),
-                'speech': float((fusion.get('base_weights') or {}).get('speech') or base_weights['speech']),
-                'video': float((fusion.get('base_weights') or {}).get('video') or base_weights['video']),
-            }
+            raw_weights = fusion.get('base_weights') or {}
+            if 'text' in raw_weights or 'speech' in raw_weights or 'video' in raw_weights:
+                base_weights = {
+                    'text': float(raw_weights.get('text') or base_weights['text']),
+                    'speech': float(raw_weights.get('speech') or base_weights['speech']),
+                    'video': float(raw_weights.get('video') or base_weights['video']),
+                }
+            elif 'content' in raw_weights or 'delivery' in raw_weights or 'presence' in raw_weights:
+                base_weights = {
+                    'text': float(raw_weights.get('content') or base_weights['text']),
+                    'speech': float(raw_weights.get('delivery') or base_weights['speech']),
+                    'video': float(raw_weights.get('presence') or base_weights['video']),
+                }
+
+        formula = str((fusion or {}).get('formula') or '').strip()
+        if formula:
+            fusion_formula = formula
+
+        shortboard_payload = (fusion or {}).get('shortboard_penalty') if isinstance((fusion or {}).get('shortboard_penalty'), dict) else {}
+        shortboard_applied = bool((shortboard_payload or {}).get('applied'))
+        if shortboard_applied:
+            shortboard_applied_count += 1
+
+        integrity_payload = (fusion or {}).get('integrity') if isinstance((fusion or {}).get('integrity'), dict) else {}
+        integrity_veto = bool((integrity_payload or {}).get('veto'))
+        if integrity_veto:
+            integrity_flagged_count += 1
 
         fusion_score = (fusion or {}).get('overall_score')
         if fusion_score is None:
@@ -4422,6 +5047,8 @@ def _build_evaluation_v2_snapshot(interview_id: str, dialogues=None):
             'speech_score': (speech_layer or {}).get('overall_score'),
             'video_score': (video_layer or {}).get('overall_score'),
             'fusion_score': fusion_score,
+            'shortboard_applied': shortboard_applied,
+            'integrity_veto': integrity_veto,
             'status': row_status,
         })
 
@@ -4464,7 +5091,9 @@ def _build_evaluation_v2_snapshot(interview_id: str, dialogues=None):
             'overall_score': round(_safe_avg(fusion_scores), 1) if fusion_scores else None,
             'base_weights': base_weights,
             'missing_layers': missing_layers,
-            'formula': 'weighted_mean(available_layer_scores)',
+            'formula': fusion_formula,
+            'shortboard_applied_count': shortboard_applied_count,
+            'integrity_flagged_count': integrity_flagged_count,
         },
         'questions': questions[:8],
         'status_counts': dict(status_counts),
@@ -4493,6 +5122,8 @@ def _build_immediate_report_payload(interview_id: str):
         report_file_path = Path(report_path)
     report_exists = bool(report_path and report_file_path.exists())
     report_size = int(report_file_path.stat().st_size) if report_exists else 0
+    detection_timeline = _load_detection_timeline_from_report(report_file_path) if report_exists else []
+    camera_insights = _build_camera_insights_snapshot_from_timeline(detection_timeline)
 
     sorted_events = sorted(
         events or [],
@@ -4519,6 +5150,7 @@ def _build_immediate_report_payload(interview_id: str):
         event_type_counter=event_type_counter,
         top_events=top_events,
         max_probability=float(interview.get('max_probability') or 0.0),
+        camera_insights=camera_insights,
     )
     if started_at and ended_at:
         duration_seconds = int(max(0, (ended_at - started_at).total_seconds()))
@@ -4855,6 +5487,65 @@ def get_latest_immediate_report():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+@app.route('/api/evaluation/trace/<interview_id>/<turn_id>')
+def get_evaluation_trace(interview_id, turn_id):
+    """按 interview_id + turn_id 返回评分审计链路。"""
+    try:
+        normalized_interview_id = str(interview_id or '').strip()
+        normalized_turn_id = str(turn_id or '').strip()
+        if not normalized_interview_id or not normalized_turn_id:
+            return jsonify({'success': False, 'error': 'invalid interview_id or turn_id'}), 400
+
+        if not hasattr(db_manager, 'get_turn_scorecard'):
+            return jsonify({'success': False, 'error': 'evaluation scorecard API unavailable'}), 503
+
+        raw_scorecard = db_manager.get_turn_scorecard(normalized_interview_id, normalized_turn_id) or {}
+        scorecard = _normalize_turn_scorecard(raw_scorecard)
+        evaluation = scorecard.get('evaluation') or {}
+        if not evaluation:
+            return jsonify({'success': False, 'error': 'scorecard not found'}), 404
+
+        return jsonify({
+            'success': True,
+            'interview_id': normalized_interview_id,
+            'turn_id': normalized_turn_id,
+            'scorecard': scorecard,
+            'snapshot': (evaluation.get('scoring_snapshot') if isinstance(evaluation.get('scoring_snapshot'), dict) else {}),
+            'trace': scorecard.get('traces') or [],
+        })
+    except Exception as e:
+        logger.error(f'获取评分审计链路失败: {e}', exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/evaluation/scorecard/<interview_id>/<turn_id>')
+def get_evaluation_scorecard(interview_id, turn_id):
+    """按 interview_id + turn_id 返回标准单题评分卡。"""
+    try:
+        normalized_interview_id = str(interview_id or '').strip()
+        normalized_turn_id = str(turn_id or '').strip()
+        if not normalized_interview_id or not normalized_turn_id:
+            return jsonify({'success': False, 'error': 'invalid interview_id or turn_id'}), 400
+
+        if not hasattr(db_manager, 'get_turn_scorecard'):
+            return jsonify({'success': False, 'error': 'evaluation scorecard API unavailable'}), 503
+
+        raw_scorecard = db_manager.get_turn_scorecard(normalized_interview_id, normalized_turn_id) or {}
+        scorecard = _normalize_turn_scorecard(raw_scorecard)
+        if not (scorecard.get('evaluation') or {}):
+            return jsonify({'success': False, 'error': 'scorecard not found'}), 404
+
+        return jsonify({
+            'success': True,
+            'interview_id': normalized_interview_id,
+            'turn_id': normalized_turn_id,
+            'scorecard': scorecard,
+        })
+    except Exception as e:
+        logger.error(f'获取单题评分卡失败: {e}', exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/interview/video/init', methods=['POST'])
 def api_video_init():
     """初始化视频分片上传会话。"""
@@ -5153,26 +5844,31 @@ def get_interviews_from_db():
         offset = request.args.get('offset', 0, type=int)
 
         interviews = db_manager.get_interviews(limit=limit, offset=offset)
-        interview_ids = [
-            str(item.get('interview_id') or '').strip()
-            for item in (interviews or [])
-            if str(item.get('interview_id') or '').strip()
-        ]
-        structured_score_map = {}
-        if interview_ids and hasattr(db_manager, 'get_interview_structured_score_map'):
-            structured_score_map = db_manager.get_interview_structured_score_map(interview_ids)
-
         for item in interviews:
             interview_id = str(item.get('interview_id') or '').strip()
-            score_payload = structured_score_map.get(interview_id)
-            if score_payload:
-                item['overall_score'] = float(score_payload.get('overall_score') or 0.0)
-                item['scored_turns'] = int(score_payload.get('scored_turns') or 0)
-                item['score_source'] = 'structured_evaluation'
-            else:
+            if not interview_id:
                 item['overall_score'] = None
                 item['scored_turns'] = 0
                 item['score_source'] = 'not_available'
+                item['structured_status'] = 'empty'
+                continue
+
+            # 历史列表与报告详情必须走同一评分逻辑：统一复用结构化快照计算。
+            dialogues = db_manager.get_interview_dialogues(interview_id) if hasattr(db_manager, 'get_interview_dialogues') else []
+            structured_snapshot = _build_structured_snapshot(interview_id, dialogues=dialogues)
+            structured_status = str(structured_snapshot.get('status') or 'unknown').strip() or 'unknown'
+            overall_score = structured_snapshot.get('overall_score')
+            evaluated_questions = int(structured_snapshot.get('evaluated_questions') or 0)
+
+            if isinstance(overall_score, (int, float)):
+                item['overall_score'] = float(overall_score)
+                item['scored_turns'] = evaluated_questions
+                item['score_source'] = 'structured_evaluation'
+            else:
+                item['overall_score'] = None
+                item['scored_turns'] = evaluated_questions
+                item['score_source'] = 'not_available'
+            item['structured_status'] = structured_status
 
         return jsonify({
             'success': True,

@@ -82,22 +82,31 @@ try:
             self.wait_open_event.set()
 
         def on_event(self, result: RecognitionResult) -> None:
-            sentence = result.get_sentence()
-            if not sentence or "text" not in sentence:
-                return
+            try:
+                sentence = result.get_sentence()
+                if not sentence or "text" not in sentence:
+                    return
 
-            text = str(sentence.get("text") or "").strip()
-            if not text:
-                return
+                text = str(sentence.get("text") or "").strip()
+                if not text:
+                    return
 
-            is_end = RecognitionResult.is_sentence_end(sentence)
-            logger.info(f"[ASR] 识别文本：'{text}' | is_end={is_end}")
+                is_end = RecognitionResult.is_sentence_end(sentence)
+                logger.info(f"[ASR] 识别文本：'{text}' | is_end={is_end}")
 
-            if is_end:
-                if self.on_final_callback:
-                    self.on_final_callback(text)
-            elif self.on_partial_callback:
-                self.on_partial_callback(text)
+                if is_end:
+                    if self.on_final_callback:
+                        try:
+                            self.on_final_callback(text)
+                        except Exception as cb_err:
+                            logger.error(f"[ASR] on_final_callback 异常: {cb_err}")
+                elif self.on_partial_callback:
+                    try:
+                        self.on_partial_callback(text)
+                    except Exception as cb_err:
+                        logger.error(f"[ASR] on_partial_callback 异常: {cb_err}")
+            except Exception as e:
+                logger.error(f"[ASR] on_event 处理异常: {e}")
 
     @dataclass
     class AsrStreamState:
@@ -105,7 +114,7 @@ try:
         recognition: Optional[Recognition] = None
         callback: Optional[AsrCallbackHandler] = None
         is_running: bool = False
-        audio_queue: queue.Queue = field(default_factory=queue.Queue)
+        audio_queue: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=200))
         worker_thread: Optional[threading.Thread] = None
         stop_worker: bool = False
         vad_in_speech: bool = False
@@ -267,6 +276,8 @@ try:
             if not value:
                 return "disabled", ""
 
+            backend_dir = Path(__file__).resolve().parent.parent
+
             raw_path = Path(value).expanduser()
             candidates: List[Path] = []
             if raw_path.is_absolute():
@@ -274,6 +285,8 @@ try:
             else:
                 candidates.append(raw_path)
                 candidates.append((self._project_root / raw_path).resolve())
+                candidates.append((backend_dir / raw_path).resolve())
+                candidates.append((backend_dir / "Qwen3-ForcedAligner-0.6B").resolve())
 
             for candidate in candidates:
                 if candidate.is_dir() and (candidate / "config.json").exists():
@@ -281,13 +294,18 @@ try:
                     logger.info("[ASR] ForcedAligner 使用本地模型目录：%s", resolved)
                     return "local", resolved
 
-            # 默认配置时，若项目根目录有本地模型则自动切换为本地优先
+            default_candidates = [
+                (self._project_root / "Qwen3-ForcedAligner-0.6B").resolve(),
+                (backend_dir / "Qwen3-ForcedAligner-0.6B").resolve(),
+                (self._project_root / "qwen3-forcedaligner-0.6b").resolve(),
+                (backend_dir / "qwen3-forcedaligner-0.6b").resolve(),
+            ]
             if value.lower() in {"qwen3-forcedaligner-0.6b", "qwen/qwen3-forcedaligner-0.6b"}:
-                default_local = (self._project_root / "Qwen3-ForcedAligner-0.6B").resolve()
-                if default_local.is_dir() and (default_local / "config.json").exists():
-                    resolved = str(default_local)
-                    logger.info("[ASR] 自动检测到本地 ForcedAligner 模型目录：%s", resolved)
-                    return "local", resolved
+                for default_local in default_candidates:
+                    if default_local.is_dir() and (default_local / "config.json").exists():
+                        resolved = str(default_local)
+                        logger.info("[ASR] 自动检测到本地 ForcedAligner 模型目录：%s", resolved)
+                        return "local", resolved
 
             return "dashscope", value
 
@@ -334,17 +352,20 @@ try:
             state = AsrStreamState(stream_id=stream_id)
             state.vad_pre_roll = deque(maxlen=self.vad_pre_roll_frames)
 
-            def handle_error(error: str):
-                logger.error(f"[ASR] stream={stream_id} 错误：{error}")
-                state.is_running = False
-                state.stop_worker = True
+            def handle_error(error: str, _state: AsrStreamState = state, _stream_id: str = stream_id, _on_error: Optional[Callable[[str], None]] = on_error):
+                logger.error(f"[ASR] stream={_stream_id} 错误：{error}")
+                _state.is_running = False
+                _state.stop_worker = True
                 with self._lock:
-                    current = self._streams.get(stream_id)
+                    current = self._streams.get(_stream_id)
                 if current:
                     current.is_running = False
                     current.stop_worker = True
-                if on_error:
-                    on_error(error)
+                if _on_error:
+                    try:
+                        _on_error(error)
+                    except Exception as cb_err:
+                        logger.error(f"[ASR] on_error 回调异常: {cb_err}")
 
             try:
                 state.callback = AsrCallbackHandler(on_result, on_partial, handle_error)
@@ -393,27 +414,24 @@ try:
                 logger.error(f"[ASR] 启动失败 - stream={stream_id}: {e}")
                 return False
 
-        def send_audio(self, stream_id: str, audio_data: Optional[bytes] = None) -> bool:
-            if audio_data is None:
-                audio_data = stream_id  # 兼容旧签名 send_audio(audio_data)
-                stream_id = self._default_stream_id
-
-            with self._lock:
-                state = self._streams.get(stream_id)
-
-            if not state or not state.is_running or not state.recognition:
-                logger.warning(f"[ASR] stream={stream_id} 未运行")
-                return False
-
+        def send_audio(self, stream_id: str, audio_data: bytes) -> bool:
             if not audio_data:
                 return False
 
-            try:
-                state.audio_queue.put(audio_data)
-                return True
-            except Exception as e:
-                logger.warning(f"[ASR] stream={stream_id} 音频入队失败: {e}")
-                return False
+            with self._lock:
+                state = self._streams.get(stream_id)
+                if not state or not state.is_running or not state.recognition:
+                    logger.warning(f"[ASR] stream={stream_id} 未运行")
+                    return False
+                try:
+                    state.audio_queue.put_nowait(audio_data)
+                    return True
+                except queue.Full:
+                    logger.warning(f"[ASR] stream={stream_id} 音频队列已满，丢弃帧")
+                    return False
+                except Exception as e:
+                    logger.warning(f"[ASR] stream={stream_id} 音频入队失败: {e}")
+                    return False
 
         def _audio_worker(self, stream_id: str):
             logger.info(f"[ASR] 音频工作线程已启动 - stream={stream_id}")
@@ -476,13 +494,18 @@ try:
             if sample_count <= 0:
                 return 0
 
-            energy = 0.0
-            view = memoryview(audio_data)
-            for index in range(0, sample_count * 2, 2):
-                sample = int.from_bytes(view[index:index + 2], byteorder="little", signed=True)
-                energy += float(sample * sample)
-
-            return int((energy / sample_count) ** 0.5)
+            try:
+                import struct
+                samples = struct.unpack(f"<{sample_count}h", audio_data[:sample_count * 2])
+                energy = sum(float(s * s) for s in samples)
+                return int((energy / sample_count) ** 0.5)
+            except Exception:
+                energy = 0.0
+                view = memoryview(audio_data)
+                for index in range(0, sample_count * 2, 2):
+                    sample = int.from_bytes(view[index:index + 2], byteorder="little", signed=True)
+                    energy += float(sample * sample)
+                return int((energy / sample_count) ** 0.5)
 
         def _filter_audio_frames_by_vad(self, state: AsrStreamState, audio_data: bytes) -> List[bytes]:
             if not audio_data:
@@ -920,12 +943,31 @@ try:
                     except Exception as exc:
                         logger.warning("[ASR] 本地 ForcedAligner dtype 配置失败，使用默认值: %s", exc)
 
+                model_path = self.aligner_model
+                if not Path(model_path).is_absolute():
+                    backend_dir = Path(__file__).resolve().parent.parent
+                    project_root = Path(__file__).resolve().parents[2]
+                    candidates = [
+                        Path(model_path),
+                        backend_dir / model_path,
+                        project_root / model_path,
+                        backend_dir / "Qwen3-ForcedAligner-0.6B",
+                        project_root / "Qwen3-ForcedAligner-0.6B",
+                    ]
+                    for candidate in candidates:
+                        if candidate.is_dir() and (candidate / "config.json").exists():
+                            model_path = str(candidate.resolve())
+                            logger.info("[ASR] ForcedAligner 模型路径解析：%s", model_path)
+                            break
+
                 try:
+                    logger.info("[ASR] 正在加载本地 ForcedAligner 模型：%s (device_map=%s, dtype=%s)", 
+                                model_path, kwargs.get("device_map", "auto"), kwargs.get("dtype", "auto"))
                     self._local_forced_aligner = Qwen3ForcedAligner.from_pretrained(
-                        self.aligner_model,
+                        model_path,
                         **kwargs,
                     )
-                    logger.info("[ASR] 本地 ForcedAligner 加载成功：%s", self.aligner_model)
+                    logger.info("[ASR] 本地 ForcedAligner 加载成功：%s", model_path)
                 except Exception as exc:
                     self.last_align_error = f"failed to load local forced aligner: {exc}"
                     logger.warning("[ASR] 本地 ForcedAligner 加载失败：%s", exc)

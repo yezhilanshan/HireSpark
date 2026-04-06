@@ -59,8 +59,9 @@ class DataManager:
         """
         self.interview_data['frames_processed'] += 1
         
-        # 添加时间戳
-        data['timestamp'] = time.time()
+        # 添加时间戳：若上游已提供（如前端毫秒 ts），则保留。
+        if not isinstance(data.get('timestamp'), (int, float)):
+            data['timestamp'] = time.time()
         data['frame_number'] = self.interview_data['frames_processed']
         
         # 添加到时间轴

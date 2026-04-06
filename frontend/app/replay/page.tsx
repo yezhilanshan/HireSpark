@@ -6,8 +6,9 @@ import { useSearchParams } from 'next/navigation'
 import { ArrowRight, CalendarDays, Clock3, Film, Tag, Timer, VolumeX } from 'lucide-react'
 import type { ReplayPayload } from '@/types/replay'
 import PersistentSidebar from '@/components/PersistentSidebar'
+import { getBackendBaseUrl } from '@/lib/backend'
 
-const BACKEND_API_BASE = (process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000').replace(/\/$/, '')
+const BACKEND_API_BASE = getBackendBaseUrl()
 
 function formatMs(ms?: number) {
     const safe = Math.max(0, Number(ms || 0))

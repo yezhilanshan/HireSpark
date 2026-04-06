@@ -288,28 +288,70 @@ def aggregate_expression_metrics(speech_rows: List[Dict[str, Any]]) -> Dict[str,
         "pause_anomaly_ratio": [],
         "long_pause_count": [],
     }
+    unreliable_pause_samples = 0
+
+    def _is_unreliable_pause_sample(metrics: Dict[str, Any]) -> bool:
+        pause = (metrics or {}).get("pause") or {}
+        pause_count = int(_safe_float(pause.get("count"), 0.0))
+        audio_duration_ms = _safe_float((metrics or {}).get("audio_duration_ms"), 0.0)
+        token_count = int(_safe_float((metrics or {}).get("token_count"), 0.0))
+        align_mode = str((metrics or {}).get("align_mode") or "").strip().lower()
+        align_confidence = _safe_float((metrics or {}).get("align_confidence"), 1.0)
+
+        low_quality_align = (
+            align_mode in {"naive", "fallback", "forced"}
+            or align_confidence < 0.6
+        )
+        no_pause_but_long_answer = pause_count == 0 and audio_duration_ms >= 30000 and token_count >= 120
+        return bool(low_quality_align and no_pause_but_long_answer)
 
     for row in speech_rows:
         metrics = row.get("speech_metrics_final") or {}
         dimensions = (metrics or {}).get("dimensions") or {}
+        unreliable_pause = _is_unreliable_pause_sample(metrics)
+
         for key in dimension_keys:
             if key in dimensions:
+                if key == "pause_anomaly_score" and unreliable_pause:
+                    continue
                 accum[key].append(_safe_float(dimensions.get(key)))
+
         summary_accum["speech_rate_wpm"].append(_safe_float((metrics or {}).get("speech_rate_wpm")))
         summary_accum["fillers_per_100_words"].append(_safe_float(((metrics or {}).get("fillers") or {}).get("per_100_words")))
-        summary_accum["pause_anomaly_ratio"].append(_safe_float(((metrics or {}).get("pause") or {}).get("anomaly_ratio")))
-        summary_accum["long_pause_count"].append(_safe_float(((metrics or {}).get("pause") or {}).get("long_count")))
+        if unreliable_pause:
+            unreliable_pause_samples += 1
+        else:
+            summary_accum["pause_anomaly_ratio"].append(_safe_float(((metrics or {}).get("pause") or {}).get("anomaly_ratio")))
+            summary_accum["long_pause_count"].append(_safe_float(((metrics or {}).get("pause") or {}).get("long_count")))
 
     def _avg(values: List[float]) -> float:
         valid = [item for item in values if isinstance(item, (int, float)) and not math.isnan(item)]
         return (sum(valid) / len(valid)) if valid else 0.0
 
     dimensions = {key: round(_avg(values), 2) for key, values in accum.items() if values}
+    if "pause_anomaly_score" not in dimensions:
+        # 当停顿样本全部不可靠时给保守中位分，避免误导为“停顿稳定性极好”。
+        dimensions["pause_anomaly_score"] = 55.0
+
+    pause_ratio_values = [
+        item for item in summary_accum["pause_anomaly_ratio"]
+        if isinstance(item, (int, float)) and not math.isnan(item)
+    ]
+    long_pause_values = [
+        item for item in summary_accum["long_pause_count"]
+        if isinstance(item, (int, float)) and not math.isnan(item)
+    ]
+
     summary = {
         "avg_speech_rate_wpm": round(_avg(summary_accum["speech_rate_wpm"]), 2),
         "avg_fillers_per_100_words": round(_avg(summary_accum["fillers_per_100_words"]), 3),
-        "avg_pause_anomaly_ratio": round(_avg(summary_accum["pause_anomaly_ratio"]), 4),
-        "avg_long_pause_count": round(_avg(summary_accum["long_pause_count"]), 2),
+        "avg_pause_anomaly_ratio": round(_avg(pause_ratio_values), 4) if pause_ratio_values else None,
+        "avg_long_pause_count": round(_avg(long_pause_values), 2) if long_pause_values else None,
+        "pause_metric_reliable_samples": len(pause_ratio_values),
+        "pause_metric_unreliable_samples": int(unreliable_pause_samples),
+        "quality_warnings": [
+            "部分停顿样本来自低置信度对齐，已降权处理。"
+        ] if unreliable_pause_samples > 0 else [],
         "samples": len(speech_rows),
     }
 

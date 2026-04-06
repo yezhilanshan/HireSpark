@@ -2,6 +2,8 @@ import type { Metadata } from 'next'
 import { Inter, Newsreader, Noto_Sans_SC, Noto_Serif_SC } from 'next/font/google'
 import './globals.css'
 import { CommandPalette } from '@/components/command-palette'
+import { ThemeProvider } from '@/components/ThemeProvider'
+import GlobalFloatingActions from '@/components/GlobalFloatingActions'
 
 const inter = Inter({ subsets: ['latin'], variable: '--font-sans' })
 const newsreader = Newsreader({ subsets: ['latin'], variable: '--font-serif', style: ['normal', 'italic'] })
@@ -34,8 +36,11 @@ export default function RootLayout({
     return (
         <html lang="zh-CN" className={`${inter.variable} ${newsreader.variable} ${sourceHanSans.variable} ${sourceHanSerif.variable}`} suppressHydrationWarning>
             <body className="font-sans bg-[#FAF9F6] text-[#1A1A1A] antialiased selection:bg-[#EBE9E0] selection:text-[#1A1A1A]">
-                {children}
-                <CommandPalette />
+                <ThemeProvider>
+                    {children}
+                    <GlobalFloatingActions />
+                    <CommandPalette />
+                </ThemeProvider>
             </body>
         </html>
     )

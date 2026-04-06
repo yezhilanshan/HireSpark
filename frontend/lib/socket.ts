@@ -2,21 +2,10 @@
  * Socket.IO 客户端封装
  */
 import { io, Socket } from 'socket.io-client';
-
-const DEFAULT_SOCKET_PORT = '5000';
+import { getBackendBaseUrl } from './backend';
 
 const getSocketUrl = (): string => {
-    const envUrl = process.env.NEXT_PUBLIC_BACKEND_URL?.trim();
-    if (envUrl) {
-        return envUrl.replace(/\/$/, '');
-    }
-
-    if (typeof window !== 'undefined') {
-        const { protocol, hostname } = window.location;
-        return `${protocol}//${hostname}:${DEFAULT_SOCKET_PORT}`;
-    }
-
-    return `http://localhost:${DEFAULT_SOCKET_PORT}`;
+    return getBackendBaseUrl();
 };
 
 class SocketClient {

@@ -4,8 +4,9 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { Camera, Mic, Settings2, CheckCircle2, AlertCircle, Play, Briefcase, Code, Building2, User, ArrowLeft } from 'lucide-react'
 import { motion } from 'motion/react'
+import { getBackendBaseUrl } from '@/lib/backend'
 
-const BACKEND_API_BASE = (process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000').replace(/\/$/, '')
+const BACKEND_API_BASE = getBackendBaseUrl()
 
 const INTERVIEW_ROUNDS = [
     {

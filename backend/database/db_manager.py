@@ -31,6 +31,38 @@ class DatabaseManager:
         self.db_path = db_path
         self._lock = Lock()  # 线程锁，保证并发安全
         self.init_database()
+
+    @staticmethod
+    def _interview_evaluations_compat_columns():
+        """返回 interview_evaluations 兼容所需列定义。"""
+        return [
+            ('text_layer_json', 'TEXT'),
+            ('speech_layer_json', 'TEXT'),
+            ('video_layer_json', 'TEXT'),
+            ('fusion_json', 'TEXT'),
+            ('scoring_snapshot_json', 'TEXT'),
+            ('confidence_score', 'REAL'),
+            ('gaze_focus_score', 'REAL'),
+            ('posture_compliance_score', 'REAL'),
+            ('physiology_stability_score', 'REAL'),
+            ('expression_naturalness_score', 'REAL'),
+            ('engagement_level_score', 'REAL'),
+            ('retry_count_layer1', 'INTEGER DEFAULT 0'),
+            ('retry_count_layer2', 'INTEGER DEFAULT 0'),
+            ('retry_count_persist', 'INTEGER DEFAULT 0'),
+            ('error_code', 'TEXT'),
+            ('error_message', 'TEXT'),
+        ]
+
+    def _ensure_interview_evaluations_schema(self, conn) -> None:
+        """兼容旧库：确保 interview_evaluations 具备当前写入所需字段。"""
+        for col_name, col_def in self._interview_evaluations_compat_columns():
+            self._ensure_column_exists(
+                conn=conn,
+                table_name='interview_evaluations',
+                column_name=col_name,
+                column_def=col_def,
+            )
     
     def init_database(self):
         """初始化数据库表结构"""
@@ -239,6 +271,7 @@ class DatabaseManager:
                     speech_layer_json TEXT,
                     video_layer_json TEXT,
                     fusion_json TEXT,
+                    scoring_snapshot_json TEXT,
                     rubric_level TEXT,
                     overall_score REAL,
                     confidence REAL,
@@ -258,6 +291,12 @@ class DatabaseManager:
                     relevance_score REAL,
                     self_awareness_score REAL,
                     communication_score REAL,
+                    confidence_score REAL,
+                    gaze_focus_score REAL,
+                    posture_compliance_score REAL,
+                    physiology_stability_score REAL,
+                    expression_naturalness_score REAL,
+                    engagement_level_score REAL,
                     retry_count_layer1 INTEGER DEFAULT 0,
                     retry_count_layer2 INTEGER DEFAULT 0,
                     retry_count_persist INTEGER DEFAULT 0,
@@ -290,6 +329,29 @@ class DatabaseManager:
             cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_interview_evaluations_created_at
                 ON interview_evaluations(created_at)
+            ''')
+
+            # 评分链路事件日志
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS evaluation_traces (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    trace_id TEXT NOT NULL,
+                    interview_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    status TEXT,
+                    duration_ms REAL,
+                    payload_json TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_evaluation_traces_interview_turn
+                ON evaluation_traces(interview_id, turn_id)
+            ''')
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_evaluation_traces_trace_id
+                ON evaluation_traces(trace_id)
             ''')
 
             # 复盘视频资产表
@@ -426,30 +488,7 @@ class DatabaseManager:
                 column_name='turn_id',
                 column_def='TEXT'
             )
-            self._ensure_column_exists(
-                conn=conn,
-                table_name='interview_evaluations',
-                column_name='text_layer_json',
-                column_def='TEXT'
-            )
-            self._ensure_column_exists(
-                conn=conn,
-                table_name='interview_evaluations',
-                column_name='speech_layer_json',
-                column_def='TEXT'
-            )
-            self._ensure_column_exists(
-                conn=conn,
-                table_name='interview_evaluations',
-                column_name='video_layer_json',
-                column_def='TEXT'
-            )
-            self._ensure_column_exists(
-                conn=conn,
-                table_name='interview_evaluations',
-                column_name='fusion_json',
-                column_def='TEXT'
-            )
+            self._ensure_interview_evaluations_schema(conn)
             
             conn.commit()
             conn.close()
@@ -2560,12 +2599,16 @@ class DatabaseManager:
             'question', 'answer', 'evaluation_version', 'rubric_version', 'prompt_version',
             'llm_model', 'eval_task_key', 'status', 'layer1_json', 'layer2_json',
             'text_layer_json', 'speech_layer_json', 'video_layer_json', 'fusion_json',
+            'scoring_snapshot_json',
             'rubric_level', 'overall_score', 'confidence',
             'technical_accuracy_score', 'knowledge_depth_score', 'completeness_score',
             'logic_score', 'job_match_score',
             'authenticity_score', 'ownership_score', 'technical_depth_score', 'reflection_score',
             'architecture_reasoning_score', 'tradeoff_awareness_score', 'scalability_score',
             'clarity_score', 'relevance_score', 'self_awareness_score', 'communication_score',
+            'confidence_score',
+            'gaze_focus_score', 'posture_compliance_score', 'physiology_stability_score',
+            'expression_naturalness_score', 'engagement_level_score',
             'retry_count_layer1', 'retry_count_layer2', 'retry_count_persist',
             'error_code', 'error_message'
         ]
@@ -2586,6 +2629,8 @@ class DatabaseManager:
         with self._lock:
             try:
                 with self.get_connection() as conn:
+                    # 兼容历史数据库：缺列时自动补齐，避免旧库写入失败。
+                    self._ensure_interview_evaluations_schema(conn)
                     cursor = conn.cursor()
                     cursor.execute(sql, values)
                     conn.commit()
@@ -2628,7 +2673,7 @@ class DatabaseManager:
                         SELECT *
                         FROM interview_evaluations
                         WHERE interview_id = ? AND evaluation_version = ?
-                        ORDER BY created_at ASC
+                        ORDER BY datetime(updated_at) DESC, id DESC
                         ''',
                         (interview_id, evaluation_version)
                     )
@@ -2638,7 +2683,7 @@ class DatabaseManager:
                         SELECT *
                         FROM interview_evaluations
                         WHERE interview_id = ?
-                        ORDER BY created_at ASC
+                        ORDER BY datetime(updated_at) DESC, id DESC
                         ''',
                         (interview_id,)
                     )
@@ -2648,9 +2693,96 @@ class DatabaseManager:
             print(f"✗ 查询评估记录失败：{e}")
             return []
 
+    def log_evaluation_event(self, trace_id: str, interview_id: str, turn_id: str, event_type: str, status: str = '', duration_ms: float = None, payload=None):
+        """记录评分链路事件。"""
+        with self._lock:
+            try:
+                with self.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        '''
+                        INSERT INTO evaluation_traces
+                        (trace_id, interview_id, turn_id, event_type, status, duration_ms, payload_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ''',
+                        (
+                            str(trace_id or '').strip(),
+                            str(interview_id or '').strip(),
+                            str(turn_id or '').strip(),
+                            str(event_type or '').strip(),
+                            str(status or '').strip(),
+                            duration_ms,
+                            json.dumps(payload or {}, ensure_ascii=False),
+                        )
+                    )
+                    conn.commit()
+                    return {'success': True}
+            except Exception as e:
+                print(f"✗ 记录评分事件失败：{e}")
+                return {'success': False, 'error': str(e)}
+
+    def get_evaluation_traces(self, interview_id: str, turn_id: str = None):
+        """读取评分链路事件。"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                if turn_id:
+                    cursor.execute(
+                        '''
+                        SELECT * FROM evaluation_traces
+                        WHERE interview_id = ? AND turn_id = ?
+                        ORDER BY datetime(created_at) ASC, id ASC
+                        ''',
+                        (interview_id, turn_id)
+                    )
+                else:
+                    cursor.execute(
+                        '''
+                        SELECT * FROM evaluation_traces
+                        WHERE interview_id = ?
+                        ORDER BY datetime(created_at) ASC, id ASC
+                        ''',
+                        (interview_id,)
+                    )
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            print(f"✗ 查询评分事件失败：{e}")
+            return []
+
+    def get_turn_scorecard(self, interview_id: str, turn_id: str):
+        """聚合单题评分卡。"""
+        evaluation = None
+        evaluations = self.get_interview_evaluations(interview_id=interview_id)
+        for row in evaluations:
+            if str((row or {}).get('turn_id') or '').strip() != str(turn_id or '').strip():
+                continue
+            status = str((row or {}).get('status') or '').strip().lower()
+            if status in {'ok', 'partial_ok'}:
+                evaluation = row
+                break
+            if evaluation is None:
+                evaluation = row
+
+        speech = None
+        for row in self.get_speech_evaluations(interview_id=interview_id) or []:
+            if str((row or {}).get('turn_id') or '').strip() == str(turn_id or '').strip():
+                speech = row
+                break
+
+        traces = self.get_evaluation_traces(interview_id=interview_id, turn_id=turn_id)
+        return {
+            'interview_id': str(interview_id or '').strip(),
+            'turn_id': str(turn_id or '').strip(),
+            'evaluation': evaluation,
+            'speech_evaluation': speech,
+            'traces': traces,
+        }
+
     def get_interview_structured_score_map(self, interview_ids):
         """
         批量获取面试结构化总分（按 turn 取最新评估记录后求平均）。
+        优先使用 overall_score 列，若为 NULL 则尝试从 layer2_json 提取 overall_score_final。
 
         Returns:
             dict: {
@@ -2672,6 +2804,7 @@ class DatabaseManager:
                     interview_id,
                     turn_id,
                     overall_score,
+                    layer2_json,
                     status,
                     ROW_NUMBER() OVER (
                         PARTITION BY interview_id, turn_id
@@ -2682,13 +2815,13 @@ class DatabaseManager:
             )
             SELECT
                 interview_id,
-                ROUND(AVG(overall_score), 1) AS overall_score,
-                COUNT(*) AS scored_turns
+                turn_id,
+                overall_score,
+                layer2_json,
+                status
             FROM ranked
             WHERE rn = 1
-              AND overall_score IS NOT NULL
               AND status IN ('ok', 'partial_ok', 'skipped')
-            GROUP BY interview_id
         '''
 
         try:
@@ -2696,16 +2829,46 @@ class DatabaseManager:
                 cursor = conn.cursor()
                 cursor.execute(sql, normalized_ids)
                 rows = cursor.fetchall()
-                result = {}
+
+                interview_scores = {}
                 for row in rows:
                     interview_id = str(row['interview_id'] or '').strip()
                     if not interview_id:
                         continue
-                    result[interview_id] = {
-                        'overall_score': float(row['overall_score'] or 0.0),
-                        'scored_turns': int(row['scored_turns'] or 0),
-                        'score_source': 'structured_evaluation',
-                    }
+
+                    score = None
+                    raw_overall_score = row['overall_score']
+                    if raw_overall_score is not None:
+                        try:
+                            score = float(raw_overall_score)
+                        except (ValueError, TypeError):
+                            pass
+
+                    if score is None:
+                        layer2_json_str = row['layer2_json']
+                        if layer2_json_str:
+                            try:
+                                layer2 = json.loads(layer2_json_str)
+                                final_score = layer2.get('overall_score_final')
+                                if final_score is None:
+                                    final_score = layer2.get('overall_score')
+                                if final_score is not None:
+                                    score = float(final_score)
+                            except (json.JSONDecodeError, ValueError, TypeError):
+                                pass
+
+                    if score is not None:
+                        interview_scores.setdefault(interview_id, []).append(score)
+
+                result = {}
+                for interview_id, scores in interview_scores.items():
+                    if scores:
+                        avg_score = round(sum(scores) / len(scores), 1)
+                        result[interview_id] = {
+                            'overall_score': avg_score,
+                            'scored_turns': len(scores),
+                            'score_source': 'structured_evaluation',
+                        }
                 return result
         except Exception as e:
             print(f"✗ 查询结构化总分失败：{e}")

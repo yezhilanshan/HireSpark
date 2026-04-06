@@ -19,9 +19,20 @@ import {
     Users,
     Volume2,
 } from 'lucide-react'
+import {
+    CartesianGrid,
+    Line,
+    LineChart,
+    ResponsiveContainer,
+    Tooltip,
+    XAxis,
+    YAxis,
+    ReferenceArea,
+} from 'recharts'
 import PersistentSidebar from '@/components/PersistentSidebar'
+import { getBackendBaseUrl } from '@/lib/backend'
 
-const BACKEND_API_BASE = (process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000').replace(/\/$/, '')
+const BACKEND_API_BASE = getBackendBaseUrl()
 
 type StructuredDimension = {
     key: string
@@ -76,6 +87,51 @@ type CameraStatistics = {
     total_multi_person: number
     off_screen_ratio: number
     frames_processed?: number
+}
+
+type CameraInsights = {
+    sample_count?: number
+    landmarks_3d?: {
+        avg_landmark_count?: number
+        max_landmark_count?: number
+        avg_mouth_open_ratio?: number
+        avg_micro_movement_variance?: number
+        avg_face_distance_z?: number
+        close_ratio?: number
+        far_ratio?: number
+    }
+    blendshapes?: {
+        tracked_count_max?: number
+        avg_blink_rate_per_min?: number
+        avg_brow_inner_up?: number
+        avg_smile?: number
+        avg_jaw_open?: number
+        avg_speech_expressiveness?: number
+        blendshape_averages?: Record<string, number>
+    }
+    head_pose?: {
+        avg_abs_pitch?: number
+        avg_abs_yaw?: number
+        avg_abs_roll?: number
+        high_pose_ratio?: number
+    }
+    iris_tracking?: {
+        avg_gaze_offset_magnitude?: number
+        avg_gaze_focus_score?: number
+        max_drift_count?: number
+        drift_jumps?: number
+    }
+    gaze_focus_summary?: {
+        avg_focus_score?: number
+        low_focus_ratio?: number
+        min_focus_score?: number
+    }
+    gaze_focus_trend?: Array<{
+        second?: number
+        focus_score?: number
+        off_screen_ratio?: number
+        risk_score?: number
+    }>
 }
 
 type WeakDimension = {
@@ -152,6 +208,7 @@ type CameraPerformance = {
     compliance_score: number
     anti_cheat_score: number
     statistics: CameraStatistics
+    camera_insights?: CameraInsights
     event_type_breakdown: EventTypeCount[]
     top_risk_events: RiskEvent[]
     notes: string[]
@@ -161,6 +218,73 @@ type ApiResult = {
     success: boolean
     report?: ImmediateReport
     error?: string
+}
+
+type TurnDimensionEvidence = {
+    score?: number
+    reason?: string
+    evidence?: {
+        hit_rubric_points?: string[]
+        missed_rubric_points?: string[]
+        source_quotes?: string[]
+        deduction_rationale?: string
+    }
+}
+
+type TurnFusion = {
+    status?: string
+    overall_score?: number | null
+    formula?: string
+    layer_scores?: Record<string, number>
+    effective_weights?: Record<string, number>
+    missing_layers?: string[]
+    rejection_reasons?: Record<string, string[]>
+    calculation_steps?: string[]
+}
+
+type TurnScorecardEvaluation = {
+    status?: string
+    scoring_snapshot?: Record<string, unknown>
+    fusion?: TurnFusion
+    layer2?: {
+        dimension_evidence_json?: Record<string, TurnDimensionEvidence>
+    }
+}
+
+type TurnTrace = {
+    event_type?: string
+    status?: string
+    duration_ms?: number | null
+    created_at?: string
+    payload?: Record<string, unknown>
+}
+
+type TurnScorecard = {
+    interview_id?: string
+    turn_id?: string
+    evaluation?: TurnScorecardEvaluation
+    traces?: TurnTrace[]
+    speech_evaluation?: {
+        final_transcript?: string
+    }
+}
+
+type TraceApiResult = {
+    success: boolean
+    scorecard?: TurnScorecard
+    snapshot?: Record<string, unknown>
+    trace?: TurnTrace[]
+    error?: string
+}
+
+type SafeDimensionEvidenceView = {
+    key: string
+    score: number | null
+    reason: string
+    hit: string[]
+    missed: string[]
+    quotes: string[]
+    rationale: string
 }
 
 function formatDuration(seconds = 0) {
@@ -202,6 +326,12 @@ function formatEventTime(value: unknown) {
     return `${num.toFixed(1)} 秒`
 }
 
+function formatSecondsLabel(value: unknown) {
+    const num = Number(value)
+    if (!Number.isFinite(num)) return '--'
+    return `${num.toFixed(0)}s`
+}
+
 function reasonTagTone(tag: string) {
     if (tag === '技术') return 'bg-[#E7F0FF] text-[#2C4A7A]'
     if (tag === '表达') return 'bg-[#FDEFE5] text-[#8A5425]'
@@ -213,6 +343,12 @@ function ReportPageContent() {
     const [loading, setLoading] = useState(true)
     const [error, setError] = useState('')
     const [report, setReport] = useState<ImmediateReport | null>(null)
+    const [activeTurnId, setActiveTurnId] = useState('')
+    const [scorecardLoading, setScorecardLoading] = useState(false)
+    const [scorecardError, setScorecardError] = useState('')
+    const [activeScorecard, setActiveScorecard] = useState<TurnScorecard | null>(null)
+    const [scorecardCache, setScorecardCache] = useState<Record<string, TurnScorecard>>({})
+    const [scorecardRetryNonce, setScorecardRetryNonce] = useState(0)
     const interviewId = (searchParams.get('interviewId') || '').trim()
 
     useEffect(() => {
@@ -239,16 +375,84 @@ function ReportPageContent() {
         void load()
     }, [interviewId])
 
-    const topDimensions = useMemo(() => {
-        return [...(report?.structured_evaluation?.dimension_scores || [])]
-            .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))
-            .slice(0, 6)
-    }, [report])
+    const questionEvidenceList = report?.content_performance?.question_evidence || []
 
-    const dimensionScale = useMemo(() => {
-        const values = topDimensions.map((item) => Number(item.score || 0))
-        return Math.max(1, ...values)
-    }, [topDimensions])
+    useEffect(() => {
+        if (!questionEvidenceList.length) {
+            setActiveTurnId('')
+            setActiveScorecard(null)
+            setScorecardError('')
+            return
+        }
+        const exists = questionEvidenceList.some((item) => String(item.turn_id || '').trim() === activeTurnId)
+        if (!exists) {
+            const firstValidTurn = questionEvidenceList.find((item) => String(item.turn_id || '').trim())
+            setActiveTurnId(String(firstValidTurn?.turn_id || questionEvidenceList[0]?.turn_id || '').trim())
+        }
+    }, [questionEvidenceList, activeTurnId])
+
+    useEffect(() => {
+        setScorecardCache({})
+        setActiveScorecard(null)
+        setScorecardError('')
+    }, [report?.interview_id])
+
+    useEffect(() => {
+        const normalizedInterviewId = String(report?.interview_id || '').trim()
+        const normalizedTurnId = String(activeTurnId || '').trim()
+        if (!normalizedInterviewId) {
+            setScorecardLoading(false)
+            return
+        }
+        if (!normalizedTurnId) {
+            setActiveScorecard(null)
+            setScorecardLoading(false)
+            setScorecardError(questionEvidenceList.length > 0 ? '当前题目缺少 turn_id，无法查询证据链。' : '')
+            return
+        }
+
+        const cached = scorecardCache[normalizedTurnId]
+        if (cached) {
+            setActiveScorecard(cached)
+            setScorecardLoading(false)
+            setScorecardError('')
+            return
+        }
+
+        let canceled = false
+        const loadScorecard = async () => {
+            try {
+                setScorecardLoading(true)
+                setScorecardError('')
+
+                const endpoint = `${BACKEND_API_BASE}/api/evaluation/trace/${encodeURIComponent(normalizedInterviewId)}/${encodeURIComponent(normalizedTurnId)}`
+                const res = await fetch(endpoint, { cache: 'no-store' })
+                const data: TraceApiResult = await res.json()
+                if (!res.ok || !data.success || !data.scorecard) {
+                    throw new Error(data.error || '获取单题证据链失败')
+                }
+
+                const mergedScorecard: TurnScorecard = {
+                    ...(data.scorecard || {}),
+                    traces: (data.trace || data.scorecard.traces || []),
+                }
+                if (canceled) return
+                setActiveScorecard(mergedScorecard)
+                setScorecardCache((prev) => ({ ...prev, [normalizedTurnId]: mergedScorecard }))
+            } catch (e) {
+                if (canceled) return
+                setActiveScorecard(null)
+                setScorecardError(e instanceof Error ? e.message : '获取单题证据链失败')
+            } finally {
+                if (!canceled) setScorecardLoading(false)
+            }
+        }
+
+        void loadScorecard()
+        return () => {
+            canceled = true
+        }
+    }, [activeTurnId, report?.interview_id, scorecardCache, scorecardRetryNonce, questionEvidenceList.length])
 
     const radarDimensions = useMemo(() => {
         const weakSource = (report?.content_performance?.weak_dimensions || []).slice(0, 5)
@@ -265,6 +469,132 @@ function ReportPageContent() {
             score: Number(item.score || 0),
         }))
     }, [report])
+
+    const speechRadarDimensions = useMemo(() => {
+        return (report?.speech_performance?.dimensions || []).map((item) => ({
+            key: item.key,
+            label: item.label,
+            score: Number(item.score || 0),
+        }))
+    }, [report])
+
+    const speechWeakItems = useMemo(() => {
+        const sorted = [...(report?.speech_performance?.dimensions || [])]
+            .map((item) => ({ ...item, score: Number(item.score || 0) }))
+            .sort((a, b) => a.score - b.score)
+
+        const belowTarget = sorted.filter((item) => item.score < 75)
+        if (belowTarget.length > 0) return belowTarget.slice(0, 3)
+        return sorted.slice(0, 2)
+    }, [report])
+
+    const dimensionLabelMap = useMemo(() => {
+        const map: Record<string, string> = {}
+        ;(report?.structured_evaluation?.dimension_scores || []).forEach((item) => {
+            if (item?.key) map[item.key] = item.label
+        })
+        ;(report?.content_performance?.weak_dimensions || []).forEach((item) => {
+            if (item?.key) map[item.key] = item.label
+        })
+        return map
+    }, [report])
+
+    const activeDimensionEvidenceList = useMemo<SafeDimensionEvidenceView[]>(() => {
+        const source = activeScorecard?.evaluation?.layer2?.dimension_evidence_json || {}
+        const entries: SafeDimensionEvidenceView[] = []
+        for (const [key, value] of Object.entries(source)) {
+            const payload = (value && typeof value === 'object') ? value as TurnDimensionEvidence : {}
+            const evidenceObj = (payload.evidence && typeof payload.evidence === 'object') ? payload.evidence : {}
+            const scoreNum = Number(payload.score)
+            const score = Number.isFinite(scoreNum) ? scoreNum : null
+            const reason = String(payload.reason || '').trim()
+            const hit = Array.isArray(evidenceObj.hit_rubric_points)
+                ? evidenceObj.hit_rubric_points.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+                : []
+            const missed = Array.isArray(evidenceObj.missed_rubric_points)
+                ? evidenceObj.missed_rubric_points.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+                : []
+            const quotes = Array.isArray(evidenceObj.source_quotes)
+                ? evidenceObj.source_quotes.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+                : []
+            const rationale = String(evidenceObj.deduction_rationale || reason).trim()
+            entries.push({
+                key,
+                score,
+                reason,
+                hit,
+                missed,
+                quotes,
+                rationale,
+            })
+        }
+        return entries
+    }, [activeScorecard])
+
+    const activeQuestionEvidence = useMemo(() => {
+        const normalizedTurnId = String(activeTurnId || '').trim()
+        if (!questionEvidenceList.length) return null
+        if (normalizedTurnId) {
+            const matched = questionEvidenceList.find((item) => String(item.turn_id || '').trim() === normalizedTurnId)
+            if (matched) return matched
+        }
+        return questionEvidenceList[0]
+    }, [questionEvidenceList, activeTurnId])
+
+    const readableDimensionCards = useMemo(() => {
+        return [...activeDimensionEvidenceList]
+            .sort((a, b) => Number(a.score ?? 0) - Number(b.score ?? 0))
+            .slice(0, 4)
+            .map((item) => {
+                const scoreValue = item.score == null ? 0 : Math.max(0, Math.min(100, Number(item.score)))
+                return {
+                    ...item,
+                    label: dimensionLabelMap[item.key] || item.key,
+                    scoreValue,
+                    highlight: item.hit[0] || '本题暂未提取到明显优势点。',
+                    improvement: item.missed[0] || item.rationale || item.reason || '建议补充关键事实与结果，提升回答完整度。',
+                    quote: item.quotes[0] || '',
+                }
+            })
+    }, [activeDimensionEvidenceList, dimensionLabelMap])
+
+    const weakestDimensionLabel = readableDimensionCards[0]?.label || '--'
+    const primaryImprovementAdvice = readableDimensionCards[0]?.improvement || '建议先梳理回答结构，再补充关键细节。'
+
+    const gazeTrendData = useMemo(() => {
+        const source = report?.camera_performance?.camera_insights?.gaze_focus_trend || []
+        return source
+            .map((item) => {
+                const second = Number(item.second)
+                const focus = Number(item.focus_score)
+                const offscreen = Number(item.off_screen_ratio)
+                const risk = Number(item.risk_score)
+                return {
+                    second: Number.isFinite(second) ? second : 0,
+                    focus: Number.isFinite(focus) ? Math.max(0, Math.min(100, focus)) : 0,
+                    offscreen: Number.isFinite(offscreen) ? Math.max(0, Math.min(100, offscreen)) : 0,
+                    risk: Number.isFinite(risk) ? Math.max(0, Math.min(100, risk)) : 0,
+                }
+            })
+            .sort((a, b) => a.second - b.second)
+    }, [report])
+
+    const gazeTrendValleys = useMemo(() => {
+        return [...gazeTrendData]
+            .sort((a, b) => a.focus - b.focus)
+            .slice(0, 3)
+    }, [gazeTrendData])
+
+    const refreshActiveTurnAudit = () => {
+        const normalizedTurnId = String(activeTurnId || '').trim()
+        if (!normalizedTurnId) return
+        setScorecardCache((prev) => {
+            const next = { ...prev }
+            delete next[normalizedTurnId]
+            return next
+        })
+        setScorecardRetryNonce((prev) => prev + 1)
+    }
 
     if (loading) {
         return (
@@ -307,8 +637,16 @@ function ReportPageContent() {
     const speechPerf = report.speech_performance
     const cameraPerf = report.camera_performance
     const cameraStats = cameraPerf?.statistics || report.anti_cheat.statistics
+    const cameraInsights = cameraPerf?.camera_insights
+    const cameraLandmarks = cameraInsights?.landmarks_3d
+    const cameraBlendshape = cameraInsights?.blendshapes
+    const cameraHeadPose = cameraInsights?.head_pose
+    const cameraIris = cameraInsights?.iris_tracking
     const cameraBreakdown = cameraPerf?.event_type_breakdown || report.anti_cheat.event_type_breakdown || []
     const cameraTopEvents = cameraPerf?.top_risk_events || report.anti_cheat.top_risk_events || []
+    const topBlendshapeAverages = Object.entries(cameraBlendshape?.blendshape_averages || {})
+        .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))
+        .slice(0, 8)
     const riskHeatValue = Math.max(0, Math.min(100, Number(report.anti_cheat.max_probability || 0)))
     const riskHeatClass = riskHeatValue >= 60
         ? '[&::-webkit-progress-value]:bg-[#B84436] [&::-moz-progress-bar]:bg-[#B84436]'
@@ -336,7 +674,15 @@ function ReportPageContent() {
                 <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
                     <MetricCard title="结构化总分" value={report.structured_evaluation.overall_score == null ? '--' : report.structured_evaluation.overall_score.toFixed(1)} icon={<Target className="h-3.5 w-3.5" />} />
                     <MetricCard title="评分状态" value={report.structured_evaluation.status || 'unknown'} />
-                    <MetricCard title="风险事件数" value={String(report.anti_cheat.events_count || 0)} icon={<TrendingUp className="h-3.5 w-3.5" />} />
+                    <InsightMetric
+                        title="停顿异常比"
+                        value={
+                            typeof speechPerf?.summary?.avg_pause_anomaly_ratio === 'number'
+                                ? `${formatNum(Number(speechPerf.summary.avg_pause_anomaly_ratio) * 100)}%`
+                                : '--'
+                        }
+                        icon={<BarChart3 className="h-4 w-4" />}
+                    />
                     <MetricCard title="会话时长" value={formatDuration(report.summary.duration_seconds)} icon={<Clock3 className="h-3.5 w-3.5" />} />
                 </div>
 
@@ -351,32 +697,6 @@ function ReportPageContent() {
                         max={100}
                     />
                     <p className="mt-2 text-xs text-[#888888]">依据：max_probability（防作弊风险峰值）</p>
-                </div>
-            </section>
-
-            <section className="rounded-3xl border border-[#E5E5E5] bg-white p-6 shadow-sm">
-                <h2 className="text-xl text-[#111111]">结构化评分维度</h2>
-                <p className="mt-2 text-sm text-[#666666]">{report.structured_evaluation.status_message || '暂无状态信息'}</p>
-                <div className="mt-4 grid gap-3">
-                    {topDimensions.length === 0 ? (
-                        <p className="rounded-xl border border-dashed border-[#D8D4CA] bg-[#FAF9F6] p-4 text-sm text-[#666666]">暂无维度评分。</p>
-                    ) : (
-                        topDimensions.map((item) => (
-                            <div key={item.key} className="rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-3">
-                                <div className="flex items-center justify-between gap-3">
-                                    <p className="text-sm font-medium text-[#111111]">{item.label}</p>
-                                    <span className="rounded-full border border-[#E5E5E5] bg-white px-3 py-1 text-xs text-[#111111]">
-                                        {Number(item.score || 0).toFixed(1)}
-                                    </span>
-                                </div>
-                                <progress
-                                    className="mt-2 h-2 w-full overflow-hidden rounded-full [appearance:none] [&::-webkit-progress-bar]:bg-[#EDEBE4] [&::-webkit-progress-value]:bg-[#5D6B8A] [&::-moz-progress-bar]:bg-[#5D6B8A]"
-                                    value={Math.max(0, Number(item.score || 0))}
-                                    max={dimensionScale}
-                                />
-                            </div>
-                        ))
-                    )}
                 </div>
             </section>
 
@@ -484,6 +804,139 @@ function ReportPageContent() {
                                 ))}
                             </div>
                         </div>
+
+                        <div className="mt-5 rounded-2xl border border-[#E5E5E5] bg-[#FCFBF8] p-4">
+                            <div className="flex items-center justify-between gap-2">
+                                <div className="flex items-center gap-2">
+                                    <ShieldCheck className="h-4 w-4 text-[#556987]" />
+                                    <p className="text-sm font-medium text-[#111111]">单题表现解读</p>
+                                </div>
+                                {!!activeTurnId && (
+                                    <button
+                                        type="button"
+                                        onClick={refreshActiveTurnAudit}
+                                        className="rounded-lg border border-[#E5E5E5] bg-white px-2.5 py-1 text-xs text-[#555555] hover:bg-[#F5F2EA]"
+                                    >
+                                        刷新本题
+                                    </button>
+                                )}
+                            </div>
+                            <p className="mt-2 text-xs text-[#888888]">选择题目后，可查看“为什么扣分”以及“下一步怎么改”。</p>
+
+                            <div className="mt-3 flex flex-wrap gap-2">
+                                {(contentPerf.question_evidence || []).slice(0, 6).map((item, index) => {
+                                    const turnId = String(item.turn_id || '').trim()
+                                    const active = turnId === activeTurnId
+                                    const disabled = !turnId
+                                    return (
+                                        <button
+                                            key={`audit-turn-${turnId || index}`}
+                                            type="button"
+                                            disabled={disabled}
+                                            onClick={() => {
+                                                if (disabled) return
+                                                if (active) {
+                                                    refreshActiveTurnAudit()
+                                                    return
+                                                }
+                                                setActiveTurnId(turnId)
+                                            }}
+                                            className={`rounded-full border px-3 py-1 text-xs transition ${active
+                                                ? 'border-[#9AA7BC] bg-[#EAF0F8] text-[#2F4566]'
+                                                : 'border-[#E0DBCF] bg-white text-[#555555] hover:bg-[#F5F2EA]'
+                                                } ${disabled ? 'cursor-not-allowed opacity-50 hover:bg-white' : ''}`}
+                                        >
+                                            题目 {index + 1} · {formatNum(item.overall_score)}{disabled ? '（缺少 turn_id）' : ''}
+                                        </button>
+                                    )
+                                })}
+                            </div>
+
+                            {scorecardLoading ? (
+                                <p className="mt-3 rounded-xl border border-dashed border-[#D8D4CA] bg-white p-4 text-sm text-[#666666]">单题证据链加载中...</p>
+                            ) : scorecardError ? (
+                                <div className="mt-3 rounded-xl border border-[#F0D7D2] bg-[#FFF6F4] p-4 text-sm text-[#8A3B3B]">
+                                    <p>{scorecardError}</p>
+                                    {!!activeTurnId && (
+                                        <button
+                                            type="button"
+                                            onClick={refreshActiveTurnAudit}
+                                            className="mt-2 rounded-lg border border-[#E5B8B1] bg-white px-3 py-1 text-xs text-[#8A3B3B] hover:bg-[#FFF0ED]"
+                                        >
+                                            重试获取证据链
+                                        </button>
+                                    )}
+                                </div>
+                            ) : activeScorecard?.evaluation ? (
+                                <>
+                                    <div className="mt-3 rounded-xl border border-[#E5E5E5] bg-white p-4">
+                                        <p className="text-sm font-medium text-[#111111]">本题结论</p>
+                                        <p className="mt-2 text-sm text-[#555555]">{activeQuestionEvidence?.question_excerpt || '暂无题干信息'}</p>
+
+                                        <div className="mt-3 grid gap-2 sm:grid-cols-3">
+                                            <div className="rounded-lg border border-[#EEE9DD] bg-[#FAF8F2] px-3 py-2">
+                                                <p className="text-xs text-[#777777]">本题得分</p>
+                                                <p className="mt-1 text-base font-semibold text-[#111111]">
+                                                    {formatNum(activeQuestionEvidence?.overall_score ?? activeScorecard.evaluation.fusion?.overall_score)}
+                                                </p>
+                                            </div>
+                                            <div className="rounded-lg border border-[#EEE9DD] bg-[#FAF8F2] px-3 py-2">
+                                                <p className="text-xs text-[#777777]">优先改进维度</p>
+                                                <p className="mt-1 text-base font-semibold text-[#111111]">{weakestDimensionLabel}</p>
+                                            </div>
+                                            <div className="rounded-lg border border-[#EEE9DD] bg-[#FAF8F2] px-3 py-2">
+                                                <p className="text-xs text-[#777777]">改进建议</p>
+                                                <p className="mt-1 text-xs leading-5 text-[#444444]">{primaryImprovementAdvice}</p>
+                                            </div>
+                                        </div>
+
+                                        {(activeQuestionEvidence?.reason_tags || []).length > 0 && (
+                                            <div className="mt-3 flex flex-wrap gap-1.5">
+                                                {(activeQuestionEvidence?.reason_tags || []).map((tag) => (
+                                                    <span key={`active-reason-tag-${tag}`} className={`rounded-full px-2 py-0.5 text-xs ${reasonTagTone(tag)}`}>
+                                                        {tag}
+                                                    </span>
+                                                ))}
+                                            </div>
+                                        )}
+
+                                        {!!activeQuestionEvidence?.answer_excerpt && (
+                                            <div className="mt-3 rounded-lg border border-[#EDEBE4] bg-[#FBFBF9] p-3">
+                                                <p className="text-xs text-[#888888]">回答摘录</p>
+                                                <p className="mt-1 text-sm text-[#555555]">{activeQuestionEvidence.answer_excerpt}</p>
+                                            </div>
+                                        )}
+                                    </div>
+
+                                    {readableDimensionCards.length > 0 ? (
+                                        <div className="mt-3 grid gap-3 md:grid-cols-2">
+                                            {readableDimensionCards.map((dimValue) => (
+                                                <div key={`dim-evidence-${dimValue.key}`} className="rounded-xl border border-[#E5E5E5] bg-white p-3">
+                                                    <div className="flex items-center justify-between gap-2">
+                                                        <p className="text-sm font-medium text-[#111111]">{dimValue.label}</p>
+                                                        <span className="rounded-full bg-[#F1EEE7] px-2 py-1 text-xs text-[#555555]">{formatNum(dimValue.score)}</span>
+                                                    </div>
+                                                    <progress
+                                                        className="mt-2 h-2 w-full overflow-hidden rounded-full [appearance:none] [&::-webkit-progress-bar]:bg-[#ECE9E1] [&::-webkit-progress-value]:bg-[#4C6A8A] [&::-moz-progress-bar]:bg-[#4C6A8A]"
+                                                        value={dimValue.scoreValue}
+                                                        max={100}
+                                                    />
+                                                    <p className="mt-2 text-xs text-[#3E7657]">做得好的点：{dimValue.highlight}</p>
+                                                    <p className="mt-1 text-xs text-[#8A3B3B]">建议改进：{dimValue.improvement}</p>
+                                                    {dimValue.quote && (
+                                                        <p className="mt-1 text-xs text-[#666666]">依据摘录：{dimValue.quote}</p>
+                                                    )}
+                                                </div>
+                                            ))}
+                                        </div>
+                                    ) : (
+                                        <p className="mt-3 rounded-xl border border-dashed border-[#D8D4CA] bg-white p-4 text-sm text-[#666666]">当前题目暂无维度级解释数据。</p>
+                                    )}
+                                </>
+                            ) : (
+                                <p className="mt-3 rounded-xl border border-dashed border-[#D8D4CA] bg-white p-4 text-sm text-[#666666]">当前单题暂无可展示的证据链数据。</p>
+                            )}
+                        </div>
                     </>
                 ) : (
                     <p className="mt-4 rounded-xl border border-dashed border-[#D8D4CA] bg-[#FAF9F6] p-4 text-sm text-[#666666]">内容表现证据暂不可用。</p>
@@ -504,21 +957,26 @@ function ReportPageContent() {
                     <InsightMetric title="语音样本数" value={String(speechPerf?.summary?.samples || 0)} icon={<Mic className="h-4 w-4" />} />
                 </div>
 
-                {(speechPerf?.dimensions || []).length > 0 && (
-                    <div className="mt-4 grid gap-3 md:grid-cols-2">
-                        {(speechPerf?.dimensions || []).map((dim) => (
-                            <div key={dim.key} className="rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-3">
-                                <div className="flex items-center justify-between gap-2">
-                                    <p className="text-sm font-medium text-[#111111]">{dim.label}</p>
-                                    <span className="rounded-full bg-white px-2 py-1 text-xs text-[#555555]">{formatNum(dim.score)}</span>
-                                </div>
-                                <progress
-                                    className="mt-2 h-2 w-full overflow-hidden rounded-full [appearance:none] [&::-webkit-progress-bar]:bg-[#ECE9E1] [&::-webkit-progress-value]:bg-[#4C6A8A] [&::-moz-progress-bar]:bg-[#4C6A8A]"
-                                    value={Math.max(0, Number(dim.score || 0))}
-                                    max={100}
-                                />
+                {speechRadarDimensions.length > 0 && (
+                    <div className="mt-4 grid gap-4 xl:grid-cols-[1.15fr,0.85fr]">
+                        <RadarSnapshot dimensions={speechRadarDimensions} title="语音能力雷达" />
+                        <div className="rounded-2xl border border-[#E5E5E5] bg-[#FAF9F6] p-4">
+                            <p className="text-sm font-medium text-[#111111]">优先改进项（语音）</p>
+                            <p className="mt-1 text-xs text-[#888888]">按得分从低到高排序，建议优先提升前两项。</p>
+                            <div className="mt-3 space-y-2">
+                                {speechWeakItems.map((item, index) => (
+                                    <div key={`speech-weak-${item.key}`} className="rounded-xl border border-[#E5E5E5] bg-white px-3 py-2">
+                                        <div className="flex items-center justify-between gap-2">
+                                            <p className="text-sm text-[#111111]">{index + 1}. {item.label}</p>
+                                            <span className="rounded-full bg-[#FDECEC] px-2 py-0.5 text-xs text-[#8A3B3B]">{formatNum(item.score)}</span>
+                                        </div>
+                                        <p className="mt-1 text-xs text-[#666666]">
+                                            {item.score < 60 ? '较弱：建议优先训练，重点改善表达稳定性。' : item.score < 75 ? '偏弱：建议通过模拟问答提升这一项。' : '可继续保持，重点巩固稳定输出。'}
+                                        </p>
+                                    </div>
+                                ))}
                             </div>
-                        ))}
+                        </div>
                     </div>
                 )}
 
@@ -561,6 +1019,75 @@ function ReportPageContent() {
                     <InsightMetric title="多人同框次数" value={String(cameraStats?.total_multi_person || 0)} icon={<Users className="h-4 w-4" />} />
                 </div>
 
+                {(cameraInsights && Number(cameraInsights.sample_count || 0) > 0) && (
+                    <div className="mt-4 space-y-4">
+                        <div className="grid gap-3 lg:grid-cols-2">
+                            <div className="rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-4">
+                                <p className="text-sm font-medium text-[#111111]">1. 478 个 3D 人脸关键点</p>
+                                <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-[#555555]">
+                                    <DataPill label="平均关键点数" value={formatNum(cameraLandmarks?.avg_landmark_count, 1)} />
+                                    <DataPill label="最大关键点数" value={formatNum(cameraLandmarks?.max_landmark_count, 0)} />
+                                    <DataPill label="嘴部开合比" value={formatNum(cameraLandmarks?.avg_mouth_open_ratio, 4)} />
+                                    <DataPill label="微动方差" value={formatNum(cameraLandmarks?.avg_micro_movement_variance, 6)} />
+                                    <DataPill label="距离Z均值" value={formatNum(cameraLandmarks?.avg_face_distance_z, 4)} />
+                                    <DataPill label="过近/过远" value={`${formatNum(cameraLandmarks?.close_ratio)}% / ${formatNum(cameraLandmarks?.far_ratio)}%`} />
+                                </div>
+                            </div>
+
+                            <div className="rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-4">
+                                <p className="text-sm font-medium text-[#111111]">2. 52 个表情系数（Blendshapes）</p>
+                                <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-[#555555]">
+                                    <DataPill label="跟踪系数数" value={formatNum(cameraBlendshape?.tracked_count_max, 0)} />
+                                    <DataPill label="眨眼频率" value={`${formatNum(cameraBlendshape?.avg_blink_rate_per_min, 1)} 次/分钟`} />
+                                    <DataPill label="browInnerUp" value={formatNum(cameraBlendshape?.avg_brow_inner_up, 4)} />
+                                    <DataPill label="微笑均值" value={formatNum(cameraBlendshape?.avg_smile, 4)} />
+                                    <DataPill label="jawOpen" value={formatNum(cameraBlendshape?.avg_jaw_open, 4)} />
+                                    <DataPill label="言语表现力" value={formatNum(cameraBlendshape?.avg_speech_expressiveness, 2)} />
+                                </div>
+                            </div>
+
+                            <div className="rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-4">
+                                <p className="text-sm font-medium text-[#111111]">3. 头部姿态（Pitch / Yaw / Roll）</p>
+                                <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-[#555555]">
+                                    <DataPill label="平均 |Pitch|" value={`${formatNum(cameraHeadPose?.avg_abs_pitch, 2)}°`} />
+                                    <DataPill label="平均 |Yaw|" value={`${formatNum(cameraHeadPose?.avg_abs_yaw, 2)}°`} />
+                                    <DataPill label="平均 |Roll|" value={`${formatNum(cameraHeadPose?.avg_abs_roll, 2)}°`} />
+                                    <DataPill label="姿态异常帧占比" value={`${formatNum(cameraHeadPose?.high_pose_ratio, 2)}%`} />
+                                </div>
+                            </div>
+
+                            <div className="rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-4">
+                                <p className="text-sm font-medium text-[#111111]">4. 虹膜追踪（Iris Tracking）</p>
+                                <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-[#555555]">
+                                    <DataPill label="平均注视偏移" value={formatNum(cameraIris?.avg_gaze_offset_magnitude, 4)} />
+                                    <DataPill label="平均聚焦分" value={formatNum(cameraIris?.avg_gaze_focus_score, 2)} />
+                                    <DataPill label="最大漂移计数" value={formatNum(cameraIris?.max_drift_count, 0)} />
+                                    <DataPill label="漂移跃迁次数" value={formatNum(cameraIris?.drift_jumps, 0)} />
+                                </div>
+                            </div>
+                        </div>
+
+                        {topBlendshapeAverages.length > 0 && (
+                            <div className="rounded-xl border border-[#E5E5E5] bg-[#F8F7F3] p-4">
+                                <p className="text-sm font-medium text-[#111111]">表情系数活跃度 Top 8（柱状）</p>
+                                <div className="mt-3 space-y-2">
+                                    {topBlendshapeAverages.map(([name, value]) => (
+                                        <div key={name} className="grid grid-cols-[120px,1fr,52px] items-center gap-2 text-xs">
+                                            <span className="truncate text-[#666666]">{name}</span>
+                                            <progress
+                                                className="h-2 w-full overflow-hidden rounded-full [appearance:none] [&::-webkit-progress-bar]:bg-[#ECE9E1] [&::-webkit-progress-value]:bg-[#4C6A8A] [&::-moz-progress-bar]:bg-[#4C6A8A]"
+                                                value={Math.max(0, Math.min(1, Number(value || 0)))}
+                                                max={1}
+                                            />
+                                            <span className="text-right text-[#555555]">{formatNum(value, 4)}</span>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                )}
+
                 {(cameraPerf?.notes || []).length > 0 && (
                     <div className="mt-4 rounded-xl border border-[#E5E5E5] bg-[#F8F7F3] p-4 text-sm text-[#555555]">
                         {(cameraPerf?.notes || []).map((note, index) => (
@@ -579,18 +1106,59 @@ function ReportPageContent() {
                     </div>
                 )}
 
-                {cameraTopEvents.length > 0 && (
-                    <div className="mt-4 grid gap-3 md:grid-cols-2">
-                        {cameraTopEvents.slice(0, 4).map((event, index) => (
-                            <div key={`${event.event_type}-${event.timestamp}-${index}`} className="rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-3">
-                                <div className="flex items-center justify-between gap-2">
-                                    <p className="text-sm font-medium text-[#111111]">{eventLabel(event.event_type)}</p>
-                                    <span className="rounded-full bg-white px-2 py-1 text-xs text-[#666666]">{formatNum(event.score)}</span>
-                                </div>
-                                <p className="mt-1 text-sm text-[#555555]">{event.description || '无补充描述'}</p>
-                                <p className="mt-1 text-xs text-[#888888]">发生时间：{formatEventTime(event.timestamp)}</p>
+                {gazeTrendData.length > 1 && (
+                    <div className="mt-4 rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-4">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                            <p className="text-sm font-medium text-[#111111]">视线专注度曲线（面试全程）</p>
+                            <div className="flex flex-wrap items-center gap-2 text-xs text-[#666666]">
+                                <span className="rounded-full bg-white px-2 py-1">均值 {formatNum(cameraInsights?.gaze_focus_summary?.avg_focus_score, 1)}</span>
+                                <span className="rounded-full bg-white px-2 py-1">低专注占比 {formatNum(cameraInsights?.gaze_focus_summary?.low_focus_ratio, 1)}%</span>
+                                <span className="rounded-full bg-white px-2 py-1">最低值 {formatNum(cameraInsights?.gaze_focus_summary?.min_focus_score, 1)}</span>
                             </div>
-                        ))}
+                        </div>
+                        <div className="mt-3 h-72 w-full">
+                            <ResponsiveContainer width="100%" height="100%">
+                                <LineChart data={gazeTrendData} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
+                                    <CartesianGrid stroke="#E7E3D8" strokeDasharray="3 3" />
+                                    <ReferenceArea y1={0} y2={60} fill="#FCEBE9" fillOpacity={0.35} />
+                                    <XAxis dataKey="second" tick={{ fontSize: 11, fill: '#666666' }} tickFormatter={formatSecondsLabel} />
+                                    <YAxis domain={[0, 100]} tick={{ fontSize: 11, fill: '#666666' }} />
+                                    <Tooltip
+                                        formatter={(value: unknown, name: string) => {
+                                            const num = Number(value)
+                                            const normalized = Number.isFinite(num) ? num.toFixed(1) : '--'
+                                            if (name === 'focus') return [`${normalized}`, '专注度']
+                                            if (name === 'offscreen') return [`${normalized}%`, '离屏占比']
+                                            return [`${normalized}%`, '风险热度']
+                                        }}
+                                        labelFormatter={(label) => `时间 ${formatSecondsLabel(label)}`}
+                                        contentStyle={{ borderRadius: 10, borderColor: '#E5E5E5' }}
+                                    />
+                                    <Line type="monotone" dataKey="focus" name="focus" stroke="#3E7657" strokeWidth={2.2} dot={false} />
+                                    <Line type="monotone" dataKey="offscreen" name="offscreen" stroke="#C17C2D" strokeDasharray="4 4" strokeWidth={1.6} dot={false} />
+                                    <Line type="monotone" dataKey="risk" name="risk" stroke="#9D3A2E" strokeOpacity={0.65} strokeWidth={1.4} dot={false} />
+                                </LineChart>
+                            </ResponsiveContainer>
+                        </div>
+
+                        {gazeTrendValleys.length > 0 && (
+                            <div className="mt-3 rounded-lg border border-[#E5E5E5] bg-white p-3">
+                                <p className="text-xs text-[#777777]">专注度最低时段（优先复盘）</p>
+                                <div className="mt-2 flex flex-wrap gap-2">
+                                    {gazeTrendValleys.map((point, idx) => (
+                                        <span key={`valley-${idx}`} className="rounded-full bg-[#FDECEC] px-2.5 py-1 text-xs text-[#8A3B3B]">
+                                            {formatSecondsLabel(point.second)} · 专注 {formatNum(point.focus, 1)}
+                                        </span>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                )}
+
+                {gazeTrendData.length <= 1 && cameraTopEvents.length > 0 && (
+                    <div className="mt-4 rounded-xl border border-dashed border-[#D8D4CA] bg-[#FAF9F6] p-4 text-sm text-[#666666]">
+                        暂无可绘制的专注度曲线数据，当前仅保留异常事件摘要。建议进行一场新会话以生成完整曲线。
                     </div>
                 )}
             </section>
@@ -653,7 +1221,22 @@ function InsightMetric({ title, value, icon }: { title: string; value: string; i
     )
 }
 
-function RadarSnapshot({ dimensions }: { dimensions: Array<{ key: string; label: string; score: number }> }) {
+function DataPill({ label, value }: { label: string; value: string }) {
+    return (
+        <div className="rounded-lg border border-[#E5E5E5] bg-white px-2.5 py-1.5">
+            <p className="text-[11px] text-[#888888]">{label}</p>
+            <p className="mt-0.5 text-xs font-medium text-[#333333]">{value}</p>
+        </div>
+    )
+}
+
+function RadarSnapshot({
+    dimensions,
+    title = '多维能力雷达',
+}: {
+    dimensions: Array<{ key: string; label: string; score: number }>
+    title?: string
+}) {
     const normalized = (dimensions || []).slice(0, 6)
     if (normalized.length < 3) {
         return <p className="rounded-xl border border-dashed border-[#D8D4CA] bg-[#FAF9F6] p-4 text-sm text-[#666666]">维度数据不足，无法绘制雷达图。</p>
@@ -662,6 +1245,7 @@ function RadarSnapshot({ dimensions }: { dimensions: Array<{ key: string; label:
     const size = 220
     const center = size / 2
     const radius = 74
+    const viewBoxPadding = 34
     const total = normalized.length
 
     const pointAt = (index: number, ratio: number) => {
@@ -698,12 +1282,15 @@ function RadarSnapshot({ dimensions }: { dimensions: Array<{ key: string; label:
     return (
         <div className="rounded-2xl border border-[#E5E5E5] bg-[#FAF9F6] p-4">
             <div className="flex flex-wrap items-center justify-between gap-2">
-                <p className="text-sm font-medium text-[#111111]">多维能力雷达</p>
+                <p className="text-sm font-medium text-[#111111]">{title}</p>
                 <p className="text-xs text-[#777777]">分值范围 0-100</p>
             </div>
 
             <div className="mt-4 flex flex-col gap-4 md:flex-row md:items-start">
-                <svg viewBox="0 0 220 220" className="h-[220px] w-[220px] shrink-0">
+                <svg
+                    viewBox={`${-viewBoxPadding} ${-viewBoxPadding} ${size + viewBoxPadding * 2} ${size + viewBoxPadding * 2}`}
+                    className="h-[240px] w-[240px] shrink-0"
+                >
                     {levelPolygons.map((item) => (
                         <polygon key={`grid-${item.ratio}`} points={item.points} fill="none" stroke="#DDD7CA" strokeWidth="1" />
                     ))}

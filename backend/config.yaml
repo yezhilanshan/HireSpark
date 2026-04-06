@@ -120,7 +120,7 @@ llm:
   provider: "qwen"  # qwen
   model: "qwen-max"  # 阿里通义 Qwen 模型（文本）
   vision_model: "qwen-vl-max"  # 阿里通义视觉模型（用于简历识别等）
-  tts_model: "cosyvoice-v1"  # 阿里通义语音模型（TTS）
+  tts_model: "cosyvoice-v3-flash"  # 阿里通义语音模型（TTS）
   api_key: "${BAILIAN_API_KEY}"  # 从环境变量读取
   api_base_url: ""
   timeout: 30  # 秒
@@ -131,6 +131,31 @@ llm:
     difficulty_levels: ["easy", "medium", "hard"]
     initial_difficulty: "medium"
     max_questions_per_round: 3
+
+# ====================================
+# 全局 AI 助理配置（非面试链路）
+# ====================================
+assistant:
+  enabled: true
+  provider: "openrouter"
+  model: "stepfun/step-3.5-flash:free"
+  timeout: 60
+  max_history: 6
+  max_context_chars: 1200
+  default_max_tokens: 512
+  default_temperature: 0.25
+  force_plain_text: true
+  default_system_prompt: "你是一个专业、简洁、可信的中文求职助手。重点帮助用户准备技术面试、梳理项目表达、优化简历表述，并提供可执行建议。回答请直奔主题，先给结论，再给关键理由。"
+  openrouter:
+    base_url: "https://openrouter.ai/api/v1"
+    api_key: ""
+    site_url: ""
+    app_name: "tianshuzhimian"
+  ollama:
+    base_url: "http://127.0.0.1:11434"
+    think: false
+    num_ctx: 1536
+    keep_alive: "2m"
 
 # ====================================
 # TTS 配置

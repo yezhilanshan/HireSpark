@@ -5,8 +5,9 @@ import { Suspense, useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'next/navigation'
 import { AlertTriangle, ArrowRight, CheckCircle, CheckCircle2, Clock3, FileText, Radar, type LucideIcon } from 'lucide-react'
 import PersistentSidebar from '@/components/PersistentSidebar'
+import { getBackendBaseUrl } from '@/lib/backend'
 
-const BACKEND_API_BASE = (process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:5000').replace(/\/$/, '')
+const BACKEND_API_BASE = getBackendBaseUrl()
 
 type GrowthReport = {
     summary: {

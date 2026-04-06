@@ -1,6 +1,7 @@
 """
 三层评价服务测试
 """
+import json
 import os
 import tempfile
 import time
@@ -341,7 +342,7 @@ class EvaluationServiceTestCase(unittest.TestCase):
                         break
                 time.sleep(0.15)
 
-            self.assertEqual(final_status, "skipped")
+            self.assertEqual(final_status, "partial_ok")
         finally:
             eval_service.shutdown()
 
@@ -390,8 +391,8 @@ class EvaluationServiceTestCase(unittest.TestCase):
             self.assertAlmostEqual(layer2["speech_adjustments"]["logic"], 0.0, places=2)
             self.assertAlmostEqual(layer2["final_dimension_scores"]["completeness"]["score"], 70.0, places=2)
             self.assertAlmostEqual(layer2["final_dimension_scores"]["technical_accuracy"]["score"], 92.0, places=2)
-            self.assertAlmostEqual(layer2["overall_score_final"], 76.0, places=2)
-            self.assertFalse(layer2.get("speech_used"))
+            self.assertAlmostEqual(layer2["overall_score_final"], 75.4, places=2)
+            self.assertTrue(layer2.get("speech_used"))
 
             speech_layer = eval_service.evaluate_speech_layer(payload)
             self.assertEqual(speech_layer.get("status"), "ready")
@@ -406,7 +407,7 @@ class EvaluationServiceTestCase(unittest.TestCase):
                 speech_layer=speech_layer,
                 video_layer=video_layer,
             )
-            self.assertEqual(evaluation_v2.get("schema_version"), "evaluation_v2")
+            self.assertEqual(evaluation_v2.get("schema_version"), "evaluation_v2.1")
             self.assertIn("fusion", evaluation_v2)
             self.assertIsNotNone((evaluation_v2.get("fusion") or {}).get("overall_score"))
         finally:
@@ -454,6 +455,175 @@ class EvaluationServiceTestCase(unittest.TestCase):
             reasons = ((speech_layer.get("summary") or {}).get("quality_gate") or {}).get("reasons") or []
             self.assertIn("audio_duration_below_threshold", reasons)
             self.assertIn("token_count_below_threshold", reasons)
+        finally:
+            eval_service.shutdown()
+
+    def test_fusion_contains_explainable_fields_and_rejections(self):
+        eval_service = EvaluationService(
+            db_manager=self.db,
+            rag_service=_StubRAG(),
+            llm_manager=_StubLLMScored(),
+        )
+        try:
+            text_layer = {
+                "status": "ready",
+                "overall_score": 80.0,
+            }
+            speech_layer = {
+                "status": "insufficient_data",
+                "overall_score": None,
+                "summary": {
+                    "quality_gate": {
+                        "reasons": ["audio_duration_below_threshold"],
+                    }
+                },
+            }
+            video_layer = {
+                "status": "unavailable",
+                "overall_score": None,
+                "summary": {
+                    "reason": "missing_video_context",
+                },
+            }
+
+            fusion = eval_service.fuse_layer_scores(text_layer, speech_layer, video_layer)
+            self.assertEqual(fusion.get("status"), "ready")
+            self.assertIn("layer_scores", fusion)
+            self.assertIn("rejection_reasons", fusion)
+            self.assertIn("weight_normalization", fusion)
+            self.assertIn("calculation_steps", fusion)
+            self.assertEqual(float((fusion.get("layer_scores") or {}).get("text", 0.0)), 80.0)
+            self.assertIn("delivery", (fusion.get("rejection_reasons") or {}))
+            self.assertIn("presence", (fusion.get("rejection_reasons") or {}))
+            self.assertGreaterEqual(len(fusion.get("calculation_steps") or []), 1)
+            self.assertIn("shortboard_penalty", fusion)
+        finally:
+            eval_service.shutdown()
+
+    def test_shortboard_penalty_applies_for_low_core_dimension(self):
+        eval_service = EvaluationService(
+            db_manager=self.db,
+            rag_service=_StubRAG(),
+            llm_manager=_StubLLMScored(),
+        )
+        try:
+            content_layer = {
+                "status": "ready",
+                "overall_score": 86.0,
+                "confidence": 0.95,
+                "dimension_scores": {
+                    "technical_accuracy": {"score": 42.0, "reason": "核心准确性明显不足"},
+                },
+            }
+            delivery_layer = {
+                "status": "ready",
+                "overall_score": 88.0,
+                "confidence": 0.7,
+            }
+            presence_layer = {
+                "status": "ready",
+                "overall_score": 90.0,
+                "confidence": 0.6,
+            }
+
+            fusion = eval_service.fuse_layer_scores(
+                content_layer,
+                delivery_layer,
+                presence_layer,
+                integrity_layer={"status": "ready", "signals": [], "veto": False, "risk_level": "low", "risk_index": 5.0},
+                round_type="technical",
+            )
+            shortboard = fusion.get("shortboard_penalty") or {}
+
+            self.assertTrue(shortboard.get("applied"))
+            self.assertLess(float(shortboard.get("coefficient") or 1.0), 1.0)
+            self.assertGreater(
+                float(fusion.get("overall_score_before_shortboard") or 0.0),
+                float(fusion.get("overall_score") or 0.0),
+            )
+        finally:
+            eval_service.shutdown()
+
+    def test_integrity_veto_flags_result_without_zeroing_score(self):
+        eval_service = EvaluationService(
+            db_manager=self.db,
+            rag_service=_StubRAG(),
+            llm_manager=_StubLLMScored(),
+        )
+        try:
+            fusion = eval_service.fuse_layer_scores(
+                {"status": "ready", "overall_score": 80.0, "confidence": 0.9, "dimension_scores": {"technical_accuracy": {"score": 80}}},
+                {"status": "ready", "overall_score": 75.0, "confidence": 0.8},
+                {"status": "ready", "overall_score": 70.0, "confidence": 0.7},
+                integrity_layer={
+                    "status": "ready",
+                    "risk_level": "high",
+                    "risk_index": 92.0,
+                    "signals": [{"code": "multi_person", "severity": "critical", "score": 95.0}],
+                    "veto": True,
+                },
+                round_type="technical",
+            )
+            self.assertEqual(fusion.get("status"), "risk_flagged")
+            self.assertTrue(((fusion.get("integrity") or {}).get("veto")))
+            self.assertIsNotNone(fusion.get("overall_score"))
+        finally:
+            eval_service.shutdown()
+
+    def test_async_enqueue_persists_snapshot_and_traces(self):
+        self._ensure_interview("i_trace_001")
+        eval_service = EvaluationService(
+            db_manager=self.db,
+            rag_service=_StubRAG(),
+            llm_manager=_StubLLMScored(),
+        )
+        try:
+            enqueue = eval_service.enqueue_evaluation(
+                interview_id="i_trace_001",
+                turn_id="turn_1",
+                question_id="q_trace_1",
+                user_id="default",
+                round_type="technical",
+                position="java_backend",
+                question="HashMap 原理？",
+                answer="底层是数组+链表+红黑树。扩容时会重哈希。",
+            )
+            self.assertTrue(enqueue.get("success"))
+
+            deadline = time.time() + 10
+            final_record = None
+            while time.time() < deadline:
+                final_record = self.db.get_evaluation_record("i_trace_001", "turn_1", "v1")
+                if final_record and str(final_record.get("status", "")).strip() not in {"pending", "running"}:
+                    break
+                time.sleep(0.2)
+
+            self.assertIsNotNone(final_record)
+            self.assertIn(str(final_record.get("status", "")).strip(), {"ok", "partial_ok", "skipped"})
+
+            snapshot_json = str(final_record.get("scoring_snapshot_json") or "{}").strip() or "{}"
+            snapshot = json.loads(snapshot_json)
+            self.assertIn("evaluation_version", snapshot)
+            self.assertIn("layer_weights", snapshot)
+            self.assertIn("speech_gate", snapshot)
+
+            layer2_json = str(final_record.get("layer2_json") or "{}").strip() or "{}"
+            layer2 = json.loads(layer2_json)
+            self.assertIn("dimension_evidence_json", layer2)
+
+            traces = self.db.get_evaluation_traces("i_trace_001", "turn_1")
+            self.assertGreaterEqual(len(traces), 6)
+            event_types = [str(item.get("event_type") or "") for item in traces]
+            for expected in [
+                "task_enqueued",
+                "task_running",
+                "layer1_done",
+                "layer2_done",
+                "fusion_done",
+                "persist_done",
+                "task_finished",
+            ]:
+                self.assertIn(expected, event_types)
         finally:
             eval_service.shutdown()
 
