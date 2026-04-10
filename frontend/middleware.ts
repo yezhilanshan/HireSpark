@@ -2,43 +2,22 @@ import { NextRequest, NextResponse } from 'next/server'
 
 const AUTH_COOKIE_NAME = 'panelmind_session'
 
-type AuthSession = {
-    email: string
-    name: string
-    exp: number
-}
-
-function parseSessionCookieValue(value?: string | null): AuthSession | null {
+function parseSessionExpiry(value?: string | null): number | null {
     try {
         const raw = String(value || '').trim()
         if (!raw) return null
-        const [expRaw, emailRaw, nameRaw] = raw.split('|')
+        const [expRaw] = raw.split('|')
         const exp = Number(expRaw)
         if (!Number.isFinite(exp) || exp <= 0) return null
-        const email = decodeURIComponent(String(emailRaw || '')).trim().toLowerCase()
-        const name = decodeURIComponent(String(nameRaw || '')).trim()
-        if (!email || !name) return null
-        return { email, name, exp }
+        return exp
     } catch {
         return null
     }
 }
 
-function isSessionValid(session: AuthSession | null | undefined): session is AuthSession {
-    if (!session) return false
-    return session.exp > Math.floor(Date.now() / 1000)
-}
-
-function shouldUseSecureCookies(): boolean {
-    const explicit = String(process.env.AUTH_COOKIE_SECURE || '').trim().toLowerCase()
-    if (explicit === 'true' || explicit === '1' || explicit === 'yes') return true
-    if (explicit === 'false' || explicit === '0' || explicit === 'no') return false
-
-    const publicSiteUrl = String(process.env.PUBLIC_SITE_URL || '').trim().toLowerCase()
-    if (publicSiteUrl.startsWith('https://')) return true
-    if (publicSiteUrl.startsWith('http://')) return false
-
-    return false
+function isSessionValid(expiry: number | null | undefined): boolean {
+    if (!expiry) return false
+    return expiry > Math.floor(Date.now() / 1000)
 }
 
 const PROTECTED_PREFIXES = [
@@ -62,22 +41,13 @@ function isProtectedPath(pathname: string): boolean {
 export function middleware(request: NextRequest) {
     try {
         const { pathname, search } = request.nextUrl
-        const session = parseSessionCookieValue(request.cookies.get(AUTH_COOKIE_NAME)?.value)
-        const authenticated = isSessionValid(session)
+        const cookieValue = request.cookies.get(AUTH_COOKIE_NAME)?.value
+        const authenticated = isSessionValid(parseSessionExpiry(cookieValue))
 
         if (pathname === '/') {
             const response = NextResponse.next()
-            if (request.cookies.get(AUTH_COOKIE_NAME)?.value) {
-                response.cookies.set({
-                    name: AUTH_COOKIE_NAME,
-                    value: '',
-                    httpOnly: true,
-                    sameSite: 'lax',
-                    secure: shouldUseSecureCookies(),
-                    path: '/',
-                    expires: new Date(0),
-                    maxAge: 0,
-                })
+            if (cookieValue) {
+                response.cookies.delete(AUTH_COOKIE_NAME)
             }
             return response
         }
