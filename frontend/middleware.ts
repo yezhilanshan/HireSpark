@@ -1,5 +1,41 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { AUTH_COOKIE_NAME, isSessionValid, parseSessionCookieValue, resolveSafeRedirect, shouldUseSecureCookies } from '@/lib/auth'
+
+const AUTH_COOKIE_NAME = 'panelmind_session'
+
+type AuthSession = {
+    email: string
+    name: string
+    exp: number
+}
+
+function parseSessionCookieValue(value?: string | null): AuthSession | null {
+    const raw = String(value || '').trim()
+    if (!raw) return null
+    const [expRaw, emailRaw, nameRaw] = raw.split('|')
+    const exp = Number(expRaw)
+    if (!Number.isFinite(exp) || exp <= 0) return null
+    const email = decodeURIComponent(String(emailRaw || '')).trim().toLowerCase()
+    const name = decodeURIComponent(String(nameRaw || '')).trim()
+    if (!email || !name) return null
+    return { email, name, exp }
+}
+
+function isSessionValid(session: AuthSession | null | undefined): session is AuthSession {
+    if (!session) return false
+    return session.exp > Math.floor(Date.now() / 1000)
+}
+
+function shouldUseSecureCookies(): boolean {
+    const explicit = String(process.env.AUTH_COOKIE_SECURE || '').trim().toLowerCase()
+    if (explicit === 'true' || explicit === '1' || explicit === 'yes') return true
+    if (explicit === 'false' || explicit === '0' || explicit === 'no') return false
+
+    const publicSiteUrl = String(process.env.PUBLIC_SITE_URL || '').trim().toLowerCase()
+    if (publicSiteUrl.startsWith('https://')) return true
+    if (publicSiteUrl.startsWith('http://')) return false
+
+    return false
+}
 
 const PROTECTED_PREFIXES = [
     '/dashboard',
