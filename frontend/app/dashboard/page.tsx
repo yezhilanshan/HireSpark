@@ -190,9 +190,9 @@ function formatSessionMeta(record: InterviewRecord): string {
         targetDay.setHours(0, 0, 0, 0)
         const delta = Math.floor((todayStart.getTime() - targetDay.getTime()) / (1000 * 60 * 60 * 24))
         if (delta === 0) {
-            dayLabel = 'Today'
+            dayLabel = '今天'
         } else if (delta === 1) {
-            dayLabel = 'Yesterday'
+            dayLabel = '昨天'
         } else {
             dayLabel = `${time.getMonth() + 1}/${time.getDate()}`
         }
@@ -205,19 +205,19 @@ function formatSessionMeta(record: InterviewRecord): string {
 
     const minutes = Math.round(duration / 60)
     if (minutes <= 0) {
-        return `${dayLabel} • ${duration}s`
+        return `${dayLabel} ${duration} 秒`
     }
-    return `${dayLabel} • ${minutes}m`
+    return `${dayLabel} ${minutes} 分钟`
 }
 
 function buildSessionTitle(record: InterviewRecord, index: number): string {
     const risk = (record.risk_level || '').toUpperCase()
-    if (risk === 'LOW') return 'Behavioral: Stability Check'
-    if (risk === 'MEDIUM') return 'Execution: Response Refinement'
-    if (risk === 'HIGH') return 'Pressure: Recovery Practice'
+    if (risk === 'LOW') return '行为稳定性检查'
+    if (risk === 'MEDIUM') return '表达执行力优化'
+    if (risk === 'HIGH') return '压力恢复训练'
 
     const suffix = record.interview_id ? `#${record.interview_id.slice(-4)}` : `#${index + 1}`
-    return `Comprehensive Interview ${suffix}`
+    return `综合面试 ${suffix}`
 }
 
 function average(values: number[]): number {
@@ -226,9 +226,9 @@ function average(values: number[]): number {
 }
 
 function formatWeeklyDelta(delta: number): string {
-    if (delta > 0) return `+${delta.toFixed(1)} points this week`
-    if (delta < 0) return `${delta.toFixed(1)} points this week`
-    return 'Stable this week'
+    if (delta > 0) return `较上周提升 ${delta.toFixed(1)} 分`
+    if (delta < 0) return `较上周下降 ${Math.abs(delta).toFixed(1)} 分`
+    return '与上周基本持平'
 }
 
 function getAvatarInitial(name: string): string {
@@ -417,13 +417,13 @@ export default function HomePage() {
 
                     <div className="flex items-center gap-6">
                         <div className="hidden items-center gap-2 rounded-full border border-[#E5E5E5] bg-white px-3 py-1.5 text-xs text-[#999999] shadow-sm md:flex">
-                            <span className="font-medium">Press</span>
+                            <span className="font-medium">快捷键</span>
                             <kbd className="rounded bg-[#F5F5F5] px-1.5 py-0.5 text-[#111111]">Ctrl K</kbd>
                         </div>
                         <div className="flex items-center gap-4">
                             <div className="hidden text-right sm:block">
                                 <p className="text-sm font-medium text-[#111111]">{state.targetRole}</p>
-                                <p className="text-xs text-[#999999]">Target Role</p>
+                                <p className="text-xs text-[#999999]">目标岗位</p>
                             </div>
                             <div className="flex h-10 w-10 items-center justify-center rounded-full bg-[#EBE9E0] font-medium text-[#111111]">
                                 {avatarInitial}
@@ -436,10 +436,10 @@ export default function HomePage() {
                     <Card className="flex flex-col items-start justify-between gap-6 border-[#E5E5E5] bg-white p-8 transition-shadow duration-300 hover:shadow-[0_8px_24px_rgba(0,0,0,0.04)] md:flex-row md:items-center">
                         <div className="space-y-2">
                             <div className="flex items-center gap-3">
-                                <Badge variant="neutral">Recommended</Badge>
-                                <span className="text-sm text-[#666666]">Est. 30 mins</span>
+                                <Badge variant="neutral">推荐</Badge>
+                                <span className="text-sm text-[#666666]">预计 30 分钟</span>
                             </div>
-                            <h2 className="text-xl font-medium text-[#111111]">Comprehensive Interview Simulation</h2>
+                            <h2 className="text-xl font-medium text-[#111111]">综合面试模拟</h2>
                             <p className="max-w-lg text-sm leading-relaxed text-[#666666]">
                                 围绕 {state.targetRole} 场景进行完整模拟，重点强化 {state.weakestLabel}，并生成结构化复盘建议。
                             </p>
@@ -451,7 +451,7 @@ export default function HomePage() {
                             className="group shrink-0 gap-2"
                         >
                             <Play className="h-4 w-4 transition-transform group-hover:scale-110" fill="currentColor" />
-                            Begin Simulation
+                            开始模拟
                         </Button>
                     </Card>
                 </motion.div>
@@ -464,12 +464,12 @@ export default function HomePage() {
 
                 <motion.section variants={itemVariants} className="grid grid-cols-1 gap-6 md:grid-cols-3">
                     <div className="col-span-1 space-y-6">
-                        <h3 className="text-sm font-medium uppercase tracking-wider text-[#999999]">Overview</h3>
+                        <h3 className="text-sm font-medium uppercase tracking-wider text-[#999999]">总览</h3>
                         <Card className="space-y-6 p-6 transition-shadow duration-300 hover:shadow-[0_8px_24px_rgba(0,0,0,0.04)]">
                             <div>
                                 <p className="mb-1 flex items-center gap-2 text-sm text-[#666666]">
                                     <Target className="h-4 w-4" />
-                                    Average Score
+                                    平均得分
                                 </p>
                                 <p className="text-3xl font-serif text-[#111111]">
                                     {state.averageScore ? state.averageScore.toFixed(1) : '--'}
@@ -484,11 +484,11 @@ export default function HomePage() {
                             <div>
                                 <p className="mb-1 flex items-center gap-2 text-sm text-[#666666]">
                                     <Clock3 className="h-4 w-4" />
-                                    Practice Time
+                                    练习时长
                                 </p>
                                 <p className="text-2xl font-serif text-[#111111]">
                                     {state.practiceHours ? state.practiceHours.toFixed(1) : '0.0'}
-                                    <span className="text-base font-sans text-[#999999]"> hrs</span>
+                                    <span className="text-base font-sans text-[#999999]"> 小时</span>
                                 </p>
                             </div>
                         </Card>
@@ -496,12 +496,12 @@ export default function HomePage() {
 
                     <div className="col-span-1 space-y-6 md:col-span-2">
                         <div className="flex items-center justify-between">
-                            <h3 className="text-sm font-medium uppercase tracking-wider text-[#999999]">Recent Sessions</h3>
+                            <h3 className="text-sm font-medium uppercase tracking-wider text-[#999999]">最近记录</h3>
                             <button
                                 onClick={() => router.push('/history')}
                                 className="group inline-flex items-center gap-1 text-sm text-[#666666] transition hover:text-[#111111]"
                             >
-                                View all
+                                查看全部
                                 <ArrowRight className="h-3.5 w-3.5 transition-transform group-hover:translate-x-1" />
                             </button>
                         </div>
@@ -518,7 +518,7 @@ export default function HomePage() {
                                         </div>
                                         <div className="shrink-0 text-right">
                                             <p className="text-lg font-serif text-[#111111]">{session.score === null ? '--' : session.score.toFixed(1)}</p>
-                                            <p className="text-xs text-[#999999]">Score</p>
+                                            <p className="text-xs text-[#999999]">得分</p>
                                         </div>
                                     </Card>
                                 </motion.div>

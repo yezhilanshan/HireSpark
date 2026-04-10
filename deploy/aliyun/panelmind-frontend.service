@@ -1,0 +1,16 @@
+[Unit]
+Description=PanelMind Frontend
+After=network.target panelmind-backend.service
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/panelmind/frontend
+EnvironmentFile=/opt/panelmind/.env.production
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/npm run start -- --hostname 0.0.0.0 --port 3000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

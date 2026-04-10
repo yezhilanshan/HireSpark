@@ -1,7 +1,8 @@
 'use client'
 
+import Link from 'next/link'
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Upload, FileText, Save, Trash2, RefreshCw, CheckCircle, AlertCircle, Loader2 } from 'lucide-react'
+import { Upload, FileText, Save, Trash2, RefreshCw, CheckCircle, AlertCircle, Loader2, ArrowLeft } from 'lucide-react'
 import { getBackendBaseUrl } from '@/lib/backend'
 
 const BACKEND_API_BASE = getBackendBaseUrl()
@@ -307,8 +308,17 @@ export default function MyPage() {
 
     return (
         <main className="page-shell">
+            <div className="mb-4">
+                <Link
+                    href="/settings"
+                    className="inline-flex items-center gap-2 rounded-lg border border-[#E5E5E5] bg-white px-3 py-2 text-sm font-medium text-[#111111] transition hover:bg-[#F5F5F5]"
+                >
+                    <ArrowLeft className="h-4 w-4" />
+                    返回系统设置
+                </Link>
+            </div>
             <div className="mb-6 rounded-3xl border border-[#E5E5E5] bg-[#FAF9F6] p-6 shadow-sm sm:p-8">
-                <p className="text-xs font-medium uppercase tracking-[0.18em] text-[#999999]">Candidate Profile</p>
+                <p className="text-xs font-medium uppercase tracking-[0.18em] text-[#999999]">候选人档案</p>
                 <h1 className="mt-2 text-3xl text-[#111111] sm:text-4xl">我的信息与简历</h1>
                 <p className="mt-2 text-sm text-[#666666]">维护候选人资料，并通过简历解析自动补全关键信息。</p>
             </div>

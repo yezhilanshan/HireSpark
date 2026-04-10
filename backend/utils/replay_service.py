@@ -783,6 +783,7 @@ class ReplayService:
             return {"success": False, "error": "invalid_interview_id"}
 
         dialogues = self.db_manager.get_interview_dialogues(interview_id) if hasattr(self.db_manager, "get_interview_dialogues") else []
+        evaluation_rows = self.db_manager.get_interview_evaluations(interview_id=interview_id) if hasattr(self.db_manager, "get_interview_evaluations") else []
         timeline_rows = self.db_manager.get_interview_turn_timelines(interview_id) if hasattr(self.db_manager, "get_interview_turn_timelines") else []
         tags = self.db_manager.get_timeline_tags(interview_id) if hasattr(self.db_manager, "get_timeline_tags") else []
         deep_audit = self.db_manager.get_deep_audit(interview_id) if hasattr(self.db_manager, "get_deep_audit") else None
@@ -798,11 +799,31 @@ class ReplayService:
             for item in dialogues
             if str(item.get("turn_id") or "").strip()
         }
+        evaluation_by_turn: Dict[str, Dict[str, Any]] = {}
+        for row in self._decode_evaluations(evaluation_rows):
+            turn_id = str(row.get("turn_id") or "").strip()
+            if not turn_id:
+                continue
+            status = str(row.get("status") or "").strip().lower()
+            if turn_id in evaluation_by_turn:
+                existing_status = str((evaluation_by_turn.get(turn_id) or {}).get("status") or "").strip().lower()
+                if existing_status in {"ok", "partial_ok"}:
+                    continue
+                if status not in {"ok", "partial_ok"}:
+                    continue
+            evaluation_by_turn[turn_id] = row
 
         transcript_anchors = []
         for row in timeline_rows:
             turn_id = str(row.get("turn_id") or "").strip()
             dialogue = dialogue_by_turn.get(turn_id, {})
+            evaluation = evaluation_by_turn.get(turn_id, {})
+            layer2 = evaluation.get("layer2") or {}
+            score = layer2.get("overall_score_final")
+            if score is None:
+                score = evaluation.get("overall_score")
+            if score is None:
+                score = layer2.get("overall_score")
             transcript_anchors.append({
                 "turn_id": turn_id,
                 "question": str(dialogue.get("question") or ""),
@@ -812,6 +833,7 @@ class ReplayService:
                 "answer_start_ms": round(_safe_float(row.get("answer_start_ms"), 0.0), 2),
                 "answer_end_ms": round(_safe_float(row.get("answer_end_ms"), 0.0), 2),
                 "latency_ms": round(_safe_float(row.get("latency_ms"), 0.0), 2),
+                "score": round(_safe_float(score), 1) if score is not None else None,
             })
 
         payload = {

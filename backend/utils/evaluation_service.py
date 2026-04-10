@@ -17,9 +17,11 @@ from typing import Any, Dict, Optional, Tuple
 
 try:
     from utils.config_loader import config
+    from utils.evidence_services import TextEvidenceService, SpeechEvidenceService, VideoEvidenceService
     from utils.logger import get_logger
 except ImportError:  # pragma: no cover
     from backend.utils.config_loader import config
+    from backend.utils.evidence_services import TextEvidenceService, SpeechEvidenceService, VideoEvidenceService
     from backend.utils.logger import get_logger
 
 
@@ -109,6 +111,9 @@ class EvaluationService:
         self.rag_service = rag_service
         self.llm_manager = llm_manager
         self.logger = logger or get_logger(__name__)
+        self.text_evidence_service = TextEvidenceService()
+        self.speech_evidence_service = SpeechEvidenceService()
+        self.video_evidence_service = VideoEvidenceService()
 
         self.evaluation_version = str(config.get("evaluation.version", "v1")).strip() or "v1"
         self.prompt_version = str(config.get("evaluation.prompt_version", "v1")).strip() or "v1"
@@ -449,23 +454,29 @@ class EvaluationService:
         speech_used = bool((speech_context or {}).get("speech_used")) and expression_score is not None
         audio_duration_ms = float((speech_context or {}).get("audio_duration_ms") or 0.0)
         token_count = int((speech_context or {}).get("token_count") or 0)
+        confidence_breakdown = self._compute_speech_axis_confidence(
+            speech_context=speech_context,
+            expression_dimensions=expression_dimensions,
+            speech_used=speech_used,
+        )
 
         if speech_used:
-            duration_factor = min(1.0, audio_duration_ms / 30000.0)
-            token_factor = min(1.0, token_count / 120.0)
-            confidence = self._clamp_unit(0.65 + duration_factor * 0.2 + token_factor * 0.15, default=0.0)
             status = "ready"
         elif (speech_context or {}).get("available"):
-            confidence = self._clamp_unit(0.15 + min(0.35, token_count / 120.0 * 0.35), default=0.0)
             status = "insufficient_data"
         else:
-            confidence = 0.0
             status = "unavailable"
+
+        evidence_service = self.speech_evidence_service.build(
+            speech_context=speech_context,
+            confidence=self._clamp_unit(confidence_breakdown.get("overall_confidence"), default=0.0),
+        )
 
         return {
             "status": status,
             "overall_score": round(float(expression_score), 2) if speech_used else None,
-            "confidence": confidence,
+            "confidence": self._clamp_unit(confidence_breakdown.get("overall_confidence"), default=0.0),
+            "confidence_breakdown": confidence_breakdown,
             "dimension_scores": {
                 key: {"score": self._clamp_score(value), "reason": ""}
                 for key, value in (expression_dimensions or {}).items()
@@ -481,6 +492,7 @@ class EvaluationService:
                 "final_transcript_excerpt": str((speech_context or {}).get("final_transcript_excerpt", "") or "").strip(),
                 "quality_gate_reasons": list(((speech_context or {}).get("quality_gate") or {}).get("reasons") or []),
             },
+            "evidence_service": evidence_service,
             "source": "speech_metrics_final",
         }
 
@@ -586,23 +598,26 @@ class EvaluationService:
             for dim, weight in self.VIDEO_DIMENSION_WEIGHTS.items()
         )
         overall_score = round(weighted_sum / sum(self.VIDEO_DIMENSION_WEIGHTS.values()), 2)
-
-        has_engagement_signals = bool(engagement_signals)
-        confidence = self._clamp_unit(
-            0.45
-            + (0.15 if has_face else 0.0)
-            + (0.20 if rppg_reliable else 0.0)
-            + (0.10 if has_engagement_signals else 0.0)
-            + (0.10 if self._safe_float(video_features.get("expression_score")) is not None else 0.0),
-            default=0.0,
+        confidence_breakdown = self._compute_video_axis_confidence(
+            video_context=video_context,
+            video_features=video_features if isinstance(video_features, dict) else {},
+            engagement_signals=engagement_signals if isinstance(engagement_signals, dict) else {},
         )
 
         integrity_signals = self._build_video_penalties(video_context)
 
+        evidence_service = self.video_evidence_service.build(
+            video_context=video_context,
+            dimension_scores=dimension_scores,
+            confidence=self._clamp_unit(confidence_breakdown.get("overall_confidence"), default=0.0),
+            integrity_signals=integrity_signals,
+        )
+
         return {
             "status": "ready",
             "overall_score": overall_score,
-            "confidence": confidence,
+            "confidence": self._clamp_unit(confidence_breakdown.get("overall_confidence"), default=0.0),
+            "confidence_breakdown": confidence_breakdown,
             "dimension_scores": dimension_scores,
             "summary": {
                 "video_features_snapshot": video_features if isinstance(video_features, dict) else {},
@@ -622,6 +637,7 @@ class EvaluationService:
                 "facial_activity": round(facial_activity, 2),
             },
             "integrity_signals": integrity_signals,
+            "evidence_service": evidence_service,
             "source": "detection_state",
         }
 
@@ -632,11 +648,16 @@ class EvaluationService:
         if score is None:
             score = self._safe_float(result.get("overall_score"))
         rubric_eval = result.get("rubric_eval") or {}
-        confidence = self._clamp_unit(rubric_eval.get("confidence", 0.55), default=0.55 if dimension_scores else 0.0)
+        confidence_breakdown = result.get("confidence_breakdown") if isinstance(result.get("confidence_breakdown"), dict) else {}
+        confidence = self._clamp_unit(
+            confidence_breakdown.get("overall_confidence", rubric_eval.get("confidence", 0.55)),
+            default=0.55 if dimension_scores else 0.0,
+        )
         return {
             "status": "ready" if dimension_scores else "unavailable",
             "overall_score": round(float(score), 2) if score is not None else None,
             "confidence": confidence,
+            "confidence_breakdown": confidence_breakdown,
             "dimension_scores": dimension_scores,
             "rubric_eval": rubric_eval,
             "summary": result.get("summary") or {},
@@ -702,6 +723,216 @@ class EvaluationService:
                 covered_points.append(point)
         return covered_points, missing_points, red_flags
 
+    def _compute_content_evidence_correction(
+        self,
+        llm_score: float,
+        coverage_ratio: float,
+        rubric_match: Optional[Dict[str, Any]],
+        evidence_density: float,
+        missing_points: list[str],
+        red_flags: list[str],
+    ) -> Dict[str, Any]:
+        rubric_match = rubric_match if isinstance(rubric_match, dict) else {}
+        basic_match = max(0.0, min(1.0, float(rubric_match.get("basic", 0.0) or 0.0)))
+        good_match = max(0.0, min(1.0, float(rubric_match.get("good", 0.0) or 0.0)))
+        excellent_match = max(0.0, min(1.0, float(rubric_match.get("excellent", 0.0) or 0.0)))
+
+        positive_bonus = round(
+            min(4.0, coverage_ratio * 4.0)
+            + min(2.5, good_match * 1.5 + excellent_match * 1.0)
+            + min(1.5, evidence_density * 1.5)
+            + min(0.8, basic_match * 0.8),
+            2,
+        )
+
+        missing_penalty = round(min(8.0, len(missing_points) * 2.5), 2)
+        risk_penalty = round(min(12.0, len(red_flags) * 6.0), 2)
+        total_penalty = round(missing_penalty + risk_penalty, 2)
+
+        net_correction = round(max(-18.0, min(8.0, positive_bonus - total_penalty)), 2)
+        corrected_score = self._clamp_score(llm_score + net_correction)
+
+        return {
+            "strategy": "llm_anchor_plus_evidence_correction_v1",
+            "llm_anchor_score": round(float(llm_score), 2),
+            "positive_bonus": positive_bonus,
+            "missing_penalty": missing_penalty,
+            "risk_penalty": risk_penalty,
+            "net_correction": net_correction,
+            "corrected_score": corrected_score,
+            "components": {
+                "coverage_ratio": round(float(coverage_ratio), 4),
+                "basic_match": round(basic_match, 4),
+                "good_match": round(good_match, 4),
+                "excellent_match": round(excellent_match, 4),
+                "evidence_density": round(float(evidence_density), 4),
+                "missing_points_count": len(missing_points),
+                "red_flags_count": len(red_flags),
+            },
+        }
+
+    def _compute_text_axis_confidence(
+        self,
+        payload: Optional[Dict[str, Any]],
+        dimension_scores: Dict[str, Any],
+        base_conf: float,
+        coverage_ratio: float,
+        evidence_density: float,
+        rubric_match: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        answer_text = self._sanitize_text((payload or {}).get("answer"))
+        token_count = self._count_transcript_tokens(answer_text)
+        dimension_count = max(1, len(dimension_scores or {}))
+        rubric_match = rubric_match if isinstance(rubric_match, dict) else {}
+        rubric_signal = max(
+            float(rubric_match.get("basic", 0.0) or 0.0),
+            float(rubric_match.get("good", 0.0) or 0.0),
+            float(rubric_match.get("excellent", 0.0) or 0.0),
+        )
+
+        data_confidence = self._clamp_unit(
+            0.25
+            + min(0.35, token_count / 120.0 * 0.35)
+            + min(0.20, evidence_density * 0.20)
+            + min(0.20, dimension_count / 5.0 * 0.20),
+            default=0.0,
+        )
+        model_confidence = self._clamp_unit(base_conf, default=0.0)
+        rubric_confidence = self._clamp_unit(
+            coverage_ratio * 0.5 + evidence_density * 0.2 + min(1.0, rubric_signal) * 0.3,
+            default=0.0,
+        )
+        overall_confidence = self._clamp_unit(
+            data_confidence * 0.4 + model_confidence * 0.3 + rubric_confidence * 0.3,
+            default=0.0,
+        )
+        return {
+            "data_confidence": data_confidence,
+            "model_confidence": model_confidence,
+            "rubric_confidence": rubric_confidence,
+            "overall_confidence": overall_confidence,
+            "inputs": {
+                "token_count": token_count,
+                "dimension_count": dimension_count,
+                "coverage_ratio": round(float(coverage_ratio), 4),
+                "evidence_density": round(float(evidence_density), 4),
+            },
+        }
+
+    def _compute_speech_axis_confidence(
+        self,
+        speech_context: Dict[str, Any],
+        expression_dimensions: Dict[str, Any],
+        speech_used: bool,
+    ) -> Dict[str, Any]:
+        audio_duration_ms = float((speech_context or {}).get("audio_duration_ms") or 0.0)
+        token_count = int((speech_context or {}).get("token_count") or 0)
+        quality_gate = (speech_context or {}).get("quality_gate") if isinstance((speech_context or {}).get("quality_gate"), dict) else {}
+        gate_passed = bool((quality_gate or {}).get("passed"))
+        gate_reasons = list((quality_gate or {}).get("reasons") or [])
+        dimension_count = max(1, len(expression_dimensions or {}))
+        dimension_coverage = min(1.0, dimension_count / max(1, len(self.SPEECH_EXPRESSION_WEIGHTS)))
+        duration_factor = min(1.0, audio_duration_ms / 30000.0)
+        token_factor = min(1.0, token_count / 120.0)
+
+        data_confidence = self._clamp_unit(
+            0.15 + duration_factor * 0.45 + token_factor * 0.25 + dimension_coverage * 0.15,
+            default=0.0,
+        )
+        model_confidence = self._clamp_unit(
+            0.2
+            + (0.45 if speech_used else 0.0)
+            + dimension_coverage * 0.2
+            - min(0.15, len(gate_reasons) * 0.03),
+            default=0.0,
+        )
+        rubric_confidence = self._clamp_unit(
+            (0.55 if gate_passed else 0.15) + dimension_coverage * 0.25,
+            default=0.0,
+        )
+        overall_confidence = self._clamp_unit(
+            data_confidence * 0.4 + model_confidence * 0.3 + rubric_confidence * 0.3,
+            default=0.0,
+        )
+        return {
+            "data_confidence": data_confidence,
+            "model_confidence": model_confidence,
+            "rubric_confidence": rubric_confidence,
+            "overall_confidence": overall_confidence,
+            "inputs": {
+                "audio_duration_ms": round(audio_duration_ms, 2),
+                "token_count": token_count,
+                "dimension_count": dimension_count,
+                "dimension_coverage": round(dimension_coverage, 4),
+                "quality_gate_passed": gate_passed,
+                "quality_gate_reason_count": len(gate_reasons),
+            },
+        }
+
+    def _compute_video_axis_confidence(
+        self,
+        video_context: Dict[str, Any],
+        video_features: Dict[str, Any],
+        engagement_signals: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        has_face = bool(video_context.get("has_face", True))
+        face_count = int(video_context.get("face_count", 1) or 1)
+        rppg_reliable = bool(video_context.get("rppg_reliable", False))
+        raw_off_screen = self._safe_float(video_context.get("off_screen_ratio")) or 0.0
+        off_screen_ratio = raw_off_screen * 100.0 if raw_off_screen <= 1.0 else raw_off_screen
+        off_screen_ratio = max(0.0, min(100.0, off_screen_ratio))
+
+        feature_hits = 0
+        if self._safe_float(video_features.get("expression_score")) is not None:
+            feature_hits += 1
+        if self._safe_float(engagement_signals.get("head_movement")) is not None:
+            feature_hits += 1
+        if self._safe_float(engagement_signals.get("facial_activity")) is not None:
+            feature_hits += 1
+        feature_coverage = min(1.0, feature_hits / 3.0)
+
+        data_confidence = self._clamp_unit(
+            0.15
+            + (0.35 if has_face else 0.0)
+            + (0.2 if face_count == 1 else 0.0)
+            + feature_coverage * 0.2
+            + (0.1 if off_screen_ratio < 35.0 else 0.0),
+            default=0.0,
+        )
+        model_confidence = self._clamp_unit(
+            0.2
+            + (0.25 if has_face else 0.0)
+            + (0.2 if rppg_reliable else 0.0)
+            + feature_coverage * 0.25,
+            default=0.0,
+        )
+        rubric_confidence = self._clamp_unit(
+            0.2
+            + (0.25 if face_count == 1 else 0.0)
+            + (0.2 if off_screen_ratio < 35.0 else 0.0)
+            + (0.15 if has_face else 0.0)
+            + feature_coverage * 0.2,
+            default=0.0,
+        )
+        overall_confidence = self._clamp_unit(
+            data_confidence * 0.4 + model_confidence * 0.3 + rubric_confidence * 0.3,
+            default=0.0,
+        )
+        return {
+            "data_confidence": data_confidence,
+            "model_confidence": model_confidence,
+            "rubric_confidence": rubric_confidence,
+            "overall_confidence": overall_confidence,
+            "inputs": {
+                "has_face": has_face,
+                "face_count": face_count,
+                "rppg_reliable": rppg_reliable,
+                "off_screen_ratio": round(off_screen_ratio, 2),
+                "feature_hits": feature_hits,
+                "feature_coverage": round(feature_coverage, 4),
+            },
+        }
+
     def _build_content_layer(
         self,
         layer1_result: Optional[Dict[str, Any]],
@@ -750,8 +981,6 @@ class EvaluationService:
             deduction_items.append({"type": "risk_signal", "item": item, "deduct": 8.0})
         total_deduction = round(sum(float(x.get("deduct") or 0.0) for x in deduction_items), 2)
 
-        blended_score = self._clamp_score(0.65 * llm_score + 0.35 * checklist_score - total_deduction)
-
         rubric_eval = layer2_payload.get("rubric_eval") if isinstance(layer2_payload.get("rubric_eval"), dict) else {}
         base_conf = self._clamp_unit((text_payload.get("confidence") if text_payload else None) or rubric_eval.get("confidence", 0.55), default=0.55)
         coverage_ratio = self._safe_float(((layer1_result or {}).get("key_points") or {}).get("coverage_ratio"))
@@ -762,7 +991,29 @@ class EvaluationService:
             fallback_answer=self._sanitize_text((payload or {}).get("answer")),
         )
         evidence_density = min(1.0, (len(evidence_chain) / max(1, len(dimension_scores))))
-        confidence = self._clamp_unit(base_conf * 0.6 + float(coverage_ratio) * 0.25 + evidence_density * 0.15, default=0.0)
+        evidence_correction = self._compute_content_evidence_correction(
+            llm_score=llm_score,
+            coverage_ratio=float(coverage_ratio),
+            rubric_match=(layer1_result or {}).get("rubric_match"),
+            evidence_density=evidence_density,
+            missing_points=missing_points,
+            red_flags=red_flags,
+        )
+        blended_score = self._clamp_score(evidence_correction.get("corrected_score", llm_score))
+        confidence_breakdown = self._compute_text_axis_confidence(
+            payload=payload,
+            dimension_scores=dimension_scores,
+            base_conf=base_conf,
+            coverage_ratio=float(coverage_ratio),
+            evidence_density=evidence_density,
+            rubric_match=(layer1_result or {}).get("rubric_match"),
+        )
+        confidence = self._clamp_unit(confidence_breakdown.get("overall_confidence"), default=0.0)
+        evidence_service = self.text_evidence_service.build(
+            layer1_result=layer1_result or {},
+            layer2_result=layer2_payload,
+            confidence=confidence,
+        )
 
         checklist_items = []
         for item in covered_points:
@@ -788,8 +1039,11 @@ class EvaluationService:
                 "llm_text_score": llm_score,
                 "checklist_score": round(checklist_score, 2),
                 "deduction_score": total_deduction,
+                "evidence_correction": evidence_correction,
                 "coverage_ratio": round(float(coverage_ratio), 4),
             },
+            "confidence_breakdown": confidence_breakdown,
+            "evidence_service": evidence_service,
             "axis": "content",
             "source": "content_axis",
         }
@@ -918,13 +1172,18 @@ class EvaluationService:
         base_weights = dict(self.AXIS_WEIGHTS)
         available_scores = {}
         confidence_map = {}
+        confidence_breakdown_map = {}
         normalized_weight_numerators = {}
         missing_axes = []
         rejection_reasons: Dict[str, list[str]] = {}
 
         for name, layer in axes.items():
             score = self._safe_float((layer or {}).get("overall_score"))
-            confidence = self._clamp_unit((layer or {}).get("confidence"), default=1.0 if score is not None else 0.0)
+            breakdown = (layer or {}).get("confidence_breakdown") if isinstance((layer or {}).get("confidence_breakdown"), dict) else {}
+            confidence = self._clamp_unit(
+                breakdown.get("overall_confidence", (layer or {}).get("confidence")),
+                default=1.0 if score is not None else 0.0,
+            )
 
             if score is None or confidence <= 0.0:
                 missing_axes.append(name)
@@ -952,6 +1211,7 @@ class EvaluationService:
                 continue
             available_scores[name] = self._clamp_score(score)
             confidence_map[name] = confidence
+            confidence_breakdown_map[name] = breakdown
             normalized_weight_numerators[name] = round(float(base_weights.get(name, 0.0)) * confidence, 6)
 
         if not available_scores:
@@ -960,6 +1220,7 @@ class EvaluationService:
                 "overall_score": None,
                 "axis_scores": {},
                 "axis_confidences": {},
+                "axis_confidence_breakdowns": {},
                 "base_weights": base_weights,
                 "effective_weights": {},
                 "missing_layers": ["text", "speech", "video"],
@@ -1037,6 +1298,7 @@ class EvaluationService:
             "overall_confidence": overall_confidence,
             "axis_scores": available_scores,
             "axis_confidences": confidence_map,
+            "axis_confidence_breakdowns": confidence_breakdown_map,
             "layer_scores": layer_alias_scores,
             "base_weights": base_weights,
             "base_weights_layers": dict(self.LAYER_WEIGHTS),

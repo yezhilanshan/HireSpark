@@ -40,7 +40,7 @@ const POSITIONS = [
     { id: 'frontend', name: '前端工程师' },
     { id: 'fullstack', name: '全栈工程师' },
     { id: 'data_engineer', name: '数据工程师' },
-    { id: 'devops', name: 'DevOps 工程师' },
+    { id: 'product_manager', name: '产品经理' },
     { id: 'algorithm', name: '算法工程师' }
 ]
 
@@ -269,7 +269,7 @@ export default function InterviewSetupPage() {
                             <ArrowLeft size={16} />
                             返回工作台
                         </button>
-                        <p className="text-xs font-medium uppercase tracking-[0.16em] text-[#8a8479]">Pre-Interview Setup</p>
+                        <p className="text-xs font-medium uppercase tracking-[0.16em] text-[#8a8479]">面试前准备</p>
                         <h1 className="mt-1.5 text-[1.7rem] tracking-tight text-[#111111]">开始前检查</h1>
                         <p className="mt-1 text-sm text-[#666666]">确认设备状态并完成本次会话配置。</p>
                         <div className="mt-2 inline-flex items-center gap-2 rounded-full border border-[#E5E5E5] bg-white px-3 py-1.5 text-xs text-[#666666]">
@@ -285,7 +285,7 @@ export default function InterviewSetupPage() {
                             <div className="absolute inset-0 flex items-center justify-center">
                                 <div className="flex flex-col items-center gap-3 text-white/60">
                                     {cameraStatus === 'checking' ? <Camera size={32} className="animate-pulse" /> : <AlertCircle size={32} className="text-red-400" />}
-                                    <span className="text-sm">{cameraStatus === 'checking' ? 'Accessing camera...' : 'Camera access denied'}</span>
+                                    <span className="text-sm">{cameraStatus === 'checking' ? '正在连接摄像头...' : '摄像头访问被拒绝'}</span>
                                 </div>
                             </div>
                         )}
@@ -298,8 +298,8 @@ export default function InterviewSetupPage() {
                                     <Camera size={16} />
                                 </div>
                                 <div>
-                                    <div className="text-sm font-medium text-[#111111]">Camera</div>
-                                    <div className="text-xs text-[#666666]">Webcam</div>
+                                    <div className="text-sm font-medium text-[#111111]">摄像头</div>
+                                    <div className="text-xs text-[#666666]">默认摄像头</div>
                                 </div>
                             </div>
                             {cameraStatus === 'checking' && <div className="h-4 w-4 animate-spin rounded-full border-2 border-[#111111] border-t-transparent" />}
@@ -313,8 +313,8 @@ export default function InterviewSetupPage() {
                                     <Mic size={16} />
                                 </div>
                                 <div>
-                                    <div className="text-sm font-medium text-[#111111]">Microphone</div>
-                                    <div className="text-xs text-[#666666]">Default Input Device</div>
+                                    <div className="text-sm font-medium text-[#111111]">麦克风</div>
+                                    <div className="text-xs text-[#666666]">默认输入设备</div>
                                 </div>
                             </div>
                             {micStatus === 'checking' && <div className="h-4 w-4 animate-spin rounded-full border-2 border-[#111111] border-t-transparent" />}

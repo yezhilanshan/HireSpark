@@ -33,15 +33,66 @@ type TrendPoint = {
     score: number
 }
 
+const BEIJING_TIME_ZONE = 'Asia/Shanghai'
+
+const beijingDateTimeFormatter = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: BEIJING_TIME_ZONE,
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+})
+
+const beijingMonthDayFormatter = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: BEIJING_TIME_ZONE,
+    month: 'numeric',
+    day: 'numeric',
+})
+
+function parseRecordDate(value?: string): Date | null {
+    if (!value) return null
+    const text = value.trim()
+    if (!text) return null
+
+    const hasExplicitTimeZone = /(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(text)
+    if (hasExplicitTimeZone) {
+        const date = new Date(text)
+        return Number.isNaN(date.getTime()) ? null : date
+    }
+
+    const match = text.match(
+        /^(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?$/
+    )
+    if (!match) {
+        const fallback = new Date(text)
+        return Number.isNaN(fallback.getTime()) ? null : fallback
+    }
+
+    const [, year, month, day, hour = '0', minute = '0', second = '0'] = match
+    const utcMs = Date.UTC(
+        Number(year),
+        Number(month) - 1,
+        Number(day),
+        Number(hour) - 8,
+        Number(minute),
+        Number(second)
+    )
+    const date = new Date(utcMs)
+    return Number.isNaN(date.getTime()) ? null : date
+}
+
 function formatDate(value?: string): string {
     if (!value) return '未知时间'
-    const date = new Date(value)
-    if (Number.isNaN(date.getTime())) return value
-    return date.toLocaleString('zh-CN')
+    const date = parseRecordDate(value)
+    if (!date) return value
+    return beijingDateTimeFormatter.format(date)
 }
 
 function formatDuration(seconds?: number): string {
-    const safe = Math.max(0, Number(seconds || 0))
+    const safe = Math.max(0, Math.round(Number(seconds || 0)))
     if (!safe) return '未记录'
     const min = Math.floor(safe / 60)
     const sec = safe % 60
@@ -50,16 +101,15 @@ function formatDuration(seconds?: number): string {
 }
 
 function toTime(value?: string): number {
-    if (!value) return 0
-    const time = new Date(value).getTime()
-    return Number.isNaN(time) ? 0 : time
+    const date = parseRecordDate(value)
+    return date ? date.getTime() : 0
 }
 
 function formatTrendLabel(value?: string): string {
     if (!value) return '--'
-    const date = new Date(value)
-    if (Number.isNaN(date.getTime())) return '--'
-    return `${date.getMonth() + 1}/${date.getDate()}`
+    const date = parseRecordDate(value)
+    if (!date) return '--'
+    return beijingMonthDayFormatter.format(date)
 }
 
 function deriveScore(record: InterviewRecord): number | null {
@@ -152,7 +202,7 @@ export default function HistoryPage() {
                     <section className="rounded-3xl border border-[#E5E5E5] bg-[#FAF9F6] p-8 shadow-sm">
                         <div className="flex flex-wrap items-start justify-between gap-4">
                             <div>
-                                <p className="text-xs font-medium uppercase tracking-[0.18em] text-[#999999]">Interview History</p>
+                                <p className="text-xs font-medium uppercase tracking-[0.18em] text-[#999999]">面试历史</p>
                                 <h1 className="mt-2 text-3xl font-semibold tracking-tight text-[#111111] sm:text-4xl">历史记录</h1>
                                 <p className="mt-2 text-base text-[#666666]">查看每一次面试的报告结果，并追踪整体趋势。</p>
                             </div>
@@ -164,7 +214,7 @@ export default function HistoryPage() {
                                         aria-label="搜索会话"
                                         value={keyword}
                                         onChange={(event) => setKeyword(event.target.value)}
-                                        placeholder="Search sessions or tags..."
+                                        placeholder="搜索会话或标签..."
                                         className="w-full rounded-xl border border-[#E5E5E5] bg-white py-2.5 pl-9 pr-3 text-sm text-[#111111] outline-none transition focus:border-[#111111]"
                                     />
                                 </div>
@@ -207,7 +257,7 @@ export default function HistoryPage() {
                                             <Tooltip
                                                 cursor={{ stroke: '#D9D6CE', strokeDasharray: '4 4' }}
                                                 contentStyle={{ borderRadius: '12px', border: '1px solid #E5E5E5', backgroundColor: '#FFFFFF' }}
-                                                formatter={(value: number) => [`${Number(value).toFixed(1)}`, 'Score']}
+                                                formatter={(value: number) => [`${Number(value).toFixed(1)}`, '得分']}
                                             />
                                             <Line
                                                 type="monotone"
@@ -227,21 +277,15 @@ export default function HistoryPage() {
 
                             <section className="mt-6 grid gap-5">
                                 {listItems.map((item) => {
-                                    const shortId = (item.interview_id || '').slice(0, 8) || 'Session'
                                     return (
                                         <article key={item.interview_id} className="rounded-3xl border border-[#E5E5E5] bg-white p-6 shadow-sm transition hover:shadow-md">
                                             <div className="flex flex-wrap items-center justify-between gap-4">
                                                 <div className="min-w-0 flex-1">
-                                                    <h3 className="truncate text-2xl font-semibold tracking-tight text-[#111111]">面试会话 {shortId}</h3>
+                                                    <h3 className="truncate text-2xl font-semibold tracking-tight text-[#111111]">面试会话</h3>
                                                     <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-[#666666]">
                                                         <span className="inline-flex items-center gap-2"><CalendarDays className="h-4 w-4" />{formatDate(item.created_at || item.start_time)}</span>
                                                         <span className="inline-flex items-center gap-2"><Timer className="h-4 w-4" />{formatDuration(item.duration)}</span>
                                                         <span>{resolveRiskLabel(item.risk_level)}</span>
-                                                    </div>
-
-                                                    <div className="mt-3 flex flex-wrap items-center gap-2">
-                                                        <span className="rounded-full border border-[#E5E5E5] bg-[#F7F6F3] px-3 py-1 text-xs text-[#6E695F]">事件数 {Math.max(0, Number(item.events_count || 0))}</span>
-                                                        <span className="rounded-full border border-[#E5E5E5] bg-[#F7F6F3] px-3 py-1 text-xs text-[#6E695F]">{item.interview_id || '-'}</span>
                                                     </div>
 
                                                     <div className="mt-4 flex flex-wrap gap-2">
@@ -254,7 +298,7 @@ export default function HistoryPage() {
                                                 <div className="flex items-center gap-3">
                                                     <div className="text-right">
                                                         <p className="text-4xl font-semibold text-[#111111]">{item.score === null ? '--' : item.score.toFixed(1)}</p>
-                                                        <p className="text-xs uppercase tracking-[0.18em] text-[#999999]">Score</p>
+                                                        <p className="text-xs uppercase tracking-[0.18em] text-[#999999]">得分</p>
                                                     </div>
                                                     <Link
                                                         href={`/report?interviewId=${encodeURIComponent(item.interview_id || '')}`}

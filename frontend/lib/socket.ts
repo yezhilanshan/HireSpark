@@ -4,9 +4,37 @@
 import { io, Socket } from 'socket.io-client';
 import { getBackendBaseUrl } from './backend';
 
-const getSocketUrl = (): string => {
-    return getBackendBaseUrl();
-};
+type SocketTarget = {
+    url?: string
+    path: string
+}
+
+const trimTrailingSlash = (value: string): string => value.replace(/\/+$/, '')
+
+const getSocketTarget = (): SocketTarget => {
+    const backendBaseUrl = trimTrailingSlash(getBackendBaseUrl())
+
+    if (!backendBaseUrl) {
+        return { path: '/socket.io' }
+    }
+
+    if (backendBaseUrl.startsWith('/')) {
+        return {
+            path: `${backendBaseUrl}/socket.io`,
+        }
+    }
+
+    try {
+        const parsed = new URL(backendBaseUrl)
+        const basePath = trimTrailingSlash(parsed.pathname || '')
+        return {
+            url: `${parsed.protocol}//${parsed.host}`,
+            path: `${basePath || ''}/socket.io`,
+        }
+    } catch {
+        return { path: '/socket.io' }
+    }
+}
 
 class SocketClient {
     private socket: Socket | null = null;
@@ -31,13 +59,14 @@ class SocketClient {
             return this.connectPromise;
         }
 
-        const socketUrl = getSocketUrl();
+        const socketTarget = getSocketTarget();
 
         const connectWithTransports = (transports: Array<'websocket' | 'polling'>): Promise<void> => {
             return new Promise((resolve, reject) => {
                 this.socket?.disconnect();
 
-                this.socket = io(socketUrl, {
+                this.socket = io(socketTarget.url, {
+                    path: socketTarget.path,
                     transports,
                     upgrade: true,
                     reconnection: true,

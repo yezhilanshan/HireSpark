@@ -1,7 +1,6 @@
 'use client'
 
 import { usePathname } from 'next/navigation'
-import MyEntry from './MyEntry'
 import ThemeToggle from './ThemeToggle'
 import AssistantFloatingChat from './AssistantFloatingChat'
 
@@ -19,7 +18,6 @@ export default function GlobalFloatingActions() {
     return (
         <>
             <AssistantFloatingChat />
-            {!hideTopActions ? <MyEntry /> : null}
             {!hideTopActions ? <ThemeToggle /> : null}
         </>
     )

@@ -121,7 +121,7 @@ export default function QuestionsPage() {
             <div className="max-w-5xl mx-auto space-y-8">
                 <header className="flex flex-col md:flex-row md:items-end justify-between gap-6">
                     <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
-                        <h1 className="text-3xl font-serif text-[#111111] tracking-tight">Question Bank</h1>
+                        <h1 className="text-3xl font-serif text-[#111111] tracking-tight">题库</h1>
                         <p className="text-[#666666] mt-2">按能力维度练习高频题，构建稳定回答框架。</p>
                     </motion.div>
 
@@ -130,7 +130,7 @@ export default function QuestionsPage() {
                             <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-[#999999]" size={16} />
                             <input
                                 type="text"
-                                placeholder="Search questions..."
+                                placeholder="搜索题目..."
                                 value={searchQuery}
                                 onChange={(e) => setSearchQuery(e.target.value)}
                                 className="h-10 pl-9 pr-4 rounded-lg border border-[#E5E5E5] bg-white text-sm focus:outline-none focus:border-[#111111] focus:ring-1 focus:ring-[#111111] transition-all w-full md:w-64"

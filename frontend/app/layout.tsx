@@ -19,7 +19,7 @@ const sourceHanSerif = Noto_Serif_SC({
 })
 
 export const metadata: Metadata = {
-    title: '天枢智面',
+    title: 'PanelMind',
     description: '岗位化 AI 模拟面试与能力提升平台',
     icons: {
         icon: '/icon.svg',

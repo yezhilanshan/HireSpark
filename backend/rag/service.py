@@ -4,6 +4,7 @@ RAG service - configuration, indexing and retrieval entrypoint.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from pathlib import Path
@@ -43,6 +44,16 @@ DEFAULT_KEY_POINT_ALIASES = {
     "性能优化": ["调优", "优化", "benchmark"],
 }
 
+POSITION_ALIASES = {
+    "java_backend": ["java_backend", "java后端", "java后端工程师", "java后端开发工程师", "后端", "后端工程师", "backend"],
+    "frontend": ["frontend", "frontend_engineer", "前端", "前端工程师", "前端开发", "web前端工程师", "web前端开发工程师", "qianduan"],
+    "algorithm": ["algorithm", "algorithm_engineer", "算法", "算法工程师"],
+    "fullstack": ["fullstack", "全栈", "全栈工程师"],
+    "data_engineer": ["data_engineer", "数据工程师", "dataengineer"],
+    "devops": ["devops", "devops工程师", "运维开发", "运维工程师"],
+    "product_manager": ["product_manager", "productmanager", "产品经理", "产品", "chanpin", "pm"],
+}
+
 
 class RAGService:
     """Shared RAG service used by scripts and runtime handlers."""
@@ -63,6 +74,9 @@ class RAGService:
         )
         self.knowledge_path = self._resolve_backend_path(
             config.get("rag.knowledge_path", "knowledge/llm_questions.json")
+        )
+        self.additional_knowledge_paths = self._resolve_backend_paths(
+            config.get("rag.additional_knowledge_paths", [])
         )
         self.top_k = int(config.get("rag.top_k", 5))
         self.min_similarity = float(config.get("rag.min_similarity", 0.55))
@@ -90,6 +104,20 @@ class RAGService:
         if path.is_absolute():
             return str(path)
         return str((self.backend_root / path).resolve())
+
+    def _resolve_backend_paths(self, values: Any) -> List[str]:
+        if not values:
+            return []
+        if isinstance(values, (str, Path)):
+            values = [values]
+
+        resolved: List[str] = []
+        for value in values:
+            text = str(value or "").strip()
+            if not text:
+                continue
+            resolved.append(self._resolve_backend_path(text))
+        return resolved
 
     def _normalize_store_type(self, value: str) -> str:
         normalized = (value or "chroma").strip().lower()
@@ -171,7 +199,21 @@ class RAGService:
             return False
 
     def _load_records(self, source_path: Optional[str] = None) -> List[Dict[str, Any]]:
-        path = Path(source_path or self.knowledge_path)
+        source_paths: List[str]
+        if source_path is None:
+            source_paths = [self.knowledge_path, *self.additional_knowledge_paths]
+        elif isinstance(source_path, (list, tuple, set)):
+            source_paths = [str(item) for item in source_path if str(item or "").strip()]
+        else:
+            source_paths = [str(source_path)]
+
+        if len(source_paths) > 1:
+            records: List[Dict[str, Any]] = []
+            for item in source_paths:
+                records.extend(self._load_records(source_path=item))
+            return records
+
+        path = Path(source_paths[0] or self.knowledge_path)
         if path.is_dir():
             records: List[Dict[str, Any]] = []
             supported_files = [
@@ -233,27 +275,71 @@ class RAGService:
     @staticmethod
     def _load_markdown_records(path: Path) -> List[Dict[str, Any]]:
         text = path.read_text(encoding="utf-8")
-        decoder = json.JSONDecoder()
         records: List[Dict[str, Any]] = []
-        cursor = 0
+        buffer: List[str] = []
+        capturing = False
+        depth = 0
+        in_string = False
+        escape = False
 
-        while cursor < len(text):
-            start = text.find("{", cursor)
-            if start == -1:
-                break
-
-            try:
-                record, offset = decoder.raw_decode(text[start:])
-            except json.JSONDecodeError:
-                cursor = start + 1
+        for char in text:
+            if not capturing:
+                if char == "{":
+                    capturing = True
+                    depth = 1
+                    in_string = False
+                    escape = False
+                    buffer = [char]
                 continue
 
-            if isinstance(record, dict):
-                records.append(record)
-            elif isinstance(record, list):
-                records.extend(item for item in record if isinstance(item, dict))
+            buffer.append(char)
 
-            cursor = start + offset
+            if escape:
+                escape = False
+                continue
+
+            if char == "\\":
+                escape = True
+                continue
+
+            if char == '"':
+                in_string = not in_string
+                continue
+
+            if in_string:
+                continue
+
+            if char == "{":
+                depth += 1
+                continue
+
+            if char != "}":
+                continue
+
+            depth -= 1
+            if depth > 0:
+                continue
+
+            chunk = "".join(buffer).strip()
+            capturing = False
+            buffer = []
+
+            if not chunk:
+                continue
+
+            parsed: Any = None
+            try:
+                parsed = json.loads(chunk)
+            except json.JSONDecodeError:
+                try:
+                    parsed = ast.literal_eval(chunk)
+                except Exception:
+                    continue
+
+            if isinstance(parsed, dict):
+                records.append(parsed)
+            elif isinstance(parsed, list):
+                records.extend(item for item in parsed if isinstance(item, dict))
 
         if not records:
             raise ValueError(f"Markdown 文件中未解析到 JSON 记录: {path}")
@@ -262,6 +348,7 @@ class RAGService:
     def _normalize_record(self, raw: Dict[str, Any], index: int) -> Dict[str, Any]:
         record_id = str(raw.get("id") or f"rag_{index:04d}")
         role_or_position = str(raw.get("position") or raw.get("role") or "").strip()
+        canonical_position = self._normalize_position(role_or_position)
         question = str(
             raw.get("question")
             or raw.get("title")
@@ -286,7 +373,7 @@ class RAGService:
         return {
             "id": record_id,
             "role": role_or_position,
-            "position": role_or_position,
+            "position": canonical_position or role_or_position,
             "question": question,
             "category": raw.get("category", ""),
             "subcategory": raw.get("subcategory") or raw.get("title", ""),
@@ -891,7 +978,19 @@ class RAGService:
 
     @staticmethod
     def _normalize_position(position: str) -> str:
-        return "".join((position or "").strip().lower().split())
+        normalized = "".join((position or "").strip().lower().split())
+        if not normalized:
+            return ""
+
+        for canonical, aliases in POSITION_ALIASES.items():
+            normalized_aliases = {
+                "".join(str(alias or "").strip().lower().split())
+                for alias in aliases
+            }
+            if normalized == canonical or normalized in normalized_aliases:
+                return canonical
+
+        return normalized
 
     def _format_context(self, items: List[Dict[str, Any]]) -> str:
         parts = []
@@ -1259,6 +1358,11 @@ class RAGService:
                 "key_points": {"covered": [], "missing": [], "coverage_ratio": 0.0},
                 "rubric_match": {"basic": 0.0, "good": 0.0, "excellent": 0.0},
                 "signals": {"hit": [], "red_flags": []},
+                "competency": [],
+                "position_profile": {
+                    "role": str(position or "").strip(),
+                    "question_intent": str(round_type or "").strip(),
+                },
             }
 
         key_points = [
@@ -1275,6 +1379,11 @@ class RAGService:
         common_mistakes = [
             str(entry).strip()
             for entry in rubric.get("common_mistakes", []) or []
+            if str(entry).strip()
+        ]
+        competencies = [
+            str(entry).strip()
+            for entry in rubric.get("competency", []) or []
             if str(entry).strip()
         ]
         scoring_rubric = rubric.get("scoring_rubric", {}) or {}
@@ -1368,6 +1477,17 @@ class RAGService:
             "signals": {
                 "hit": hit_signals,
                 "red_flags": red_flags,
+            },
+            "competency": competencies,
+            "position_profile": {
+                "role": str(rubric.get("position") or position or "").strip(),
+                "question_intent": str(rubric.get("question_intent") or "").strip(),
+                "question_type": str(rubric.get("question_type") or "").strip(),
+                "keywords": [
+                    str(entry).strip()
+                    for entry in rubric.get("keywords", []) or []
+                    if str(entry).strip()
+                ][:8],
             },
             "metadata": {
                 "semantic_threshold": semantic_threshold,

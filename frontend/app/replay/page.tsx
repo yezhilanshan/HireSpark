@@ -3,7 +3,7 @@
 import { Suspense, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useSearchParams } from 'next/navigation'
-import { ArrowRight, CalendarDays, Clock3, Film, Tag, Timer, VolumeX } from 'lucide-react'
+import { ArrowRight, CalendarDays, Clock3, Film, Tag, Timer } from 'lucide-react'
 import type { ReplayPayload } from '@/types/replay'
 import PersistentSidebar from '@/components/PersistentSidebar'
 import { getBackendBaseUrl } from '@/lib/backend'
@@ -18,24 +18,8 @@ function formatMs(ms?: number) {
     return `${String(min).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
 }
 
-function tagLabel(tagType: string) {
-    if (tagType === 'high') return 'High Moment'
-    if (tagType === 'low') return 'Low Moment'
-    if (tagType === 'turning') return 'Turning Point'
-    if (tagType === 'emotion') return 'Emotion'
-    if (tagType === 'posture') return 'Posture'
-    if (tagType === 'gaze') return 'Gaze'
-    return tagType
-}
-
-function markerLabel(tagType: string) {
-    if (tagType === 'high') return 'High'
-    if (tagType === 'low') return 'Low'
-    if (tagType === 'turning') return 'Turning'
-    if (tagType === 'emotion') return 'Emotion'
-    if (tagType === 'posture') return 'Posture'
-    if (tagType === 'gaze') return 'Gaze'
-    return tagType
+function anchorLabel(index: number): string {
+    return `第 ${index + 1} 题`
 }
 
 function isAnchorActive(currentMs: number, startMs: number, endMs: number) {
@@ -43,11 +27,43 @@ function isAnchorActive(currentMs: number, startMs: number, endMs: number) {
     return currentMs >= Math.max(0, startMs - 500) && currentMs <= endMs + 1000
 }
 
+function getAnchorStartMs(anchor: ReplayPayload['transcript_anchor_list'][number]): number {
+    return Number(anchor.question_start_ms || anchor.answer_start_ms || 0)
+}
+
+function normalizeCompareText(value?: string): string {
+    return String(value || '').replace(/\s+/g, '').trim().toLowerCase()
+}
+
+function matchesCurrentAnchor(
+    item: { turn_id?: string; question?: string } | null | undefined,
+    anchor: ReplayPayload['transcript_anchor_list'][number] | null
+): boolean {
+    if (!item || !anchor) return false
+    const itemTurnId = String(item.turn_id || '').trim()
+    const anchorTurnId = String(anchor.turn_id || '').trim()
+    if (itemTurnId && anchorTurnId && itemTurnId === anchorTurnId) {
+        return true
+    }
+    const itemQuestion = normalizeCompareText(item.question)
+    const anchorQuestion = normalizeCompareText(anchor.question)
+    return Boolean(itemQuestion && anchorQuestion && itemQuestion === anchorQuestion)
+}
+
+function dimensionLabel(value?: string): string {
+    const normalized = String(value || '').trim().toLowerCase()
+    if (normalized === 'content') return '内容维度'
+    if (normalized === 'delivery') return '表达维度'
+    if (normalized === 'presence') return '镜头维度'
+    return String(value || '待补充维度')
+}
+
 type InterviewRecord = {
     interview_id: string
     created_at?: string
     start_time?: string
     duration?: number
+    dominant_round?: string
 }
 
 type InterviewApiResult = {
@@ -70,12 +86,21 @@ function formatDate(value?: string): string {
 }
 
 function formatDuration(seconds?: number): string {
-    const safe = Math.max(0, Number(seconds || 0))
+    const safe = Math.max(0, Math.round(Number(seconds || 0)))
     if (!safe) return '未记录'
     const min = Math.floor(safe / 60)
     const sec = safe % 60
     if (min <= 0) return `${sec}秒`
     return `${min}分${sec}秒`
+}
+
+function roundLabel(roundType?: string): string {
+    const normalized = String(roundType || '').trim().toLowerCase()
+    if (normalized === 'technical') return '技术基础面'
+    if (normalized === 'project') return '项目深度面'
+    if (normalized === 'system_design') return '系统设计面'
+    if (normalized === 'hr') return 'HR 综合面'
+    return '未标注轮次'
 }
 
 function ReplayPageContent() {
@@ -87,6 +112,7 @@ function ReplayPageContent() {
     const [records, setRecords] = useState<InterviewRecord[]>([])
     const [videoDurationMs, setVideoDurationMs] = useState(0)
     const [videoCurrentMs, setVideoCurrentMs] = useState(0)
+    const [selectedAnchorIndex, setSelectedAnchorIndex] = useState(-1)
     const videoRef = useRef<HTMLVideoElement | null>(null)
 
     useEffect(() => {
@@ -96,6 +122,7 @@ function ReplayPageContent() {
                 setLoading(true)
                 setVideoCurrentMs(0)
                 setVideoDurationMs(0)
+                setSelectedAnchorIndex(-1)
                 if (!interviewId) {
                     const res = await fetch(`${BACKEND_API_BASE}/api/interviews?limit=80`, { cache: 'no-store' })
                     const data: InterviewApiResult = await res.json()
@@ -131,11 +158,7 @@ function ReplayPageContent() {
     }, [interviewId])
 
     const orderedAnchors = useMemo(() => {
-        return [...(payload?.transcript_anchor_list || [])].sort((a, b) => Number(a.answer_start_ms || 0) - Number(b.answer_start_ms || 0))
-    }, [payload])
-
-    const orderedTags = useMemo(() => {
-        return [...(payload?.tags || [])].sort((a, b) => Number(a.start_ms || 0) - Number(b.start_ms || 0))
+        return [...(payload?.transcript_anchor_list || [])].sort((a, b) => getAnchorStartMs(a) - getAnchorStartMs(b))
     }, [payload])
 
     const playUrl = useMemo(() => {
@@ -167,15 +190,97 @@ function ReplayPageContent() {
     const activeAnchorKey = useMemo(() => {
         const current = Number(videoCurrentMs || 0)
         return orderedAnchors.findIndex(item => {
-            const start = Number(item.question_start_ms || item.answer_start_ms || 0)
+            const start = getAnchorStartMs(item)
             const end = Number(item.answer_end_ms || item.answer_start_ms || start)
             return isAnchorActive(current, start, end)
         })
     }, [orderedAnchors, videoCurrentMs])
 
-    const seekTo = (ms: number) => {
+    useEffect(() => {
+        if (orderedAnchors.length === 0) {
+            setSelectedAnchorIndex(-1)
+            return
+        }
+
+        if (activeAnchorKey >= 0) {
+            setSelectedAnchorIndex(activeAnchorKey)
+            return
+        }
+
+        setSelectedAnchorIndex((prev) => {
+            if (prev >= 0 && prev < orderedAnchors.length) return prev
+            return 0
+        })
+    }, [activeAnchorKey, orderedAnchors])
+
+    const currentAnchorIndex = useMemo(() => {
+        if (selectedAnchorIndex >= 0 && selectedAnchorIndex < orderedAnchors.length) {
+            return selectedAnchorIndex
+        }
+        if (activeAnchorKey >= 0) return activeAnchorKey
+        return orderedAnchors.length > 0 ? 0 : -1
+    }, [selectedAnchorIndex, activeAnchorKey, orderedAnchors])
+
+    const currentAnchor = useMemo(() => {
+        if (currentAnchorIndex < 0) return null
+        return orderedAnchors[currentAnchorIndex] || null
+    }, [currentAnchorIndex, orderedAnchors])
+
+    const currentFactChecks = useMemo(() => {
+        if (!currentAnchor) return []
+        return (payload?.audits?.fact_checks || []).filter((item) => matchesCurrentAnchor(item, currentAnchor)).slice(0, 3)
+    }, [payload, currentAnchor])
+
+    const currentDimensionGaps = useMemo(() => {
+        if (!currentAnchor) return []
+        return (payload?.audits?.dimension_gaps || []).filter((item) => matchesCurrentAnchor(item, currentAnchor)).slice(0, 3)
+    }, [payload, currentAnchor])
+
+    const currentShadowAnswer = useMemo(() => {
+        if (!currentAnchor) return null
+        return (payload?.shadow_answers || []).find((item) => matchesCurrentAnchor(item, currentAnchor)) || null
+    }, [payload, currentAnchor])
+
+    const currentLatencyMs = useMemo(() => {
+        if (!currentAnchor) return 0
+        const matched = (payload?.visual_metrics?.latency_matrix?.items || []).find(
+            (item) => String(item.turn_id || '').trim() === String(currentAnchor.turn_id || '').trim()
+        )
+        return Number(matched?.latency_ms ?? currentAnchor.latency_ms ?? 0)
+    }, [payload, currentAnchor])
+
+    const currentCoverageRatio = useMemo(() => {
+        if (!currentAnchor) return 0
+        const matched = (payload?.visual_metrics?.keyword_coverage?.items || []).find(
+            (item) => String(item.turn_id || '').trim() === String(currentAnchor.turn_id || '').trim()
+        )
+        return Number(matched?.coverage_ratio || 0)
+    }, [payload, currentAnchor])
+
+    const currentDiagnosisSummary = useMemo(() => {
+        if (!currentAnchor) return '当前暂无题目诊断。'
+        if (currentFactChecks.length > 0) {
+            return currentFactChecks[0]?.finding || '当前题已识别到需要优先复盘的问题。'
+        }
+        if (currentDimensionGaps.length > 0) {
+            const weakest = currentDimensionGaps[0]
+            return `本题主要短板在${dimensionLabel(weakest.dimension)}，建议优先补充底层原理、结构化表达和边界说明。`
+        }
+        if (currentCoverageRatio < 0.45) {
+            return '本题关键词覆盖偏低，说明回答命中题干核心点不足，建议先补主结论再展开。'
+        }
+        if (currentLatencyMs > 2500) {
+            return '本题响应时延偏长，建议先给结论，再补充细节，减少长时间停顿。'
+        }
+        return '当前题没有明显风险信号，建议结合参考答案继续优化表达顺序和信息密度。'
+    }, [currentAnchor, currentFactChecks, currentDimensionGaps, currentCoverageRatio, currentLatencyMs])
+
+    const seekTo = (ms: number, anchorIndex?: number) => {
         if (!videoRef.current) return
         const targetMs = Math.max(0, Number(ms || 0))
+        if (typeof anchorIndex === 'number' && anchorIndex >= 0) {
+            setSelectedAnchorIndex(anchorIndex)
+        }
         videoRef.current.currentTime = targetMs / 1000
         setVideoCurrentMs(targetMs)
         videoRef.current.play().catch(() => undefined)
@@ -208,7 +313,7 @@ function ReplayPageContent() {
                 <main className="flex-1 overflow-y-auto">
                     <div className="mx-auto max-w-5xl px-6 py-8">
                         <section className="rounded-3xl border border-[#E5E5E5] bg-[#FAF9F6] p-8 shadow-sm">
-                            <p className="text-xs uppercase tracking-[0.16em] text-[#999999]">Interview Replay</p>
+                            <p className="text-xs uppercase tracking-[0.16em] text-[#999999]">面试回放</p>
                             <h1 className="mt-3 text-3xl font-semibold tracking-tight text-[#111111]">面试复盘</h1>
                             <p className="mt-3 text-base text-[#666666]">选择任一面试会话，进入"文本锚点 + 视频回放"查看逐段复盘。</p>
                         </section>
@@ -229,12 +334,12 @@ function ReplayPageContent() {
                                     <article key={item.interview_id} className="rounded-2xl border border-[#E5E5E5] bg-white p-6 shadow-sm transition-shadow hover:shadow-md">
                                         <div className="flex flex-wrap items-center justify-between gap-4">
                                             <div className="min-w-0 flex-1">
-                                                <p className="text-lg font-semibold text-[#111111]">会话 {String(item.interview_id || '').slice(0, 8)}</p>
+                                                <p className="text-lg font-semibold text-[#111111]">面试会话</p>
                                                 <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-[#666666]">
                                                     <span className="inline-flex items-center gap-2"><CalendarDays className="h-4 w-4" />{formatDate(item.created_at || item.start_time)}</span>
                                                     <span className="inline-flex items-center gap-2"><Timer className="h-4 w-4" />{formatDuration(item.duration)}</span>
+                                                    <span className="inline-flex items-center gap-2"><Tag className="h-4 w-4" />{roundLabel(item.dominant_round)}</span>
                                                 </div>
-                                                <p className="mt-3 text-xs text-[#999999]">{item.interview_id}</p>
                                             </div>
                                             <Link
                                                 href={`/replay?interviewId=${encodeURIComponent(item.interview_id || '')}`}
@@ -276,7 +381,7 @@ function ReplayPageContent() {
             <main className="flex-1 overflow-y-auto">
                 <div className="mx-auto max-w-7xl px-6 py-8">
                     <section className="rounded-3xl border border-[#E5E5E5] bg-[#FAF9F6] p-8 shadow-sm">
-                        <p className="text-xs uppercase tracking-[0.16em] text-[#999999]">Interview Replay</p>
+                        <p className="text-xs uppercase tracking-[0.16em] text-[#999999]">面试回放</p>
                         <h1 className="mt-3 text-3xl font-semibold tracking-tight text-[#111111]">文本锚点 + 视频回放</h1>
                         <p className="mt-3 text-base text-[#666666]">左侧放大回放视频，右侧查看完整对话锚点；关键节点标签已嵌入时间轴，可直接点击跳转。</p>
                     </section>
@@ -316,7 +421,7 @@ function ReplayPageContent() {
 
                                     <div className="mt-5 rounded-2xl border border-[#E5E5E5] bg-[#FAF9F6] p-5">
                                         <div className="flex flex-wrap items-center justify-between gap-2">
-                                            <p className="text-sm font-medium text-[#111111]">关键节点时间轴</p>
+                                            <p className="text-sm font-medium text-[#111111]">题目时间轴</p>
                                             <p className="text-xs text-[#666666]">{formatMs(videoCurrentMs)} / {formatMs(timelineDurationMs)}</p>
                                         </div>
                                         <div className="relative mt-4 h-14">
@@ -326,37 +431,31 @@ function ReplayPageContent() {
                                                 style={{ width: `${Math.min(100, Math.max(0, (videoCurrentMs / timelineDurationMs) * 100))}%` }}
                                             />
 
-                                            {(orderedTags || []).slice(0, 18).map((item, idx) => {
-                                                const startMs = Number(item.start_ms || 0)
+                                            {orderedAnchors.map((item, idx) => {
+                                                const startMs = getAnchorStartMs(item)
                                                 const left = Math.min(100, Math.max(0, (startMs / timelineDurationMs) * 100))
+                                                const active = idx === activeAnchorKey
                                                 return (
                                                     <button
-                                                        key={`${item.tag_type}-${item.start_ms}-${idx}`}
-                                                        onClick={() => seekTo(startMs)}
+                                                        key={`${item.turn_id}-${idx}`}
+                                                        onClick={() => seekTo(startMs, idx)}
                                                         className="absolute top-1 -translate-x-1/2"
                                                         style={{ left: `${left}%` }}
-                                                        title={`${tagLabel(item.tag_type)} ${formatMs(startMs)}`}
+                                                        title={`${anchorLabel(idx)} ${formatMs(startMs)}`}
                                                     >
-                                                        <span className="mb-1 block max-w-[72px] truncate rounded-full border border-[#D9D4CA] bg-white px-2 py-0.5 text-[10px] text-[#555555]">
-                                                            {markerLabel(item.tag_type)}
+                                                        <span className={`mb-1 block max-w-[88px] truncate rounded-full border px-2 py-0.5 text-[10px] ${active
+                                                            ? 'border-[#111111] bg-[#111111] text-white'
+                                                            : 'border-[#D9D4CA] bg-white text-[#555555]'
+                                                            }`}>
+                                                            {anchorLabel(idx)}
                                                         </span>
-                                                        <span className="mx-auto block h-4 w-4 rounded-full border border-[#111111] bg-white shadow-sm hover:bg-[#111111]" />
+                                                        <span className={`mx-auto block h-4 w-4 rounded-full border shadow-sm ${active
+                                                            ? 'border-[#111111] bg-[#111111]'
+                                                            : 'border-[#111111] bg-white hover:bg-[#111111]'
+                                                            }`} />
                                                     </button>
                                                 )
                                             })}
-                                        </div>
-                                        <div className="mt-2 flex flex-wrap gap-2">
-                                            {(orderedTags || []).slice(0, 12).map((item, idx) => (
-                                                <button
-                                                    key={`chip-${item.tag_type}-${item.start_ms}-${idx}`}
-                                                    onClick={() => seekTo(item.start_ms)}
-                                                    className="inline-flex items-center gap-1 rounded-full border border-[#DDD8CE] bg-white px-3 py-1 text-xs text-[#444444] hover:bg-[#F3F1EC]"
-                                                >
-                                                    <Tag className="h-3 w-3" />
-                                                    {tagLabel(item.tag_type)}
-                                                    <span className="text-[#777777]">{formatMs(item.start_ms)}</span>
-                                                </button>
-                                            ))}
                                         </div>
                                     </div>
                                 </>
@@ -366,14 +465,6 @@ function ReplayPageContent() {
                                 </div>
                             )}
 
-                            <div className="mt-5 rounded-2xl border border-[#E5E5E5] bg-[#FAF9F6] p-5 text-sm text-[#555555]">
-                                <p>平均响应时延：{Number(payload.visual_metrics?.latency_matrix?.avg_latency_ms || 0).toFixed(0)} ms</p>
-                                <p className="mt-1">关键词覆盖率：{(Number(payload.visual_metrics?.keyword_coverage?.avg_coverage_ratio || 0) * 100).toFixed(1)}%</p>
-                                <p className="mt-2 inline-flex items-center gap-1 rounded-full border border-[#E1DBD1] bg-white px-2.5 py-1 text-xs text-[#6A655B]">
-                                    <VolumeX className="h-3.5 w-3.5" />
-                                    当前部分历史视频可能无音频轨道；后续录制将统一写入麦克风声音。
-                                </p>
-                            </div>
                         </article>
 
                         <article className="rounded-3xl border border-[#E5E5E5] bg-white p-6 shadow-sm xl:sticky xl:top-6 xl:max-h-[calc(100vh-72px)] xl:overflow-hidden">
@@ -383,29 +474,28 @@ function ReplayPageContent() {
                             </div>
                             <div className="space-y-3 overflow-y-auto pr-1 xl:max-h-[calc(100vh-166px)]">
                                 {orderedAnchors.map((item, idx) => {
-                                    const startMs = Number(item.answer_start_ms || item.question_start_ms || 0)
+                                    const startMs = getAnchorStartMs(item)
                                     const active = idx === activeAnchorKey
                                     return (
-                                    <button
-                                        key={`${item.turn_id}-${idx}`}
-                                        onClick={() => seekTo(startMs)}
-                                        className={`w-full rounded-2xl border p-4 text-left transition ${
-                                            active
+                                        <button
+                                            key={`${item.turn_id}-${idx}`}
+                                            onClick={() => seekTo(startMs, idx)}
+                                            className={`w-full rounded-2xl border p-4 text-left transition ${active
                                                 ? 'border-[#111111] bg-[#F3F1EC]'
                                                 : 'border-[#E5E5E5] bg-[#FAF9F6] hover:bg-[#F1EFEA]'
-                                        }`}
-                                    >
-                                        <div className="flex flex-wrap items-center justify-between gap-2">
-                                            <p className="whitespace-pre-wrap break-words text-sm font-semibold text-[#111111]">
-                                                {item.question || '未记录题目'}
+                                                }`}
+                                        >
+                                            <div className="flex flex-wrap items-center justify-between gap-2">
+                                                <p className="whitespace-pre-wrap break-words text-sm font-semibold text-[#111111]">
+                                                    {item.question || '未记录题目'}
+                                                </p>
+                                                <span className="inline-flex items-center gap-1 text-xs text-[#666666]"><Clock3 className="h-3 w-3" />{formatMs(startMs)}</span>
+                                            </div>
+                                            <p className="mt-2 whitespace-pre-wrap break-words text-sm text-[#666666]">
+                                                {item.answer || '未记录回答'}
                                             </p>
-                                            <span className="inline-flex items-center gap-1 text-xs text-[#666666]"><Clock3 className="h-3 w-3" />{formatMs(startMs)}</span>
-                                        </div>
-                                        <p className="mt-2 whitespace-pre-wrap break-words text-sm text-[#666666]">
-                                            {item.answer || '未记录回答'}
-                                        </p>
-                                        <p className="mt-2 text-xs text-[#999999]">Latency {Number(item.latency_ms || 0).toFixed(0)} ms</p>
-                                    </button>
+                                            <p className="mt-2 text-xs text-[#999999]">Latency {Number(item.latency_ms || 0).toFixed(0)} ms</p>
+                                        </button>
                                     )
                                 })}
                                 {orderedAnchors.length === 0 ? (
@@ -419,25 +509,83 @@ function ReplayPageContent() {
 
                     <section className="mt-6 grid gap-6 lg:grid-cols-2">
                         <article className="rounded-3xl border border-[#E5E5E5] bg-white p-6 shadow-sm">
-                            <h3 className="text-lg font-semibold text-[#111111]">Deep Tech Audit</h3>
-                            <div className="mt-3 space-y-2 text-sm text-[#555555]">
-                                {(payload.audits?.fact_checks || []).slice(0, 6).map((item, idx) => (
-                                    <p key={`fc-${idx}`}>- {item.finding}</p>
-                                ))}
-                                {(payload.audits?.fact_checks || []).length === 0 ? <p>暂无诊断结果。</p> : null}
+                            <div className="flex flex-wrap items-start justify-between gap-3">
+                                <div>
+                                    <h3 className="text-lg font-semibold text-[#111111]">当前题诊断</h3>
+                                    <p className="mt-1 text-sm text-[#666666]">
+                                        {currentAnchor ? currentAnchor.question || '未记录题目' : '请选择一题查看本题诊断。'}
+                                    </p>
+                                </div>
+                                {currentAnchor ? (
+                                    <span className="rounded-full border border-[#E5E5E5] bg-[#FAF9F6] px-3 py-1 text-xs text-[#666666]">
+                                        {anchorLabel(currentAnchorIndex)}
+                                    </span>
+                                ) : null}
                             </div>
+
+                            {currentAnchor ? (
+                                <>
+                                    <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                                        <div className="rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-3">
+                                            <p className="text-xs text-[#999999]">开始时间</p>
+                                            <p className="mt-1 text-sm font-semibold text-[#111111]">{formatMs(getAnchorStartMs(currentAnchor))}</p>
+                                        </div>
+                                        <div className="rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-3">
+                                            <p className="text-xs text-[#999999]">响应时延</p>
+                                            <p className="mt-1 text-sm font-semibold text-[#111111]">{Number(currentLatencyMs || 0).toFixed(0)} ms</p>
+                                        </div>
+                                        <div className="rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-3">
+                                            <p className="text-xs text-[#999999]">关键词覆盖率</p>
+                                            <p className="mt-1 text-sm font-semibold text-[#111111]">{(currentCoverageRatio * 100).toFixed(1)}%</p>
+                                        </div>
+                                    </div>
+
+                                    <div className="mt-4 rounded-2xl border border-[#E5E5E5] bg-[#FAF9F6] p-4">
+                                        <p className="text-sm font-semibold text-[#111111]">本题判断</p>
+                                        <p className="mt-2 text-sm leading-6 text-[#555555]">{currentDiagnosisSummary}</p>
+                                    </div>
+
+                                    <div className="mt-4 space-y-3">
+                                        {currentFactChecks.map((item, idx) => (
+                                            <div key={`diagnosis-fact-${idx}`} className="rounded-xl border border-amber-200/70 bg-amber-50/70 p-3">
+                                                <p className="text-xs font-medium text-amber-700">问题信号</p>
+                                                <p className="mt-1 text-sm text-[#333333]">{item.finding || '当前题存在需要重点回放的问题。'}</p>
+                                            </div>
+                                        ))}
+                                        {currentDimensionGaps.map((item, idx) => (
+                                            <div key={`diagnosis-gap-${idx}`} className="rounded-xl border border-[#E5E5E5] bg-white p-3">
+                                                <p className="text-xs font-medium text-[#666666]">
+                                                    {dimensionLabel(item.dimension)}
+                                                    {typeof item.score === 'number' ? ` · ${item.score.toFixed(1)} 分` : ''}
+                                                </p>
+                                                <p className="mt-1 text-sm text-[#333333]">{item.suggestion || '建议补充这一维度的关键论据与边界说明。'}</p>
+                                            </div>
+                                        ))}
+                                        {currentFactChecks.length === 0 && currentDimensionGaps.length === 0 ? (
+                                            <div className="rounded-xl border border-dashed border-[#D8D4CA] bg-[#FAF9F6] p-3 text-sm text-[#666666]">
+                                                当前题没有额外审计告警，建议结合右侧参考答案优化表达顺序和信息密度。
+                                            </div>
+                                        ) : null}
+                                    </div>
+                                </>
+                            ) : (
+                                <div className="mt-4 rounded-xl border border-dashed border-[#D8D4CA] bg-[#FAF9F6] p-4 text-sm text-[#666666]">
+                                    暂无当前题诊断数据。
+                                </div>
+                            )}
                         </article>
 
                         <article className="rounded-3xl border border-[#E5E5E5] bg-white p-6 shadow-sm">
-                            <h3 className="text-lg font-semibold text-[#111111]">Shadow Answers</h3>
+                            <h3 className="text-lg font-semibold text-[#111111]">参考答案</h3>
                             <div className="mt-3 space-y-3">
-                                {(payload.shadow_answers || []).slice(0, 3).map((item, idx) => (
-                                    <div key={`shadow-${idx}`} className="rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-3">
-                                        <p className="text-xs text-[#999999]">{item.question || '未记录题目'}</p>
-                                        <p className="mt-1 text-sm text-[#333333]">{item.shadow_answer || '暂无优化回答'}</p>
+                                {currentShadowAnswer ? (
+                                    <div className="rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-4">
+                                        <p className="text-xs text-[#999999]">{currentShadowAnswer.question || currentAnchor?.question || '未记录题目'}</p>
+                                        <p className="mt-2 text-sm leading-6 text-[#333333]">{currentShadowAnswer.shadow_answer || '暂无优化回答'}</p>
                                     </div>
-                                ))}
-                                {(payload.shadow_answers || []).length === 0 ? <p className="text-sm text-[#666666]">暂无影子回答。</p> : null}
+                                ) : (
+                                    <p className="text-sm text-[#666666]">当前题暂无参考答案草稿。</p>
+                                )}
                             </div>
                         </article>
                     </section>

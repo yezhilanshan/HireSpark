@@ -6,6 +6,7 @@
 import os
 import json
 import time
+import re
 import dashscope
 from typing import Any, Optional, Dict, List
 from dashscope import Generation
@@ -27,7 +28,9 @@ INTERVIEWER_STRUGGLE_RESPONSE_RULES = """
 当候选人回答明显不完整、偏弱、卡住或答不上来时，遵守以下反应规则：
 - 不要立刻否定、下结论或表现出不耐烦，更不要使用羞辱、讽刺、阴阳怪气的表达
 - 先判断是没听清、太紧张，还是确实不会；必要时可以重述问题、换一种更清楚的说法，或把问题拆小一点
-- 先给很小的引导，不要直接给标准答案，例如让候选人先说大致思路、先说一个可行方案、先结合项目经验分析
+- 只允许给一句非常短的提示，不能直接给定义、结论、完整示例、示范代码或标准答案
+- 输出必须保持“面试官提问”姿态，提示之后要立刻落到一个明确问题上，不能进入教学讲解模式
+- 禁止出现“你觉得这个例子清晰吗”“如果有问题我再解释”这类授课式收尾
 - 如果对方仍然回答不好，优先降一级继续评估基础能力，而不是持续在同一点上施压
 - 重点观察候选人的逻辑、真实性、应变和情绪稳定性；允许候选人承认“不确定”，不要逼迫其乱答
 - 如果当前题继续深挖价值不大，应自然切换到相关但更容易发挥的问题
@@ -56,7 +59,9 @@ INTERVIEW_ROUNDS = {
 回答要求：
 - 字数控制在 200 字以内
 - 语言专业但不生硬
-- 如果候选人回答不理想，可以给予提示或追问更深层的知识点"""
+- 每次输出都必须以明确问题结尾，且只能提问或极短提示后追问
+- 不要直接解释概念，不要给标准答案，不要写示例代码
+- 如果候选人回答不理想，只能重述、缩小问题或继续追问，不能切换成讲课模式"""
     },
     'project': {
         'name': '项目深度面',
@@ -133,6 +138,24 @@ INTERVIEW_ROUNDS = {
 
 class LLMManager:
     """大模型管理器 - 处理与 Qwen 的交互"""
+    _QUESTION_LINE_PATTERNS = (
+        r"(?:优先问题|候选题|问题)\s*[:：]\s*(.+)",
+    )
+    _META_QUESTION_PATTERNS = (
+        "你觉得这个例子清晰吗",
+        "如果有任何问题",
+        "需要进一步解释的地方",
+        "我可以继续解释",
+        "我再给你解释",
+    )
+    _TEACHING_PATTERNS = (
+        "在这个例子中",
+        "假设我们有一个",
+        "请看下面的代码",
+        "这就是",
+        "我们来具体看一下",
+        "下面这个例子",
+    )
     
     def __init__(self):
         """初始化 LLM 管理器"""
@@ -168,7 +191,9 @@ class LLMManager:
 - 每次只提一个问题，问题要清晰具体
 - 字数控制在 100 字以内
 - 语言专业但不生硬，要体现面试官的专业性
-- 如果候选人回答不理想，可以提出改进建议或追问更深层的知识点""")
+- 输出必须是面试官口吻，最终落在一个明确问题上
+- 不要直接解释概念、不要给标准答案、不要写示例代码
+- 如果候选人回答不理想，可以缩小范围继续追问，但不要变成教学讲解""")
 
     @staticmethod
     def _resolve_api_key(config_value: Optional[str]) -> Optional[str]:
@@ -197,6 +222,236 @@ class LLMManager:
         if resume_data:
             prompt += "\n\n" + self._build_resume_context(resume_data)
         return prompt
+
+    @staticmethod
+    def _dedupe_text_list(items: Optional[List[Any]], limit: int = 8) -> List[str]:
+        results: List[str] = []
+        seen = set()
+        for item in items or []:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append(text)
+            if len(results) >= limit:
+                break
+        return results
+
+    @classmethod
+    def _extract_question_from_context(cls, text: Optional[str]) -> str:
+        source = str(text or "").strip()
+        if not source:
+            return ""
+
+        for raw_line in source.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            for pattern in cls._QUESTION_LINE_PATTERNS:
+                matched = re.search(pattern, line)
+                if not matched:
+                    continue
+                candidate = str(matched.group(1) or "").strip().strip("。")
+                if candidate:
+                    return candidate if candidate.endswith(("？", "?")) else f"{candidate}？"
+        return ""
+
+    @classmethod
+    def _extract_primary_question(cls, text: Optional[str]) -> str:
+        source = re.sub(r"\s+", " ", str(text or "").strip())
+        if not source:
+            return ""
+
+        parts = re.split(r"(?<=[？?])\s*", source)
+        for part in parts:
+            candidate = part.strip()
+            if not candidate or ("？" not in candidate and "?" not in candidate):
+                continue
+            if any(pattern in candidate for pattern in cls._META_QUESTION_PATTERNS):
+                continue
+            if len(candidate) < 6:
+                continue
+            return candidate
+        return ""
+
+    @classmethod
+    def _looks_like_teaching_response(cls, text: Optional[str]) -> bool:
+        source = re.sub(r"\s+", " ", str(text or "").strip())
+        if not source:
+            return True
+        if any(pattern in source for pattern in cls._META_QUESTION_PATTERNS):
+            return True
+        teaching_hits = sum(1 for pattern in cls._TEACHING_PATTERNS if pattern in source)
+        if teaching_hits >= 1 and len(source) >= 40:
+            return True
+        if ("示例" in source or "代码" in source) and len(source) >= 30:
+            return True
+        return False
+
+    @classmethod
+    def _fallback_interviewer_question(
+        cls,
+        *,
+        round_type: str,
+        current_question: str = "",
+        rag_context: Optional[str] = None,
+        user_answer: str = "",
+    ) -> str:
+        context_question = cls._extract_question_from_context(rag_context)
+        if context_question:
+            return context_question
+
+        normalized_current = str(current_question or "").strip()
+        normalized_answer = re.sub(r"\s+", " ", str(user_answer or "").strip())
+        if normalized_current and normalized_answer:
+            followup_map = {
+                "technical": "你刚才讲的是概括层面。请继续往下展开一层，具体说明它的底层机制、关键约束，以及实际使用时最容易出错的点？",
+                "project": "你刚才更多是在讲结果。请具体拆一下当时你的个人职责、关键决策，以及你最终怎么验证方案有效？",
+                "system_design": "你刚才先给了总体说法。请继续展开核心模块划分、关键数据流，以及你会优先防哪类瓶颈？",
+                "hr": "你刚才说到了结论。请再具体补充一下当时你的行动、判断依据，以及这件事对你的影响？",
+            }
+            return followup_map.get(round_type, followup_map["technical"])
+
+        generic_map = {
+            "technical": "请你直接说明这个技术点的定义、核心机制，以及一个实际使用场景？",
+            "project": "请你结合你的项目经历，挑一个关键技术决策讲一下为什么这样做？",
+            "system_design": "请你先给出整体方案，再说明核心模块划分和关键权衡？",
+            "hr": "请你结合一段真实经历，说明你当时是怎么思考和处理的？",
+        }
+        return generic_map.get(round_type, generic_map["technical"])
+
+    @classmethod
+    def _sanitize_interviewer_output(
+        cls,
+        text: Optional[str],
+        *,
+        round_type: str,
+        current_question: str = "",
+        rag_context: Optional[str] = None,
+        user_answer: str = "",
+    ) -> str:
+        source = re.sub(r"\s+", " ", str(text or "").strip())
+        if not source:
+            return cls._fallback_interviewer_question(
+                round_type=round_type,
+                current_question=current_question,
+                rag_context=rag_context,
+                user_answer=user_answer,
+            )
+
+        primary_question = cls._extract_primary_question(source)
+        if primary_question and not cls._looks_like_teaching_response(source):
+            return primary_question
+
+        if source.endswith(("？", "?")) and not cls._looks_like_teaching_response(source):
+            return source
+
+        return cls._fallback_interviewer_question(
+            round_type=round_type,
+            current_question=current_question,
+            rag_context=rag_context,
+            user_answer=user_answer,
+        )
+
+    def _build_position_profile(
+        self,
+        position: str,
+        round_type: str,
+        layer1_result: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        normalized_position = "".join(str(position or "").strip().lower().split())
+        competency = self._dedupe_text_list((layer1_result or {}).get("competency") or [], limit=6)
+        position_profile = dict((layer1_result or {}).get("position_profile") or {})
+        question_keywords = self._dedupe_text_list(position_profile.get("keywords") or [], limit=8)
+
+        role_hints_map = {
+            "java_backend": [
+                "后端工程实践",
+                "Java 生态与框架使用",
+                "数据库与缓存",
+                "接口设计与稳定性",
+                "排障与性能优化",
+            ],
+            "java后端": [
+                "后端工程实践",
+                "Java 生态与框架使用",
+                "数据库与缓存",
+                "接口设计与稳定性",
+                "排障与性能优化",
+            ],
+            "frontend": [
+                "前端工程化",
+                "组件设计与状态管理",
+                "浏览器与性能优化",
+                "交互体验",
+                "联调与问题排查",
+            ],
+            "frontend_engineer": [
+                "前端工程化",
+                "组件设计与状态管理",
+                "浏览器与性能优化",
+                "交互体验",
+                "联调与问题排查",
+            ],
+            "算法工程师": [
+                "模型理解与训练调优",
+                "数据与评估设计",
+                "工程落地能力",
+                "问题分析与实验闭环",
+                "业务场景适配",
+            ],
+            "algorithm_engineer": [
+                "模型理解与训练调优",
+                "数据与评估设计",
+                "工程落地能力",
+                "问题分析与实验闭环",
+                "业务场景适配",
+            ],
+            "产品经理": [
+                "需求分析与优先级判断",
+                "用户洞察与场景抽象",
+                "跨团队协作与推动落地",
+                "数据分析与效果复盘",
+                "产品规划与商业判断",
+            ],
+            "product_manager": [
+                "需求分析与优先级判断",
+                "用户洞察与场景抽象",
+                "跨团队协作与推动落地",
+                "数据分析与效果复盘",
+                "产品规划与商业判断",
+            ],
+        }
+
+        role_hints: List[str] = []
+        for key, hints in role_hints_map.items():
+            if key in normalized_position:
+                role_hints = hints[:]
+                break
+
+        if not role_hints:
+            role_hints = [
+                "岗位核心技能是否匹配",
+                "回答是否贴近真实工作场景",
+                "是否体现岗位需要的工程判断",
+            ]
+
+        resume_data = self.resume_data if isinstance(self.resume_data, dict) else {}
+        resume_skills = self._dedupe_text_list((resume_data or {}).get("skills") or [], limit=10)
+
+        return {
+            "position": str(position or "").strip(),
+            "round_type": str(round_type or "").strip(),
+            "target_competency": competency,
+            "question_keywords": question_keywords,
+            "role_hints": role_hints,
+            "resume_skills": resume_skills,
+            "question_intent": str(position_profile.get("question_intent") or "").strip(),
+            "question_type": str(position_profile.get("question_type") or "").strip(),
+        }
     
     def check_enabled(self) -> bool:
         """检查 LLM 是否启用"""
@@ -336,7 +591,7 @@ class LLMManager:
                 prompt += f"背景信息：{context}\n"
             if rag_context:
                 prompt += f"参考知识：\n{rag_context}\n"
-            prompt += "请直接给出问题，不要多余的解释。"
+            prompt += "参考知识只用于帮助你选题，不允许直接复述成答案、示例或讲解。请直接给出一个面试问题，不要多余解释。"
             
             messages = [
                 {
@@ -362,7 +617,11 @@ class LLMManager:
             if response.status_code == 200:
                 question = response.output.text
                 logger.info(f"✓ 生成面试问题 - 职位: {position}, 难度: {difficulty}")
-                return question
+                return self._sanitize_interviewer_output(
+                    question,
+                    round_type=self.current_round,
+                    rag_context=rag_context,
+                )
             else:
                 logger.error(f"✗ API 错误: {response.message}")
                 return ""
@@ -433,7 +692,12 @@ class LLMManager:
             if response.status_code == 200:
                 feedback = response.output.text
                 logger.info(f"✓ 处理回答 - 职位: {position}")
-                return feedback
+                return self._sanitize_interviewer_output(
+                    feedback,
+                    round_type=self.current_round,
+                    current_question=current_question,
+                    user_answer=user_answer,
+                )
             else:
                 logger.error(f"✗ API 错误: {response.message}")
                 return ""
@@ -463,13 +727,15 @@ class LLMManager:
             "technical": ["technical_accuracy", "knowledge_depth", "completeness", "logic", "job_match"],
             "project": ["authenticity", "ownership", "technical_depth", "reflection"],
             "system_design": ["architecture_reasoning", "tradeoff_awareness", "scalability", "logic"],
-            "hr": ["clarity", "relevance", "self_awareness", "communication"],
+            "hr": ["clarity", "relevance", "self_awareness", "communication", "confidence"],
         }
         dimensions = round_dimensions.get(round_type, round_dimensions["technical"])
 
         rubric_text = json.dumps(scoring_rubric or {}, ensure_ascii=False, indent=2)
         layer1_text = json.dumps(layer1_result or {}, ensure_ascii=False, indent=2)
         speech_text = json.dumps(speech_context or {}, ensure_ascii=False, indent=2)
+        position_profile = self._build_position_profile(position, round_type, layer1_result)
+        position_profile_text = json.dumps(position_profile, ensure_ascii=False, indent=2)
 
         dim_schema = ", ".join(
             (
@@ -494,7 +760,10 @@ class LLMManager:
             "For every dimension, you must also return structured evidence. "
             "Do not apply speech weighting inside dimension scores or overall_score. "
             "If speech_context is present, you may reference it only in reasons and summary wording. "
-            "Keep scores calibrated to 0-100 and ensure reasons are concise, evidence is concrete, and quotes come from the candidate answer."
+            "Keep scores calibrated to 0-100 and ensure reasons are concise, evidence is concrete, and quotes come from the candidate answer. "
+            "For `job_match`, score role alignment instead of repeating technical correctness: judge whether the answer reflects the target role's core competency, engineering context, and scenario relevance. "
+            "For HR round `confidence`, score professional confidence from the semantics of the answer: whether the candidate shows stable judgment, clear ownership, and appropriately bounded self-belief. "
+            "Do not confuse confidence with extroversion, speaking volume, aggression, or refusal to admit uncertainty."
         )
         user_prompt = (
             f"prompt_version: {prompt_version}\n"
@@ -502,6 +771,7 @@ class LLMManager:
             f"round_type: {round_type}\n"
             f"question: {question}\n"
             f"candidate_answer: {user_answer}\n\n"
+            f"position_profile:\n{position_profile_text}\n\n"
             f"scoring_rubric:\n{rubric_text}\n\n"
             f"layer1_result:\n{layer1_text}\n\n"
             f"speech_context:\n{speech_text}\n\n"
@@ -512,6 +782,17 @@ class LLMManager:
             "4. `summary` can mention speaking strengths/weaknesses only if supported by speech_context.\n"
             "5. Every dimension must include `evidence.hit_rubric_points`, `evidence.missed_rubric_points`, `evidence.source_quotes`, and `evidence.deduction_rationale`.\n"
             "6. `source_quotes` must quote the candidate answer verbatim when possible; use short excerpts only.\n\n"
+            "7. When scoring `job_match`, prioritize these signals in order:\n"
+            "   - whether the answer reflects role-specific competency from `position_profile.target_competency`\n"
+            "   - whether the answer uses role-relevant scenarios / technologies / engineering trade-offs\n"
+            "   - whether the answer goes beyond generic correctness and shows practical fit for the target role\n"
+            "   - do not simply mirror `technical_accuracy`; a technically correct but generic answer can have only moderate `job_match`\n"
+            "8. When scoring HR `confidence`, prioritize these signals in order:\n"
+            "   - whether the candidate expresses clear judgments, choices, and reasons instead of repeated hedging\n"
+            "   - whether the candidate shows stable ownership of actions, outcomes, strengths, and weaknesses\n"
+            "   - whether the answer stays composed and coherent when discussing pressure, failure, trade-offs, or self-evaluation\n"
+            "   - whether the confidence is appropriately bounded: admitting uncertainty can still score well if the stance remains honest and stable\n"
+            "   - do not reward aggression, exaggerated self-praise, or mere verbosity; do not punish introversion or calm tone\n\n"
             "Return JSON with this schema:\n"
             "{\n"
             '  "rubric_eval": {\n'
@@ -698,14 +979,18 @@ class LLMManager:
                 prompt += f"\n候选人项目：{projects[0].get('name', '')}"
         if rag_context:
             prompt += f"\n参考知识：\n{rag_context}"
-        prompt += "\n请直接给出问题，不要多余的解释。"
+        prompt += "\n参考知识只用于帮助你选题，不允许直接复述成答案、示例或讲解。请直接给出一个面试问题，不要多余解释。"
         messages = [{"role": "system", "content": self.system_prompt}, {"role": "user", "content": prompt}]
         try:
             response = Generation.call(model=self.model, messages=messages, top_p=0.7, top_k=50, temperature=0.7, max_tokens=500, timeout=self.timeout)
             if response.status_code == 200:
                 question = response.output.text
                 logger.info(f"✓ 生成{round_info['name']}问题 - 职位：{position}")
-                return question
+                return self._sanitize_interviewer_output(
+                    question,
+                    round_type=round_type,
+                    rag_context=rag_context,
+                )
             else:
                 logger.error(f"✗ API 错误：{response.message}")
                 return ""
@@ -741,7 +1026,8 @@ class LLMManager:
         user_content = []
         if rag_context:
             user_content.append(
-                "以下是与当前问题相关的参考知识，请优先基于这些知识判断候选人回答质量，并据此生成追问：\n"
+                "以下是与当前问题相关的参考知识，请优先基于这些知识判断候选人回答质量，并据此生成追问。\n"
+                "这些内容只用于判断和设计追问，禁止直接把参考知识讲给候选人听，禁止直接给出标准答案、完整例子或示范代码：\n"
                 f"{rag_context}"
             )
         user_content.append(f"当前问题：{current_question}\n\n候选人回答：{user_answer}")
@@ -752,7 +1038,13 @@ class LLMManager:
             if response.status_code == 200:
                 feedback = response.output.text
                 logger.info(f"✓ 处理回答 - 轮次：{round_type}, 职位：{position}")
-                return feedback
+                return self._sanitize_interviewer_output(
+                    feedback,
+                    round_type=round_type,
+                    current_question=current_question,
+                    rag_context=rag_context,
+                    user_answer=user_answer,
+                )
             else:
                 logger.error(f"✗ API 错误：{response.message}")
                 return ""

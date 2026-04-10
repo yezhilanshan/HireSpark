@@ -206,7 +206,7 @@ function ReviewPageContent() {
             <main className="flex-1 overflow-y-auto">
                 <div className="mx-auto max-w-6xl px-6 py-8 space-y-6">
                     <section className="rounded-3xl border border-[#E5E5E5] bg-[#FAF9F6] p-6 shadow-sm sm:p-8">
-                <p className="text-xs font-medium uppercase tracking-[0.18em] text-[#999999]">Single Session Review</p>
+                <p className="text-xs font-medium uppercase tracking-[0.18em] text-[#999999]">单场复盘</p>
                 <h1 className="mt-2 text-3xl font-semibold tracking-tight text-[#111111] sm:text-4xl">先看结论，再进入完整报告</h1>
                 <p className="mt-2 text-sm text-[#666666]">你可以先用本页快速定位“下一次训练该做什么”，再进入完整分析页查看证据细节。</p>
                 {interviewId && (

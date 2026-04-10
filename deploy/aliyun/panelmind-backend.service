@@ -1,0 +1,15 @@
+[Unit]
+Description=PanelMind Backend
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/panelmind
+EnvironmentFile=/opt/panelmind/.env.production
+ExecStart=/opt/panelmind/.venv/bin/python backend/app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

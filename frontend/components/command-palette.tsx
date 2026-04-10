@@ -1,78 +1,117 @@
 'use client'
 
-import { useState, useEffect } from 'react'
-import { motion, AnimatePresence } from 'motion/react'
-import { Search, LayoutDashboard, History, BookOpen, Settings, LogOut, ArrowRight, Film } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
+import { AnimatePresence, motion } from 'motion/react'
+import {
+    ArrowRight,
+    BarChart3,
+    BookOpen,
+    Film,
+    History,
+    LayoutDashboard,
+    LogOut,
+    Search,
+    Settings,
+} from 'lucide-react'
 import { useRouter } from 'next/navigation'
 
-const commands = [
-    { id: 'dashboard', title: '工作区', icon: LayoutDashboard, href: '/dashboard', section: '导航' },
-    { id: 'questions', title: '题库', icon: BookOpen, href: '/dashboard/questions', section: '导航' },
+type CommandItem = {
+    id: string
+    title: string
+    icon: typeof Search
+    href?: string
+    section: string
+    action?: 'logout'
+}
+
+const commands: CommandItem[] = [
+    { id: 'dashboard', title: '工作台', icon: LayoutDashboard, href: '/dashboard', section: '导航' },
+    { id: 'questions', title: '题库中心', icon: BookOpen, href: '/dashboard/questions', section: '导航' },
     { id: 'history', title: '历史记录', icon: History, href: '/history', section: '导航' },
     { id: 'replay', title: '面试复盘', icon: Film, href: '/replay', section: '导航' },
-    { id: 'start', title: '开始面试', icon: ArrowRight, href: '/interview/setup', section: '操作' },
-    { id: 'settings', title: '系统设置', icon: Settings, href: '/settings', section: '账户' },
-    { id: 'logout', title: '退出登录', icon: LogOut, href: '/', section: '账户' },
+    { id: 'insights', title: '近期总结', icon: BarChart3, href: '/insights', section: '导航' },
+    { id: 'start', title: '开始新面试', icon: ArrowRight, href: '/interview-setup', section: '操作' },
+    { id: 'settings', title: '设置', icon: Settings, href: '/settings', section: '账户' },
+    { id: 'logout', title: '退出登录', icon: LogOut, section: '账户', action: 'logout' },
 ]
 
 export function CommandPalette() {
+    const router = useRouter()
     const [isOpen, setIsOpen] = useState(false)
     const [search, setSearch] = useState('')
     const [selectedIndex, setSelectedIndex] = useState(0)
-    const router = useRouter()
+
+    const filteredCommands = useMemo(
+        () => commands.filter((cmd) => cmd.title.toLowerCase().includes(search.trim().toLowerCase())),
+        [search]
+    )
 
     useEffect(() => {
-        const down = (e: KeyboardEvent) => {
-            if (e.key === 'k' && (e.metaKey || e.ctrlKey)) {
-                e.preventDefault()
+        const handleGlobalKeydown = (event: KeyboardEvent) => {
+            const normalizedKey = typeof event.key === 'string' ? event.key.toLowerCase() : ''
+            if (normalizedKey === 'k' && (event.metaKey || event.ctrlKey)) {
+                event.preventDefault()
                 setIsOpen((open) => !open)
             }
-            if (e.key === 'Escape') {
+            if (event.key === 'Escape') {
                 setIsOpen(false)
             }
         }
 
-        document.addEventListener('keydown', down)
-        return () => document.removeEventListener('keydown', down)
+        document.addEventListener('keydown', handleGlobalKeydown)
+        return () => document.removeEventListener('keydown', handleGlobalKeydown)
     }, [])
-
-    const filteredCommands = commands.filter((cmd) => cmd.title.toLowerCase().includes(search.toLowerCase()))
 
     useEffect(() => {
         setSelectedIndex(0)
     }, [search])
 
-    useEffect(() => {
-        const handleKeyDown = (e: KeyboardEvent) => {
-            if (!isOpen || filteredCommands.length === 0) {
-                return
-            }
+    const runCommand = async (command: CommandItem | undefined) => {
+        if (!command) return
+        setIsOpen(false)
 
-            if (e.key === 'ArrowDown') {
-                e.preventDefault()
+        if (command.action === 'logout') {
+            await fetch('/api/auth/logout', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+            }).catch(() => null)
+            router.replace('/')
+            router.refresh()
+            return
+        }
+
+        if (command.href) {
+            router.push(command.href)
+        }
+    }
+
+    useEffect(() => {
+        const handleListKeydown = (event: KeyboardEvent) => {
+            if (!isOpen || filteredCommands.length === 0) return
+
+            if (event.key === 'ArrowDown') {
+                event.preventDefault()
                 setSelectedIndex((prev) => (prev + 1) % filteredCommands.length)
             }
-            if (e.key === 'ArrowUp') {
-                e.preventDefault()
+
+            if (event.key === 'ArrowUp') {
+                event.preventDefault()
                 setSelectedIndex((prev) => (prev - 1 + filteredCommands.length) % filteredCommands.length)
             }
-            if (e.key === 'Enter') {
-                e.preventDefault()
-                const selected = filteredCommands[selectedIndex]
-                if (selected) {
-                    setIsOpen(false)
-                    router.push(selected.href)
-                }
+
+            if (event.key === 'Enter') {
+                event.preventDefault()
+                void runCommand(filteredCommands[selectedIndex])
             }
         }
 
-        document.addEventListener('keydown', handleKeyDown)
-        return () => document.removeEventListener('keydown', handleKeyDown)
-    }, [isOpen, filteredCommands, selectedIndex, router])
+        document.addEventListener('keydown', handleListKeydown)
+        return () => document.removeEventListener('keydown', handleListKeydown)
+    }, [filteredCommands, isOpen, router, selectedIndex])
 
     return (
         <AnimatePresence>
-            {isOpen && (
+            {isOpen ? (
                 <>
                     <motion.div
                         initial={{ opacity: 0 }}
@@ -81,75 +120,72 @@ export function CommandPalette() {
                         className="fixed inset-0 z-50 bg-black/20 backdrop-blur-sm"
                         onClick={() => setIsOpen(false)}
                     />
-                    <div className="fixed inset-0 z-50 flex items-start justify-center pt-[15vh] pointer-events-none">
+
+                    <div className="pointer-events-none fixed inset-0 z-50 flex items-start justify-center pt-[15vh]">
                         <motion.div
-                            initial={{ opacity: 0, scale: 0.95, y: -20 }}
+                            initial={{ opacity: 0, scale: 0.96, y: -16 }}
                             animate={{ opacity: 1, scale: 1, y: 0 }}
-                            exit={{ opacity: 0, scale: 0.95, y: -20 }}
-                            transition={{ type: 'spring', stiffness: 400, damping: 30 }}
-                            className="w-full max-w-xl bg-white rounded-2xl shadow-2xl overflow-hidden border border-[#E5E5E5] pointer-events-auto"
+                            exit={{ opacity: 0, scale: 0.96, y: -16 }}
+                            transition={{ type: 'spring', stiffness: 340, damping: 28 }}
+                            className="pointer-events-auto w-full max-w-xl overflow-hidden rounded-3xl border border-[#E5E5E5] bg-white shadow-2xl"
                         >
-                            <div className="flex items-center px-4 py-4 border-b border-[#E5E5E5]">
-                                <Search className="w-5 h-5 text-[#999999] mr-3" />
+                            <div className="flex items-center border-b border-[#E5E5E5] px-4 py-4">
+                                <Search className="mr-3 h-5 w-5 text-[#999999]" />
                                 <input
                                     autoFocus
-                                    className="flex-1 bg-transparent outline-none text-[#111111] placeholder:text-[#999999] text-lg"
-                                    placeholder="搜索命令或页面..."
                                     value={search}
-                                    onChange={(e) => setSearch(e.target.value)}
+                                    onChange={(event) => setSearch(event.target.value)}
+                                    placeholder="搜索页面、操作或功能"
+                                    className="flex-1 bg-transparent text-lg text-[#111111] outline-none placeholder:text-[#999999]"
                                 />
-                                <div className="flex items-center gap-1 text-xs text-[#999999] font-mono bg-[#F5F5F5] px-2 py-1 rounded">
-                                    <span>esc</span>
-                                </div>
+                                <div className="rounded bg-[#F5F5F5] px-2 py-1 font-mono text-xs text-[#999999]">esc</div>
                             </div>
 
                             <div className="max-h-[60vh] overflow-y-auto p-2">
                                 {filteredCommands.length === 0 ? (
-                                    <div className="py-12 text-center text-[#666666] text-sm">未找到结果</div>
+                                    <div className="py-12 text-center text-sm text-[#666666]">没有找到匹配的结果</div>
                                 ) : (
                                     <div className="space-y-1">
-                                        {filteredCommands.map((cmd, index) => {
-                                            const isSelected = index === selectedIndex
+                                        {filteredCommands.map((command, index) => {
+                                            const selected = index === selectedIndex
                                             return (
-                                                <div
-                                                    key={cmd.id}
-                                                    className={`flex items-center px-4 py-3 rounded-xl cursor-pointer transition-colors ${
-                                                        isSelected ? 'bg-[#F5F5F5] text-[#111111]' : 'text-[#666666] hover:bg-[#FAFAFA]'
+                                                <button
+                                                    key={command.id}
+                                                    type="button"
+                                                    className={`flex w-full items-center rounded-2xl px-4 py-3 text-left transition-colors ${
+                                                        selected ? 'bg-[#F5F5F5] text-[#111111]' : 'text-[#666666] hover:bg-[#FAFAFA]'
                                                     }`}
                                                     onMouseEnter={() => setSelectedIndex(index)}
-                                                    onClick={() => {
-                                                        setIsOpen(false)
-                                                        router.push(cmd.href)
-                                                    }}
+                                                    onClick={() => void runCommand(command)}
                                                 >
-                                                    <cmd.icon className={`w-5 h-5 mr-3 ${isSelected ? 'text-[#111111]' : 'text-[#999999]'}`} />
-                                                    <span className="font-medium">{cmd.title}</span>
-                                                    {isSelected && <span className="ml-auto text-xs text-[#999999] font-mono">↵</span>}
-                                                </div>
+                                                    <command.icon className={`mr-3 h-5 w-5 ${selected ? 'text-[#111111]' : 'text-[#999999]'}`} />
+                                                    <span className="font-medium">{command.title}</span>
+                                                    <span className="ml-auto text-xs text-[#999999]">{command.section}</span>
+                                                </button>
                                             )
                                         })}
                                     </div>
                                 )}
                             </div>
 
-                            <div className="bg-[#FAFAFA] border-t border-[#E5E5E5] px-4 py-3 flex items-center justify-between text-xs text-[#999999]">
+                            <div className="flex items-center justify-between border-t border-[#E5E5E5] bg-[#FAFAFA] px-4 py-3 text-xs text-[#999999]">
                                 <div className="flex items-center gap-4">
                                     <span className="flex items-center gap-1">
-                                        <kbd className="font-mono bg-[#E5E5E5] px-1.5 py-0.5 rounded text-[#666666]">↑</kbd>
-                                        <kbd className="font-mono bg-[#E5E5E5] px-1.5 py-0.5 rounded text-[#666666]">↓</kbd>
-                                        导航
+                                        <kbd className="rounded bg-[#E5E5E5] px-1.5 py-0.5 font-mono text-[#666666]">↑</kbd>
+                                        <kbd className="rounded bg-[#E5E5E5] px-1.5 py-0.5 font-mono text-[#666666]">↓</kbd>
+                                        切换
                                     </span>
                                     <span className="flex items-center gap-1">
-                                        <kbd className="font-mono bg-[#E5E5E5] px-1.5 py-0.5 rounded text-[#666666]">↵</kbd>
-                                        选择
+                                        <kbd className="rounded bg-[#E5E5E5] px-1.5 py-0.5 font-mono text-[#666666]">enter</kbd>
+                                        打开
                                     </span>
                                 </div>
-                                <div className="font-medium">HireSpark</div>
+                                <div className="font-medium text-[#666666]">PanelMind</div>
                             </div>
                         </motion.div>
                     </div>
                 </>
-            )}
+            ) : null}
         </AnimatePresence>
     )
 }

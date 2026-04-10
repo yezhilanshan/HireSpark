@@ -183,6 +183,7 @@ export default function InterviewPage() {
     const [isRecording, setIsRecording] = useState(false)
     const [sessionElapsed, setSessionElapsed] = useState(0)
     const [showCompletionModal, setShowCompletionModal] = useState(false)
+    const [isEndingInterview, setIsEndingInterview] = useState(false)
     const [completedInterviewId, setCompletedInterviewId] = useState('')
 
     // 检测数据
@@ -195,6 +196,7 @@ export default function InterviewPage() {
     const currentTurnIdRef = useRef('')
     const interruptEpochRef = useRef(0)
     const activeTtsJobIdRef = useRef('')
+    const autoEndingRef = useRef(false)
     const autoStartTriggeredRef = useRef(false)
     const pendingTtsTextRef = useRef('')
     const answerSessionIdRef = useRef('')
@@ -1007,7 +1009,7 @@ export default function InterviewPage() {
             }
         } catch (error) {
             console.error('Camera error:', error)
-            alert('Camera access denied')
+            alert('摄像头访问被拒绝')
             router.push('/dashboard')
         }
     }
@@ -1418,6 +1420,7 @@ export default function InterviewPage() {
             socketClient.off('session_control_notice')
             socketClient.off('pipeline_error')
             socketClient.off('error')
+            socketClient.off('interview_should_end')
             socketClient.off('interview_ended')
 
             socketClient.on('orchestrator_state', (data: any) => {
@@ -1714,6 +1717,7 @@ export default function InterviewPage() {
                 }
                 clearLlmTimeout()
                 setIsProcessing(false)
+                setIsEndingInterview(false)
                 if (data?.code === 'TTS_SYNTH_FAIL') {
                     const shouldFallbackToBrowser =
                         pendingTtsTextRef.current
@@ -1753,11 +1757,28 @@ export default function InterviewPage() {
                 setIsProcessing(false)
             })
 
+            socketClient.on('interview_should_end', (data: any) => {
+                if (data?.session_id && sessionIdRef.current && data.session_id !== sessionIdRef.current) return
+                if (autoEndingRef.current) return
+                if (!sessionIdRef.current) return
+                autoEndingRef.current = true
+                void (async () => {
+                    try {
+                        await requestSessionEnd(socketClient, sessionIdRef.current)
+                    } catch (error) {
+                        autoEndingRef.current = false
+                        console.error('[Interview] 自动结束失败:', error)
+                    }
+                })()
+            })
+
             socketClient.on('interview_ended', (data: any) => {
                 if (data?.session_id && sessionIdRef.current && data.session_id !== sessionIdRef.current) return
                 console.log('Interview ended:', data)
                 const endedSessionId = String(data?.session_id || sessionIdRef.current || '').trim()
                 const endedInterviewId = String(data?.interview_id || buildInterviewId(endedSessionId)).trim()
+                autoEndingRef.current = false
+                setIsEndingInterview(false)
                 void stopVideoRecording(endedSessionId, true)
                 setCompletedInterviewId(endedInterviewId)
                 interviewStartedRef.current = false
@@ -1779,7 +1800,9 @@ export default function InterviewPage() {
 
     const startInterviewSession = (socketClient: SocketClient) => {
         socketRef.current = socketClient
+        autoEndingRef.current = false
         setShowCompletionModal(false)
+        setIsEndingInterview(false)
         clearLlmTimeout()
         clearPendingCommit()
         stopCurrentTts()
@@ -1832,29 +1855,32 @@ export default function InterviewPage() {
         startInterviewSession(socket)
     }, [cameraReady, socket, interviewStarted, showCompletionModal])
 
-    const handleEndInterview = async () => {
-        if (!socket || !sessionIdRef.current) return
-        const endedSessionId = sessionIdRef.current
-        const pendingUploadId = videoUploadIdRef.current
-        const endedInterviewId = buildInterviewId(endedSessionId)
+    const requestSessionEnd = async (socketClient: SocketClient, endedSessionId: string) => {
         clearLlmTimeout()
         clearPendingCommit()
         stopCurrentTts()
         stopAudioRecording()
         speechActiveRef.current = false
         clearSpeechPrebuffer()
-        await stopVideoRecording(endedSessionId, true)
-        interviewStartedRef.current = false
-        setInterviewStarted(false)
-        setSessionElapsed(0)
-        resetAnswerSessionUi()
-        setCompletedInterviewId(endedInterviewId)
-        socket.emit('session_end', {
-            session_id: endedSessionId,
-            video_upload_id: pendingUploadId || '',
+        setIsEndingInterview(true)
+        void stopVideoRecording(endedSessionId, true).catch((error) => {
+            console.warn('[Interview] video finalize after session end failed:', error)
         })
-        setUserAnswer('')
-        socketRef.current = null
+        socketClient.emit('session_end', {
+            session_id: endedSessionId,
+        })
+    }
+
+    const handleEndInterview = async () => {
+        if (!socket || !sessionIdRef.current || autoEndingRef.current) return
+        autoEndingRef.current = true
+        try {
+            await requestSessionEnd(socket, sessionIdRef.current)
+        } catch (error) {
+            autoEndingRef.current = false
+            setIsEndingInterview(false)
+            console.error('[Interview] 手动结束失败:', error)
+        }
     }
 
     const closeCompletionModal = () => {
@@ -1960,23 +1986,23 @@ export default function InterviewPage() {
 
             let riskScore = 18
             if (!hasFace) {
-                riskScore = noFaceLong ? 88 : 58
+                riskScore = noFaceLong ? 88 : 35
             } else {
-                if (poseUnstable) riskScore = Math.max(riskScore, 54)
-                if (gazeDriftHigh) riskScore = Math.max(riskScore, 62)
-                if (blinkHigh) riskScore = Math.max(riskScore, 50)
-                if (distanceTooClose || distanceTooFar) riskScore = Math.max(riskScore, 47)
+                if (poseUnstable) riskScore = Math.max(riskScore, 48)
+                if (gazeDriftHigh) riskScore = Math.max(riskScore, 58)
+                if (blinkHigh) riskScore = Math.max(riskScore, 32)
+                if (distanceTooClose || distanceTooFar) riskScore = Math.max(riskScore, 25)
                 if (faceCount > 1) riskScore = Math.max(riskScore, 85)
-                if (!hasLandmarks) riskScore = Math.max(riskScore, 40)
+                if (!hasLandmarks) riskScore = Math.max(riskScore, 30)
 
                 if (pulseMetrics.status === 'unstable') {
-                    riskScore = Math.max(riskScore, 46)
+                    riskScore = Math.max(riskScore, 24)
                 } else if (pulseMetrics.status === 'error') {
-                    riskScore = Math.max(riskScore, 66)
-                } else if (!pulseMetrics.isReliable) {
                     riskScore = Math.max(riskScore, 28)
+                } else if (!pulseMetrics.isReliable) {
+                    riskScore = Math.max(riskScore, 20)
                 } else if (pulseMetrics.hr !== null && (pulseMetrics.hr < 48 || pulseMetrics.hr > 125)) {
-                    riskScore = Math.max(riskScore, 52)
+                    riskScore = Math.max(riskScore, 22)
                 }
             }
             riskScore = clamp(riskScore, 0, 100)
@@ -2105,14 +2131,20 @@ export default function InterviewPage() {
     if (interviewStarted) {
         return (
             <div
-                className="interview-shell-bg -m-3 flex h-[100dvh] flex-col overflow-hidden font-sans text-[#111111] sm:-m-4 lg:-m-5"
+                className="interview-shell-bg relative flex min-h-[100dvh] w-full flex-col overflow-hidden font-sans text-[#111111] md:h-[100dvh]"
             >
-                <header className="z-10 shrink-0 border-b border-[#E5E5E5] bg-white/88 px-3 py-2.5 backdrop-blur-md sm:px-5">
+                <header className="z-10 shrink-0 border-b border-[#E5E5E5] bg-white/88 px-3 py-2 backdrop-blur-md sm:px-4 md:px-5">
                     <div className="flex items-center justify-between gap-4">
                         <div className="flex min-w-0 items-center gap-3">
                             <button
                                 onClick={handleEndInterview}
-                                className="rounded-full p-2 text-[#666666] transition-colors hover:bg-[#F5F5F5] hover:text-[#111111]"
+                                disabled={isEndingInterview}
+                                type="button"
+                                className={`rounded-full p-2 text-[#666666] transition-colors ${
+                                    isEndingInterview
+                                        ? 'cursor-wait opacity-60'
+                                        : 'hover:bg-[#F5F5F5] hover:text-[#111111]'
+                                }`}
                                 aria-label="结束并返回"
                             >
                                 <X size={18} />
@@ -2121,6 +2153,16 @@ export default function InterviewPage() {
                             <span className="truncate text-sm font-semibold tracking-tight text-[#111111]">AI 面试进行中</span>
                         </div>
                         <div className="flex items-center gap-3 sm:gap-6">
+                            <button
+                                onClick={handleEndInterview}
+                                disabled={isEndingInterview}
+                                className={`inline-flex items-center rounded-full border border-[#E5E5E5] bg-white px-4 py-1.5 text-sm font-medium text-[#111111] transition-colors ${
+                                    isEndingInterview ? 'cursor-wait opacity-60' : 'hover:bg-[#F5F5F5]'
+                                }`}
+                                type="button"
+                            >
+                                结束面试
+                            </button>
                             <div className="flex items-center gap-2 text-sm text-[#666666]">
                                 <span className={`h-2 w-2 rounded-full ${isRecording ? 'bg-[#E27A5F] animate-pulse' : isAiSpeaking ? 'bg-[#f59e0b] animate-pulse' : 'bg-[#2E6A45]'}`} />
                                 {isRecording ? 'Recording' : isAiSpeaking ? 'Interviewer Speaking' : 'Session Active'}
@@ -2130,9 +2172,9 @@ export default function InterviewPage() {
                     </div>
                 </header>
 
-                <main className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden p-2.5 md:flex-row md:gap-3 md:p-3 lg:gap-4 lg:p-4">
+                <main className="flex min-h-0 w-full flex-1 flex-col gap-2.5 overflow-hidden p-2 md:flex-row md:gap-2.5 md:p-2.5 lg:gap-3 lg:p-3">
                     <div className="flex min-w-0 flex-1 flex-col gap-2.5 md:flex-[1.58]">
-                        <div className="relative min-h-0 flex-[1_1_62%] overflow-hidden rounded-2xl border border-[#1D1D1D] bg-[#0B0B0D] shadow-[0_22px_40px_-28px_rgba(0,0,0,0.75)]">
+                        <div className="relative min-h-[40svh] overflow-hidden rounded-2xl border border-[#1D1D1D] bg-[#0B0B0D] shadow-[0_22px_40px_-28px_rgba(0,0,0,0.75)] md:min-h-0 md:flex-[1_1_64%]">
                             <video
                                 ref={videoRef}
                                 autoPlay
@@ -2156,8 +2198,8 @@ export default function InterviewPage() {
                                     </div>
                                 </div>
                             )}
-                            <div className="absolute left-3 top-3 z-20 max-w-[84%] rounded-xl border border-white/15 bg-black/40 px-3 py-1.5 text-xs text-white backdrop-blur">
-                                <p className="mb-1 text-[10px] uppercase tracking-wider text-white/70">Current Question</p>
+                            <div className="absolute left-3 top-3 z-20 max-w-[calc(100%-1.5rem)] rounded-xl border border-white/15 bg-black/40 px-3 py-1.5 text-xs text-white backdrop-blur sm:max-w-[84%]">
+                                <p className="mb-1 text-[10px] uppercase tracking-wider text-white/70">当前问题</p>
                                 <p className="line-clamp-3 text-sm leading-relaxed">{displayQuestion}</p>
                             </div>
                             <div className="absolute bottom-3 left-3 inline-flex items-center gap-2 rounded-xl border border-white/10 bg-black/45 px-3 py-1.5 text-xs text-white backdrop-blur">
@@ -2166,7 +2208,7 @@ export default function InterviewPage() {
                                 </span>
                                 You
                             </div>
-                            <div className="absolute bottom-3 right-3 flex h-20 w-36 items-center justify-center overflow-hidden rounded-xl border border-white/10 bg-[#1F1F22] shadow-2xl">
+                            <div className="absolute bottom-3 right-3 flex h-16 w-28 items-center justify-center overflow-hidden rounded-xl border border-white/10 bg-[#1F1F22] shadow-2xl sm:h-20 sm:w-36">
                                 <span className={`h-3 w-3 rounded-full ${isAiSpeaking ? 'animate-pulse bg-[#E27A5F]' : 'bg-white/75'}`} />
                                 <span className={`absolute h-10 w-10 rounded-full border border-white/20 ${isAiSpeaking ? 'animate-ping' : ''}`} />
                                 <span className="absolute bottom-2 left-2 text-[10px] uppercase tracking-wider text-white/70">
@@ -2175,7 +2217,7 @@ export default function InterviewPage() {
                             </div>
                         </div>
 
-                        <div className="h-[clamp(148px,24vh,208px)] shrink-0 rounded-2xl border border-[#E5E5E5] bg-white p-4 shadow-sm lg:p-5">
+                        <div className="min-h-[160px] shrink-0 rounded-2xl border border-[#E5E5E5] bg-white p-3.5 shadow-sm md:h-[clamp(132px,20vh,180px)] lg:p-4">
                             <div className="mb-3 flex h-full flex-col">
                                 <div className="flex-1 overflow-y-auto pr-2">
                                     {userAnswer ? (
@@ -2233,9 +2275,9 @@ export default function InterviewPage() {
                         </div>
                     </div>
 
-                    <aside className="flex w-full shrink-0 flex-col overflow-hidden rounded-2xl border border-[#E5E5E5] bg-white/95 shadow-sm md:w-[300px] lg:w-[320px]">
+                    <aside className="flex min-h-[320px] w-full shrink-0 flex-col overflow-hidden rounded-2xl border border-[#E5E5E5] bg-white/95 shadow-sm md:min-h-0 md:w-[min(280px,28vw)] lg:w-[300px]">
                         <div className="border-b border-[#E5E5E5] bg-[#FAFAFA] px-4 py-3">
-                            <h3 className="text-sm font-medium text-[#111111]">Interview Transcript</h3>
+                            <h3 className="text-sm font-medium text-[#111111]">面试转写</h3>
                             <p className="mt-1 text-xs text-[#666666]">已记录 {chatMessages.length} 条对话</p>
                         </div>
 
@@ -2281,8 +2323,8 @@ export default function InterviewPage() {
                             <div className="border-t border-[#E5E5E5] bg-[#FAFAFA]">
                                 <div className="flex items-center justify-between gap-2 px-3 py-2">
                                     <div>
-                                        <p className="text-[11px] font-semibold uppercase tracking-wider text-[#111111]">ASR Diagnostics</p>
-                                        <p className="text-[10px] text-[#777268]">{asrDebugEvents.length} events</p>
+                                        <p className="text-[11px] font-semibold uppercase tracking-wider text-[#111111]">语音识别诊断</p>
+                                        <p className="text-[10px] text-[#777268]">{asrDebugEvents.length} 条事件</p>
                                     </div>
                                     <div className="flex items-center gap-1.5">
                                         <button
@@ -2334,6 +2376,20 @@ export default function InterviewPage() {
                         )}
                     </aside>
                 </main>
+
+                {isEndingInterview && (
+                    <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/30 p-4 backdrop-blur-sm">
+                        <div className="w-full max-w-sm rounded-3xl border border-white/20 bg-white/92 p-6 text-center shadow-2xl">
+                            <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-full bg-[#111111] text-white">
+                                <Loader2 className="h-6 w-6 animate-spin" />
+                            </div>
+                            <h3 className="mt-4 text-xl font-semibold text-[#111111]">正在结束面试</h3>
+                            <p className="mt-2 text-sm leading-6 text-[#666666]">
+                                正在保存会话内容并生成报告，你可以稍等几秒。
+                            </p>
+                        </div>
+                    </div>
+                )}
             </div>
         )
     }

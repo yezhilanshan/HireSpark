@@ -1,7 +1,8 @@
 """
 全局 AI 助理服务（非面试链路）
 支持 provider:
-- openrouter（默认）
+- qwen / dashscope（阿里百炼）
+- openrouter
 - ollama（兼容回退）
 """
 import os
@@ -9,12 +10,16 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
+import dashscope
 import requests
+from dashscope import Generation
 
 from utils.config_loader import config
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+DEFAULT_ASSISTANT_QWEN_MODEL = "qwen-plus"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -35,6 +40,35 @@ def _safe_bool(value: Any, default: bool) -> bool:
     if raw in {"0", "false", "no", "off"}:
         return False
     return bool(default)
+
+
+def _resolve_dashscope_api_key(config_value: Optional[str] = None) -> Optional[str]:
+    env_key = (
+        os.environ.get("ASSISTANT_DASHSCOPE_API_KEY")
+        or os.environ.get("ASSISTANT_BAILIAN_API_KEY")
+        or os.environ.get("DASHSCOPE_API_KEY")
+        or os.environ.get("BAILIAN_API_KEY")
+    )
+    if env_key:
+        return str(env_key).strip()
+
+    if isinstance(config_value, str):
+        value = config_value.strip()
+        if value and not (value.startswith("${") and value.endswith("}")):
+            return value
+
+    return None
+
+
+def _safe_field(obj: Any, key: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    try:
+        return getattr(obj, key)
+    except Exception:
+        return default
 
 
 def _safe_text_content(value: Any) -> str:
@@ -151,19 +185,39 @@ class AssistantService:
         self.enabled = _env_bool("ASSISTANT_ENABLED", bool(config.get("assistant.enabled", True)))
         self.provider = (
             str(os.environ.get("ASSISTANT_PROVIDER", "")).strip().lower()
-            or str(config.get("assistant.provider", "openrouter")).strip().lower()
-            or "openrouter"
+            or str(config.get("assistant.provider", "qwen")).strip().lower()
+            or "qwen"
         )
         self.model = (
             str(os.environ.get("ASSISTANT_MODEL", "")).strip()
-            or str(config.get("assistant.model", "stepfun/step-3.5-flash:free")).strip()
-            or "stepfun/step-3.5-flash:free"
+            or str(config.get("assistant.model", "qvq-max-2025-03-25")).strip()
+            or "qvq-max-2025-03-25"
+        )
+        self.dashscope_api_key = _resolve_dashscope_api_key(
+            config.get("assistant.qwen.api_key", config.get("llm.api_key"))
         )
         self.timeout = float(config.get("assistant.timeout", 45) or 45)
         self.max_history = int(config.get("assistant.max_history", 6) or 6)
         self.max_context_chars = int(config.get("assistant.max_context_chars", 1200) or 1200)
         self.default_max_tokens = int(config.get("assistant.default_max_tokens", 512) or 512)
         self.default_temperature = float(config.get("assistant.default_temperature", 0.3) or 0.3)
+
+        if self.provider in {"qwen", "dashscope", "aliyun"} and self.model.startswith("qvq-"):
+            fallback_model = (
+                str(os.environ.get("ASSISTANT_QWEN_TEXT_MODEL", "")).strip()
+                or str(config.get("assistant.qwen.fallback_text_model", DEFAULT_ASSISTANT_QWEN_MODEL)).strip()
+                or DEFAULT_ASSISTANT_QWEN_MODEL
+            )
+            logger.warning(
+                "Assistant 文本助手当前不兼容视觉推理模型 %s，已自动回退到 %s",
+                self.model,
+                fallback_model,
+            )
+            self.model = fallback_model
+
+        if self.dashscope_api_key:
+            dashscope.api_key = self.dashscope_api_key
+            Generation.api_key = self.dashscope_api_key
 
         # OpenRouter 配置
         self.openrouter_base_url = (
@@ -237,13 +291,16 @@ class AssistantService:
                 (
                     "Assistant 服务初始化完成 - "
                     f"provider={self.provider}, model={self.model}, timeout={self.timeout}s, "
-                    f"openrouter_base={self.openrouter_base_url}, ollama_base={self.ollama_base_url}"
+                    f"openrouter_base={self.openrouter_base_url}, ollama_base={self.ollama_base_url}, "
+                    f"dashscope_ready={bool(self.dashscope_api_key)}"
                 )
             )
 
     def check_enabled(self) -> bool:
         if not self.enabled:
             return False
+        if self.provider in {"qwen", "dashscope", "aliyun"}:
+            return bool(self.dashscope_api_key)
         if self.provider == "openrouter":
             return bool(self.openrouter_api_key)
         if self.provider == "ollama":
@@ -302,6 +359,42 @@ class AssistantService:
             "error": "",
             "model_available": False,
         }
+
+        if self.provider in {"qwen", "dashscope", "aliyun"}:
+            payload["api_key_configured"] = bool(self.dashscope_api_key)
+            if not self.dashscope_api_key:
+                payload["error"] = "DASHSCOPE_API_KEY missing"
+                return payload
+
+            started_at = time.time()
+            try:
+                response = Generation.call(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": "You are a health checker. Reply with OK only."},
+                        {"role": "user", "content": "ping"},
+                    ],
+                    top_p=0.1,
+                    top_k=10,
+                    temperature=0.0,
+                    max_tokens=8,
+                    timeout=min(float(self.timeout or 30), 15.0),
+                )
+                payload["latency_ms"] = round((time.time() - started_at) * 1000.0, 2)
+                if getattr(response, "status_code", None) != 200:
+                    payload["error"] = str(
+                        getattr(response, "message", "") or getattr(response, "code", "") or "unknown_error"
+                    )
+                    return payload
+
+                payload["success"] = True
+                payload["model_available"] = True
+                payload["reply_preview"] = str(getattr(getattr(response, "output", None), "text", "") or "").strip()[:48]
+                return payload
+            except Exception as exc:
+                payload["latency_ms"] = round((time.time() - started_at) * 1000.0, 2)
+                payload["error"] = str(exc)[:300]
+                return payload
 
         if self.provider == "openrouter":
             payload["base_url"] = self.openrouter_base_url
@@ -379,6 +472,64 @@ class AssistantService:
 
         payload["error"] = f"unsupported provider: {self.provider}"
         return payload
+
+    def _chat_qwen(
+        self,
+        *,
+        messages: List[Dict[str, str]],
+        temperature: float,
+        max_tokens: int,
+    ) -> Dict[str, Any]:
+        started_at = time.time()
+        try:
+            response = Generation.call(
+                model=self.model,
+                messages=messages,
+                top_p=0.8,
+                top_k=40,
+                temperature=round(max(0.0, min(1.2, float(temperature))), 3),
+                max_tokens=int(max(64, min(4096, int(max_tokens)))),
+                timeout=self.timeout,
+            )
+            latency_ms = round((time.time() - started_at) * 1000.0, 2)
+            if _safe_field(response, "status_code") != 200:
+                return {
+                    "success": False,
+                    "error": str(_safe_field(response, "code", "") or "QWEN_API_ERROR"),
+                    "message": str(_safe_field(response, "message", "") or "assistant request failed"),
+                    "latency_ms": latency_ms,
+                }
+
+            output_payload = _safe_field(response, "output")
+            reply_text = str(_safe_field(output_payload, "text", "") or "").strip()
+            if self.force_plain_text:
+                reply_text = _to_plain_natural_text(reply_text)
+            if not reply_text:
+                return {
+                    "success": False,
+                    "error": "EMPTY_REPLY",
+                    "message": "assistant returned empty reply",
+                    "latency_ms": latency_ms,
+                }
+
+            usage = _safe_field(response, "usage")
+            return {
+                "success": True,
+                "provider": "qwen",
+                "model": str(_safe_field(response, "model", "") or self.model),
+                "reply": reply_text,
+                "latency_ms": latency_ms,
+                "done_reason": str(_safe_field(output_payload, "finish_reason", "") or ""),
+                "prompt_eval_count": int(_safe_field(usage, "input_tokens", 0) or 0),
+                "eval_count": int(_safe_field(usage, "output_tokens", 0) or 0),
+            }
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": "ASSISTANT_EXCEPTION",
+                "message": repr(exc)[:500],
+                "latency_ms": round((time.time() - started_at) * 1000.0, 2),
+            }
 
     def _chat_openrouter(
         self,
@@ -561,6 +712,8 @@ class AssistantService:
         """统一对话入口。"""
         if not self.check_enabled():
             reason = "assistant disabled or provider unsupported"
+            if self.provider in {"qwen", "dashscope", "aliyun"} and not self.dashscope_api_key:
+                reason = "DASHSCOPE_API_KEY missing"
             if self.provider == "openrouter" and not self.openrouter_api_key:
                 reason = "OPENROUTER_API_KEY missing"
             return {
@@ -588,7 +741,13 @@ class AssistantService:
         safe_temperature = round(max(0.0, min(1.2, float(temperature))), 3)
         safe_max_tokens = int(max(64, min(4096, int(max_tokens or self.default_max_tokens))))
 
-        if self.provider == "openrouter":
+        if self.provider in {"qwen", "dashscope", "aliyun"}:
+            result = self._chat_qwen(
+                messages=composed,
+                temperature=safe_temperature,
+                max_tokens=safe_max_tokens,
+            )
+        elif self.provider == "openrouter":
             result = self._chat_openrouter(
                 messages=composed,
                 temperature=safe_temperature,

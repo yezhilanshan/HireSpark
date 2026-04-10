@@ -1681,6 +1681,8 @@ class DatabaseManager:
             return 'data_engineer'
         if 'devops' in merged:
             return 'devops'
+        if '产品' in merged or ('product' in merged and 'manager' in merged) or 'chanpin' in merged:
+            return 'product_manager'
 
         return stem or 'unknown'
 
@@ -2691,6 +2693,44 @@ class DatabaseManager:
                 return [dict(row) for row in rows]
         except Exception as e:
             print(f"✗ 查询评估记录失败：{e}")
+            return []
+
+    def get_recent_interview_evaluations_by_round(self, round_type: str, exclude_interview_id: str = None, limit: int = 300):
+        """
+        æŒ‰ round_type è¯»å–è¿‘æœŸ interview_evaluationsï¼Œç”¨äºŽåŠ¨æ€ round baseline æ ¡å‡†ã€‚
+        """
+        try:
+            safe_limit = max(1, min(int(limit or 300), 1000))
+            normalized_round = str(round_type or '').strip()
+            normalized_exclude = str(exclude_interview_id or '').strip()
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                if normalized_exclude:
+                    cursor.execute(
+                        '''
+                        SELECT *
+                        FROM interview_evaluations
+                        WHERE round_type = ? AND interview_id != ?
+                        ORDER BY datetime(updated_at) DESC, id DESC
+                        LIMIT ?
+                        ''',
+                        (normalized_round, normalized_exclude, safe_limit)
+                    )
+                else:
+                    cursor.execute(
+                        '''
+                        SELECT *
+                        FROM interview_evaluations
+                        WHERE round_type = ?
+                        ORDER BY datetime(updated_at) DESC, id DESC
+                        LIMIT ?
+                        ''',
+                        (normalized_round, safe_limit)
+                    )
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            print(f"é‰?è¯»å– round baseline è¯„ä¼°æ•°æ®å¤±è´¥: {e}")
             return []
 
     def log_evaluation_event(self, trace_id: str, interview_id: str, turn_id: str, event_type: str, status: str = '', duration_ms: float = None, payload=None):

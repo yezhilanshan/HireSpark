@@ -137,8 +137,8 @@ llm:
 # ====================================
 assistant:
   enabled: true
-  provider: "openrouter"
-  model: "stepfun/step-3.5-flash:free"
+  provider: "qwen"
+  model: "qwen-plus"
   timeout: 60
   max_history: 6
   max_context_chars: 1200
@@ -146,6 +146,9 @@ assistant:
   default_temperature: 0.25
   force_plain_text: true
   default_system_prompt: "你是一个专业、简洁、可信的中文求职助手。重点帮助用户准备技术面试、梳理项目表达、优化简历表述，并提供可执行建议。回答请直奔主题，先给结论，再给关键理由。"
+  qwen:
+    api_key: "${BAILIAN_API_KEY}"
+    fallback_text_model: "qwen-plus"
   openrouter:
     base_url: "https://openrouter.ai/api/v1"
     api_key: ""
@@ -175,6 +178,9 @@ rag:
   vector_db: "chroma"  # 兼容旧字段
   embedding_model: "shibing624/text2vec-base-chinese"
   knowledge_path: "interview_knowledge"
+  additional_knowledge_paths:
+    - "basic_knowledge/qianduan.md"
+    - "basic_knowledge/chanpin.md"
   persist_dir: "rag_data"
   collection_name: "interview_questions"
   search_type: "similarity"
@@ -250,6 +256,11 @@ positions:
   - id: "frontend_engineer"
     name: "前端工程师"
     description: "前端应用开发工程师"
+    enabled: false  # 将在改造中启用
+
+  - id: "product_manager"
+    name: "产品经理"
+    description: "产品规划与需求分析"
     enabled: false  # 将在改造中启用
 
 # ====================================

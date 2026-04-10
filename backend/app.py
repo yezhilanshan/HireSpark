@@ -13,13 +13,13 @@ import json
 import threading
 import uuid
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from collections import Counter
 from urllib.parse import urlparse
 
 # 导入自定义模块
-from utils import DataManager, ReportGenerator
+from utils import DataManager
 from utils.config_loader import config
 try:
     from utils.llm_manager import llm_manager
@@ -73,6 +73,7 @@ from utils.speech_metrics import compute_final_speech_metrics, aggregate_express
 from utils.replay_service import ReplayService, ReplayTaskManager
 from utils.behavior_analysis_service import BehaviorAnalysisService, BehaviorAnalysisTaskManager
 from utils.video_upload_service import VideoUploadService
+from utils.round_aggregation import build_round_aggregation
 from utils.security import (
     RateLimiter,
     rate_limit,
@@ -99,6 +100,15 @@ app.config['SECRET_KEY'] = SECRET_KEY
 FLASK_HOST = config.get('server.host', '0.0.0.0')# 监听地址
 FLASK_PORT = config.get('server.port', 5000)# 监听端口
 FLASK_DEBUG = config.get('system.debug', False)# 调试模式
+
+
+INSIGHTS_RECENT_LIMIT = 5
+INSIGHTS_LOOKBACK_DAYS = 30
+INSIGHTS_WEEKLY_DAYS = 7
+INSIGHTS_PER_ROUND_LIMIT = 3
+INSIGHTS_CACHE_TTL_SECONDS = 600
+INSIGHTS_TRACKED_ROUNDS = ('technical', 'project', 'system_design', 'hr')
+INSIGHTS_SUMMARY_CACHE = {}
 
 
 def _safe_int(value, default: int) -> int:
@@ -214,19 +224,11 @@ else:
 # 初始化工具类
 logger.info("初始化工具模块...")
 data_manager = DataManager()
-
-if callable(ReportGenerator):
-    report_generator = ReportGenerator()
-else:
-    logger.error("ReportGenerator 不可用，已降级为 no-op（仅影响报告文件导出）")
-
-    class _NoopReportGenerator:
-        def generate_report(self, report_data):
-            return ""
-
-    report_generator = _NoopReportGenerator()
-
-db_manager = DatabaseManager()
+configured_db_path = str(config.get('database.path', 'interview_system.db') or 'interview_system.db').strip()
+resolved_db_path = Path(configured_db_path)
+if not resolved_db_path.is_absolute():
+    resolved_db_path = (Path(__file__).resolve().parent / resolved_db_path).resolve()
+db_manager = DatabaseManager(str(resolved_db_path))
 session_registry = SessionRegistry()
 state_orchestrator = StateOrchestrator(session_registry)
 speech_normalizer = SpeechTextNormalizer()
@@ -1656,6 +1658,25 @@ def _derive_detection_events_and_stats(report_data: dict) -> tuple[list[dict], d
     return events, stats
 
 
+def _normalize_risk_probability(value) -> float:
+    try:
+        risk = float(value or 0.0)
+    except Exception:
+        risk = 0.0
+    if risk <= 1.0:
+        risk *= 100.0
+    return round(max(0.0, min(100.0, risk)), 2)
+
+
+def _risk_level_from_probability(value: float) -> str:
+    risk = _normalize_risk_probability(value)
+    if risk >= 75.0:
+        return 'HIGH'
+    if risk >= 40.0:
+        return 'MEDIUM'
+    return 'LOW'
+
+
 def _interrupt_runtime(runtime, reason: str):
     payload = state_orchestrator.start_speech(runtime)
     _log_runtime_event(runtime, 'interrupt', reason=reason, interrupted_job_id=payload.get('job_id', ''))
@@ -1742,6 +1763,163 @@ def _record_runtime_dialogue(
                 )
         except Exception as e:
             logger.warning(f"投递三层评估任务失败：{e}")
+
+
+AUTO_END_MIN_QUESTIONS = 3
+AUTO_END_MAX_QUESTIONS = 8
+AUTO_END_RECENT_WINDOW = 2
+AUTO_END_HIGH_SCORE = 85.0
+AUTO_END_LOW_SCORE = 45.0
+AUTO_END_SCORE_WAIT_SECONDS = 3.0
+AUTO_END_SCORE_POLL_SECONDS = 0.2
+
+
+def _extract_turn_sequence(turn_id: str) -> int:
+    normalized_turn_id = str(turn_id or '').strip()
+    match = re.match(r'^turn_(\d+)', normalized_turn_id)
+    if not match:
+        return 0
+    try:
+        return int(match.group(1))
+    except Exception:
+        return 0
+
+
+def _extract_fusion_score_from_evaluation(row) -> float | None:
+    if not isinstance(row, dict):
+        return None
+    fusion = row.get('fusion') if isinstance(row.get('fusion'), dict) else {}
+    layer2 = row.get('layer2') if isinstance(row.get('layer2'), dict) else {}
+    candidates = (
+        fusion.get('overall_score'),
+        row.get('overall_score'),
+        layer2.get('overall_score_final'),
+        layer2.get('overall_score'),
+    )
+    for candidate in candidates:
+        if isinstance(candidate, (int, float)):
+            return round(float(candidate), 2)
+        try:
+            if candidate is not None and str(candidate).strip() != '':
+                return round(float(candidate), 2)
+        except Exception:
+            continue
+    return None
+
+
+def _evaluation_row_priority(row) -> tuple[int, int, int]:
+    status = str((row or {}).get('status') or '').strip().lower()
+    has_score = _extract_fusion_score_from_evaluation(row) is not None
+    status_rank = 2 if status == 'ok' else 1 if status == 'partial_ok' else 0
+    updated_at = str((row or {}).get('updated_at') or '').strip()
+    return (status_rank, int(has_score), 1 if updated_at else 0)
+
+
+def _collect_scored_turns(interview_id: str):
+    if not interview_id or not hasattr(db_manager, 'get_interview_evaluations'):
+        return []
+
+    raw_rows = db_manager.get_interview_evaluations(interview_id=interview_id) or []
+    decoded_rows = _decode_evaluation_rows(raw_rows)
+    best_rows_by_turn = {}
+    for row in decoded_rows:
+        turn_id = str((row or {}).get('turn_id') or '').strip()
+        if not turn_id:
+            continue
+        existing = best_rows_by_turn.get(turn_id)
+        if existing is None or _evaluation_row_priority(row) >= _evaluation_row_priority(existing):
+            best_rows_by_turn[turn_id] = row
+
+    scored_turns = []
+    for turn_id, row in best_rows_by_turn.items():
+        fusion_score = _extract_fusion_score_from_evaluation(row)
+        if fusion_score is None:
+            continue
+        scored_turns.append({
+            'turn_id': turn_id,
+            'turn_sequence': _extract_turn_sequence(turn_id),
+            'fusion_score': fusion_score,
+            'status': str((row or {}).get('status') or '').strip().lower(),
+        })
+
+    scored_turns.sort(key=lambda item: (int(item.get('turn_sequence') or 0), str(item.get('turn_id') or '')))
+    return scored_turns
+
+
+def _wait_for_turn_fusion_score(
+    interview_id: str,
+    turn_id: str,
+    timeout_seconds: float = AUTO_END_SCORE_WAIT_SECONDS,
+    poll_interval: float = AUTO_END_SCORE_POLL_SECONDS,
+) -> float | None:
+    normalized_interview_id = str(interview_id or '').strip()
+    normalized_turn_id = str(turn_id or '').strip()
+    if not normalized_interview_id or not normalized_turn_id or not hasattr(db_manager, 'get_turn_scorecard'):
+        return None
+
+    deadline = time.time() + max(float(timeout_seconds or 0.0), 0.0)
+    while time.time() <= deadline:
+        raw_scorecard = db_manager.get_turn_scorecard(normalized_interview_id, normalized_turn_id) or {}
+        scorecard = _normalize_turn_scorecard(raw_scorecard)
+        evaluation = scorecard.get('evaluation') if isinstance(scorecard.get('evaluation'), dict) else {}
+        fusion_score = _extract_fusion_score_from_evaluation(evaluation)
+        if fusion_score is not None:
+            return fusion_score
+        time.sleep(max(float(poll_interval or 0.0), 0.05))
+    return None
+
+
+def _should_auto_end_interview(runtime, current_turn_id: str):
+    question_count = int(getattr(runtime, 'turn_index', 0) or 0)
+    current_turn_sequence = _extract_turn_sequence(current_turn_id)
+    decision = {
+        'question_count': question_count,
+        'recent_scores': [],
+        'recent_average': None,
+        'reason': '',
+        'current_turn_score': None,
+    }
+
+    if question_count < AUTO_END_MIN_QUESTIONS:
+        decision['reason'] = 'below_min_questions'
+        return False, decision
+
+    if question_count >= AUTO_END_MAX_QUESTIONS:
+        decision['reason'] = 'max_questions_reached'
+        return True, decision
+
+    current_turn_score = _wait_for_turn_fusion_score(runtime.interview_id, current_turn_id)
+    if current_turn_score is not None:
+        decision['current_turn_score'] = current_turn_score
+
+    scored_turns = _collect_scored_turns(runtime.interview_id)
+    latest_scored_turn_sequence = int(scored_turns[-1].get('turn_sequence') or 0) if scored_turns else 0
+    if current_turn_sequence > 0 and latest_scored_turn_sequence < current_turn_sequence:
+        decision['reason'] = 'current_turn_score_pending'
+        return False, decision
+
+    recent_scores = [
+        float(item.get('fusion_score'))
+        for item in scored_turns[-AUTO_END_RECENT_WINDOW:]
+        if isinstance(item.get('fusion_score'), (int, float))
+    ]
+    decision['recent_scores'] = recent_scores
+
+    if len(recent_scores) < AUTO_END_RECENT_WINDOW:
+        decision['reason'] = 'insufficient_scored_turns'
+        return False, decision
+
+    recent_average = round(sum(recent_scores) / len(recent_scores), 2)
+    decision['recent_average'] = recent_average
+    if recent_average >= AUTO_END_HIGH_SCORE:
+        decision['reason'] = 'high_score_threshold_reached'
+        return True, decision
+    if recent_average <= AUTO_END_LOW_SCORE:
+        decision['reason'] = 'low_score_threshold_reached'
+        return True, decision
+
+    decision['reason'] = 'continue_interview'
+    return False, decision
 
 
 def _maybe_emit_session_notice(runtime):
@@ -2340,6 +2518,38 @@ def _process_runtime_commit(runtime, answer_text: str, turn_id: str, source: str
                 'content': normalized_answer
             })
             _reset_answer_session(current)
+
+            should_auto_end, auto_end_decision = _should_auto_end_interview(current, turn_id)
+            if should_auto_end:
+                current.last_answer_analysis = analysis_result
+                _set_runtime_asr_lock(current, True, reason='auto_end_pending')
+                state_orchestrator.begin_listening(current)
+                _log_runtime_event(
+                    current,
+                    'interview_auto_end_pending',
+                    reason=str(auto_end_decision.get('reason') or '').strip(),
+                    question_count=auto_end_decision.get('question_count', 0),
+                    recent_average=auto_end_decision.get('recent_average', ''),
+                    recent_scores=', '.join(
+                        str(round(float(score), 2))
+                        for score in (auto_end_decision.get('recent_scores') or [])
+                        if isinstance(score, (int, float))
+                    ),
+                    current_turn_score=auto_end_decision.get('current_turn_score', ''),
+                )
+                _emit_orchestrator_state(current)
+                socketio.emit('interview_should_end', {
+                    'session_id': current.session_id,
+                    'turn_id': turn_id,
+                    'interview_id': current.interview_id,
+                    'reason': auto_end_decision.get('reason', ''),
+                    'question_count': auto_end_decision.get('question_count', 0),
+                    'recent_average': auto_end_decision.get('recent_average'),
+                    'recent_scores': auto_end_decision.get('recent_scores') or [],
+                    'message': '当前面试已达到收束条件，正在结束本轮面试。',
+                    'timestamp': time.time(),
+                }, to=current.client_id)
+                return
 
             next_action = str((followup_decision or {}).get('next_action', 'ask_followup')).strip()
             current.interview_state = next_state
@@ -2997,6 +3207,34 @@ def handle_session_start(data=None):
         logger.error(f"启动新会话错误：{e}", exc_info=True)
         _emit_pipeline_error(client_id, '', 'SESSION_START_ERROR', 'Failed to start session', str(e))
 
+def _finalize_video_upload_async(upload_id: str, interview_id: str):
+    try:
+        finalize_payload = video_upload_service.finalize_upload(
+            upload_id=upload_id,
+            interview_id=interview_id,
+        )
+        if finalize_payload.get('success'):
+            db_manager.save_or_update_interview_asset({
+                'interview_id': interview_id,
+                'upload_id': upload_id,
+                'storage_key': Path(finalize_payload.get('final_path', '')).name,
+                'video_url': '',
+                'local_path': finalize_payload.get('final_path', ''),
+                'duration_ms': finalize_payload.get('duration_ms', 0),
+                'codec': finalize_payload.get('codec', ''),
+                'status': finalize_payload.get('status', 'uploaded'),
+                'metadata_json': json.dumps({
+                    'raw_path': finalize_payload.get('raw_path', ''),
+                }, ensure_ascii=False),
+            })
+            return
+
+        error = str(finalize_payload.get('error', '')).strip()
+        if error != 'upload_not_found':
+            logger.warning("Video finalize fallback failed for upload_id=%s: %s", upload_id, error)
+    except Exception as exc:
+        logger.warning("Video finalize fallback crashed for upload_id=%s: %s", upload_id, exc, exc_info=True)
+
 
 @socketio.on('session_end')
 @rate_limit(interview_rate_limiter)
@@ -3010,11 +3248,13 @@ def handle_session_end(data=None):
         _log_runtime_event(runtime, 'session_end_requested')
         upload_id = str((data or {}).get('video_upload_id', '')).strip()
         if upload_id:
-            finalize_payload = video_upload_service.finalize_upload(
-                upload_id=upload_id,
-                interview_id=runtime.interview_id,
+            socketio.start_background_task(
+                _finalize_video_upload_async,
+                upload_id,
+                runtime.interview_id,
             )
-            if finalize_payload.get('success'):
+            finalize_payload = {'success': False}
+            if False:
                 db_manager.save_or_update_interview_asset({
                     'interview_id': runtime.interview_id,
                     'upload_id': upload_id,
@@ -3046,15 +3286,21 @@ def handle_session_end(data=None):
         else:
             report_data = {}
 
-        report_path = report_generator.generate_report(report_data) if report_data else ""
+        report_path = ""
         if report_data:
             derived_events, derived_stats = _derive_detection_events_and_stats(report_data)
+            risk_stats = report_data.get('statistics') if isinstance(report_data.get('statistics'), dict) else {}
+            max_probability = _normalize_risk_probability(risk_stats.get('max_probability'))
+            avg_probability = _normalize_risk_probability(risk_stats.get('avg_probability'))
+            risk_level = _risk_level_from_probability(max_probability)
             db_manager.save_interview({
                 'interview_id': runtime.interview_id,
                 'start_time': report_data.get('summary', {}).get('start_time'),
                 'end_time': report_data.get('summary', {}).get('end_time'),
                 'duration': report_data.get('summary', {}).get('duration', 0),
-                'risk_level': report_data.get('summary', {}).get('risk_level', 'LOW'),
+                'max_probability': max_probability,
+                'avg_probability': avg_probability,
+                'risk_level': risk_level,
                 'events_count': len(derived_events),
                 'report_path': report_path
             })
@@ -3608,6 +3854,51 @@ def _score_to_level(score: float) -> str:
 def _safe_avg(values):
     valid = [float(v) for v in values if isinstance(v, (int, float))]
     return (sum(valid) / len(valid)) if valid else 0.0
+
+
+def _build_round_aggregation_snapshot(interview_id: str, decoded_rows=None, dialogues=None):
+    rows = list(decoded_rows or [])
+    if not rows:
+        return {
+            'status': 'empty',
+            'status_message': 'no round aggregation data',
+            'round_profiles': [],
+            'interview_stability': {
+                'overall_score_raw': None,
+                'overall_score_stable': None,
+                'round_count': 0,
+                'avg_consistency_score': None,
+                'outlier_turn_count': 0,
+                'dominant_round_type': None,
+            },
+            'calibration_version': 'cross_turn_calibrator_v1',
+            'stabilizer_version': 'round_stabilizer_v1',
+        }
+
+    question_lookup = {
+        str(item.get('turn_id') or '').strip(): str(item.get('question') or '').strip()
+        for item in (dialogues or [])
+        if str(item.get('turn_id') or '').strip()
+    }
+    round_types = {
+        str(row.get('round_type') or 'unknown').strip() or 'unknown'
+        for row in rows
+    }
+    baseline_rows_by_round = {}
+    if hasattr(db_manager, 'get_recent_interview_evaluations_by_round'):
+        for round_type in round_types:
+            raw_baseline_rows = db_manager.get_recent_interview_evaluations_by_round(
+                round_type=round_type,
+                exclude_interview_id=interview_id,
+                limit=300,
+            ) or []
+            baseline_rows_by_round[round_type] = _decode_evaluation_rows(raw_baseline_rows)
+
+    return build_round_aggregation(
+        current_rows=rows,
+        baseline_rows_by_round=baseline_rows_by_round,
+        question_lookup=question_lookup,
+    )
 
 
 def _safe_float(value, default=0.0):
@@ -4809,6 +5100,7 @@ def _build_structured_snapshot(interview_id: str, dialogues=None):
             'overall_score': None,
             'level': None,
             'round_breakdown': [],
+            'round_aggregation': _build_round_aggregation_snapshot(interview_id, decoded_rows=[], dialogues=dialogues),
             'dimension_scores': [],
             'status_counts': {},
         }
@@ -4902,6 +5194,7 @@ def _build_structured_snapshot(interview_id: str, dialogues=None):
     ]
 
     overall_score = round(_safe_avg(all_scores), 1) if all_scores else None
+    round_aggregation = _build_round_aggregation_snapshot(interview_id, decoded_rows=decoded_rows, dialogues=dialogues)
     return {
         'status': status,
         'status_message': status_message,
@@ -4910,6 +5203,7 @@ def _build_structured_snapshot(interview_id: str, dialogues=None):
         'overall_score': overall_score,
         'level': _score_to_level(overall_score) if overall_score is not None else None,
         'round_breakdown': round_breakdown,
+        'round_aggregation': round_aggregation,
         'dimension_scores': dimension_items,
         'status_counts': dict(status_counts),
     }
@@ -4970,7 +5264,18 @@ def _build_evaluation_v2_snapshot(interview_id: str, dialogues=None):
 
     valid_score_status = {'ok', 'partial_ok'}
     layer_scores = {'text': [], 'speech': [], 'video': []}
+    layer_confidence_parts = {
+        'text': {'data_confidence': [], 'model_confidence': [], 'rubric_confidence': [], 'overall_confidence': []},
+        'speech': {'data_confidence': [], 'model_confidence': [], 'rubric_confidence': [], 'overall_confidence': []},
+        'video': {'data_confidence': [], 'model_confidence': [], 'rubric_confidence': [], 'overall_confidence': []},
+    }
     fusion_scores = []
+    fusion_confidences = []
+    fusion_axis_confidence_parts = {
+        'content': {'data_confidence': [], 'model_confidence': [], 'rubric_confidence': [], 'overall_confidence': []},
+        'delivery': {'data_confidence': [], 'model_confidence': [], 'rubric_confidence': [], 'overall_confidence': []},
+        'presence': {'data_confidence': [], 'model_confidence': [], 'rubric_confidence': [], 'overall_confidence': []},
+    }
     questions = []
     scored_turns = set()
     base_weights = {'text': 0.5, 'speech': 0.25, 'video': 0.25}
@@ -5004,6 +5309,11 @@ def _build_evaluation_v2_snapshot(interview_id: str, dialogues=None):
             score = (layer_data or {}).get('overall_score')
             if isinstance(score, (int, float)):
                 layer_scores[layer_name].append(float(score))
+            confidence_breakdown = (layer_data or {}).get('confidence_breakdown') if isinstance((layer_data or {}).get('confidence_breakdown'), dict) else {}
+            for confidence_key in ('data_confidence', 'model_confidence', 'rubric_confidence', 'overall_confidence'):
+                confidence_value = confidence_breakdown.get(confidence_key)
+                if isinstance(confidence_value, (int, float)):
+                    layer_confidence_parts[layer_name][confidence_key].append(float(confidence_value))
 
         if isinstance((fusion or {}).get('base_weights'), dict):
             raw_weights = fusion.get('base_weights') or {}
@@ -5040,6 +5350,20 @@ def _build_evaluation_v2_snapshot(interview_id: str, dialogues=None):
         if isinstance(fusion_score, (int, float)):
             fusion_scores.append(float(fusion_score))
 
+        fusion_confidence = (fusion or {}).get('overall_confidence')
+        if isinstance(fusion_confidence, (int, float)):
+            fusion_confidences.append(float(fusion_confidence))
+
+        axis_confidence_breakdowns = (fusion or {}).get('axis_confidence_breakdowns') if isinstance((fusion or {}).get('axis_confidence_breakdowns'), dict) else {}
+        for axis_name, axis_breakdown in axis_confidence_breakdowns.items():
+            normalized_axis_name = str(axis_name or '').strip().lower()
+            if normalized_axis_name not in fusion_axis_confidence_parts or not isinstance(axis_breakdown, dict):
+                continue
+            for confidence_key in ('data_confidence', 'model_confidence', 'rubric_confidence', 'overall_confidence'):
+                confidence_value = axis_breakdown.get(confidence_key)
+                if isinstance(confidence_value, (int, float)):
+                    fusion_axis_confidence_parts[normalized_axis_name][confidence_key].append(float(confidence_value))
+
         questions.append({
             'turn_id': turn_id,
             'round_type': str(row.get('round_type') or 'unknown').strip() or 'unknown',
@@ -5065,18 +5389,34 @@ def _build_evaluation_v2_snapshot(interview_id: str, dialogues=None):
         status = 'processing' if total_questions > 0 else 'empty'
         status_message = '三层评分处理中，请稍后刷新。' if total_questions > 0 else '暂无可评分题目。'
 
+    def _aggregate_confidence_breakdown(parts):
+        aggregated = {}
+        sample_size = 0
+        for confidence_key in ('data_confidence', 'model_confidence', 'rubric_confidence', 'overall_confidence'):
+            values = list(parts.get(confidence_key) or [])
+            if values:
+                aggregated[confidence_key] = round(_safe_avg(values), 3)
+                sample_size = max(sample_size, len(values))
+            else:
+                aggregated[confidence_key] = None
+        aggregated['sample_size'] = int(sample_size)
+        return aggregated
+
     layers = {
         'text': {
             'overall_score': round(_safe_avg(layer_scores['text']), 1) if layer_scores['text'] else None,
             'sample_size': len(layer_scores['text']),
+            'confidence_breakdown': _aggregate_confidence_breakdown(layer_confidence_parts['text']),
         },
         'speech': {
             'overall_score': round(_safe_avg(layer_scores['speech']), 1) if layer_scores['speech'] else None,
             'sample_size': len(layer_scores['speech']),
+            'confidence_breakdown': _aggregate_confidence_breakdown(layer_confidence_parts['speech']),
         },
         'video': {
             'overall_score': round(_safe_avg(layer_scores['video']), 1) if layer_scores['video'] else None,
             'sample_size': len(layer_scores['video']),
+            'confidence_breakdown': _aggregate_confidence_breakdown(layer_confidence_parts['video']),
         },
     }
     missing_layers = [name for name, payload in layers.items() if payload.get('overall_score') is None]
@@ -5089,11 +5429,17 @@ def _build_evaluation_v2_snapshot(interview_id: str, dialogues=None):
         'layers': layers,
         'fusion': {
             'overall_score': round(_safe_avg(fusion_scores), 1) if fusion_scores else None,
+            'overall_confidence': round(_safe_avg(fusion_confidences), 3) if fusion_confidences else None,
             'base_weights': base_weights,
             'missing_layers': missing_layers,
             'formula': fusion_formula,
             'shortboard_applied_count': shortboard_applied_count,
             'integrity_flagged_count': integrity_flagged_count,
+            'axis_confidence_breakdowns': {
+                'content': _aggregate_confidence_breakdown(fusion_axis_confidence_parts['content']),
+                'delivery': _aggregate_confidence_breakdown(fusion_axis_confidence_parts['delivery']),
+                'presence': _aggregate_confidence_breakdown(fusion_axis_confidence_parts['presence']),
+            },
         },
         'questions': questions[:8],
         'status_counts': dict(status_counts),
@@ -5115,14 +5461,9 @@ def _build_immediate_report_payload(interview_id: str):
     events = db_manager.get_events(normalized_id) if hasattr(db_manager, 'get_events') else []
     started_at = _parse_db_datetime(interview.get('start_time'))
     ended_at = _parse_db_datetime(interview.get('end_time'))
-
     report_path = str(interview.get('report_path') or '').strip()
-    report_file_path = Path(report_path)
-    if report_path and not report_file_path.is_absolute():
-        report_file_path = Path(report_path)
-    report_exists = bool(report_path and report_file_path.exists())
-    report_size = int(report_file_path.stat().st_size) if report_exists else 0
-    detection_timeline = _load_detection_timeline_from_report(report_file_path) if report_exists else []
+    report_file_path = Path(report_path) if report_path else None
+    detection_timeline = _load_detection_timeline_from_report(report_file_path)
     camera_insights = _build_camera_insights_snapshot_from_timeline(detection_timeline)
 
     sorted_events = sorted(
@@ -5157,6 +5498,15 @@ def _build_immediate_report_payload(interview_id: str):
     else:
         duration_seconds = int(interview.get('duration') or 0)
 
+    stored_max_probability = _normalize_risk_probability(interview.get('max_probability'))
+    stored_avg_probability = _normalize_risk_probability(interview.get('avg_probability'))
+    fallback_event_peak = max([float(item.get('score') or 0.0) for item in sorted_events] + [0.0])
+    max_probability = max(stored_max_probability, _normalize_risk_probability(fallback_event_peak))
+    avg_probability = stored_avg_probability
+    risk_level = str(interview.get('risk_level') or '').strip().upper() or _risk_level_from_probability(max_probability)
+    if risk_level not in {'LOW', 'MEDIUM', 'HIGH'}:
+        risk_level = _risk_level_from_probability(max_probability)
+
     payload = {
         'interview_id': normalized_id,
         'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -5166,15 +5516,10 @@ def _build_immediate_report_payload(interview_id: str):
             'duration_seconds': duration_seconds,
             'dialogue_count': len(dialogues or []),
         },
-        'pdf_report': {
-            'path': report_path,
-            'exists': report_exists,
-            'size_bytes': report_size,
-        },
         'anti_cheat': {
-            'risk_level': str(interview.get('risk_level') or 'LOW'),
-            'max_probability': float(interview.get('max_probability') or 0.0),
-            'avg_probability': float(interview.get('avg_probability') or 0.0),
+            'risk_level': risk_level,
+            'max_probability': max_probability,
+            'avg_probability': avg_probability,
             'events_count': int(interview.get('events_count') or len(events or [])),
             'event_type_breakdown': [
                 {'event_type': key, 'count': int(count)}
@@ -5200,6 +5545,854 @@ def _build_immediate_report_payload(interview_id: str):
         },
     }
     return payload, ''
+
+
+def _normalize_round_type(value):
+    normalized = str(value or '').strip().lower()
+    return normalized if normalized in INSIGHTS_TRACKED_ROUNDS else ''
+
+
+def _round_label_for_insights(round_type):
+    normalized = _normalize_round_type(round_type)
+    if normalized == 'technical':
+        return '技术面'
+    if normalized == 'project':
+        return '项目面'
+    if normalized == 'system_design':
+        return '系统设计面'
+    if normalized == 'hr':
+        return 'HR 综合面'
+    return '未标记'
+
+
+def _position_label_for_insights(position):
+    normalized = str(position or '').strip().lower()
+    if not normalized:
+        return '当前目标岗位'
+    if normalized in {'frontend', 'frontend_engineer', 'web_frontend', 'web_frontend_engineer'}:
+        return '前端开发工程师'
+    if normalized in {'product_manager', 'pm'}:
+        return '产品经理'
+    if normalized in {'algorithm_engineer', 'algorithm'}:
+        return '算法工程师'
+    if normalized in {'backend', 'backend_engineer', 'java_backend'}:
+        return '后端开发工程师'
+    return str(position).strip()
+
+
+def _extract_dimension_score_for_insights(dimension_items, target_key):
+    target = str(target_key or '').strip().lower()
+    for item in (dimension_items or []):
+        key = str((item or {}).get('key') or '').strip().lower()
+        score = (item or {}).get('score')
+        if key == target and isinstance(score, (int, float)):
+            return float(score)
+    return None
+
+
+def _extract_primary_round_profile_for_insights(report_payload):
+    profiles = (
+        (((report_payload or {}).get('structured_evaluation') or {}).get('round_aggregation') or {}).get('round_profiles')
+        or []
+    )
+    if not profiles:
+        return None
+    return sorted(
+        profiles,
+        key=lambda item: int((item or {}).get('turn_count_used') or 0),
+        reverse=True,
+    )[0]
+
+
+def _infer_interview_round_for_insights(interview_id):
+    normalized_id = str(interview_id or '').strip()
+    if not normalized_id:
+        return ''
+
+    counter = Counter()
+    if hasattr(db_manager, 'get_interview_dialogues'):
+        for row in (db_manager.get_interview_dialogues(normalized_id) or []):
+            round_type = _normalize_round_type((row or {}).get('round_type'))
+            if round_type:
+                counter[round_type] += 1
+
+    if not counter and hasattr(db_manager, 'get_interview_evaluations'):
+        for row in (db_manager.get_interview_evaluations(normalized_id) or []):
+            round_type = _normalize_round_type((row or {}).get('round_type'))
+            if round_type:
+                counter[round_type] += 1
+
+    return counter.most_common(1)[0][0] if counter else ''
+
+
+def _infer_interview_position_for_insights(interview_id):
+    normalized_id = str(interview_id or '').strip()
+    if not normalized_id or not hasattr(db_manager, 'get_interview_evaluations'):
+        return ''
+
+    counter = Counter()
+    rows = db_manager.get_interview_evaluations(normalized_id) or []
+    for row in rows:
+        status = str((row or {}).get('status') or '').strip().lower()
+        position = str((row or {}).get('position') or '').strip()
+        if status in {'ok', 'partial_ok'} and position:
+            counter[position] += 1
+
+    if not counter:
+        for row in rows:
+            position = str((row or {}).get('position') or '').strip()
+            if position:
+                counter[position] += 1
+
+    return counter.most_common(1)[0][0] if counter else ''
+
+
+def _build_insight_item_from_payload(interview_row, report_payload=None):
+    report_payload = report_payload or {}
+    interview_id = str((interview_row or {}).get('interview_id') or '').strip()
+    position = _infer_interview_position_for_insights(interview_id)
+    structured = (report_payload.get('structured_evaluation') or {}) if isinstance(report_payload, dict) else {}
+    round_aggregation = (structured.get('round_aggregation') or {}) if isinstance(structured, dict) else {}
+    interview_stability = (round_aggregation.get('interview_stability') or {}) if isinstance(round_aggregation, dict) else {}
+    profile = _extract_primary_round_profile_for_insights(report_payload)
+    round_type = _normalize_round_type(
+        (interview_row or {}).get('dominant_round')
+        or (profile or {}).get('round_type')
+        or _infer_interview_round_for_insights(interview_id)
+    )
+
+    score = interview_stability.get('overall_score_stable')
+    if not isinstance(score, (int, float)):
+        evaluation_v2 = (report_payload.get('evaluation_v2') or {}) if isinstance(report_payload, dict) else {}
+        fusion = (evaluation_v2.get('fusion') or {}) if isinstance(evaluation_v2, dict) else {}
+        score = fusion.get('overall_score')
+    if not isinstance(score, (int, float)):
+        score = structured.get('overall_score')
+    score = float(score) if isinstance(score, (int, float)) else None
+
+    risk_probability = (((report_payload.get('anti_cheat') or {}) if isinstance(report_payload, dict) else {}).get('max_probability'))
+    risk_score = None
+    if isinstance(risk_probability, (int, float)):
+        risk_score = max(0.0, min(100.0, float(risk_probability) * 100.0))
+
+    stability_score = interview_stability.get('avg_consistency_score')
+    stability_score = float(stability_score) if isinstance(stability_score, (int, float)) else None
+
+    content_score = (profile or {}).get('round_content_score')
+    delivery_score = (profile or {}).get('round_delivery_score')
+    presence_score = (profile or {}).get('round_presence_score')
+    content_score = float(content_score) if isinstance(content_score, (int, float)) else None
+    delivery_score = float(delivery_score) if isinstance(delivery_score, (int, float)) else None
+    presence_score = float(presence_score) if isinstance(presence_score, (int, float)) else None
+
+    structured_dimensions = structured.get('dimension_scores') if isinstance(structured, dict) else []
+    job_match_score = _extract_dimension_score_for_insights(structured_dimensions, 'job_match')
+
+    content_performance = (report_payload.get('content_performance') or {}) if isinstance(report_payload, dict) else {}
+    speech_performance = (report_payload.get('speech_performance') or {}) if isinstance(report_payload, dict) else {}
+    camera_performance = (report_payload.get('camera_performance') or {}) if isinstance(report_payload, dict) else {}
+    question_evidence = (content_performance.get('question_evidence') or []) if isinstance(content_performance, dict) else []
+    speech_status_message = str((speech_performance.get('status_message') or '')) if isinstance(speech_performance, dict) else ''
+    camera_status_message = str((camera_performance.get('status_message') or '')) if isinstance(camera_performance, dict) else ''
+    low_axis_labels = []
+    for axis_key, axis_label, axis_score in (
+        ('content', '内容轴', content_score),
+        ('delivery', '表达轴', delivery_score),
+        ('presence', '镜头轴', presence_score),
+    ):
+        if isinstance(axis_score, (int, float)) and float(axis_score) < 70:
+            low_axis_labels.append(axis_label)
+
+    return {
+        'interview_id': interview_id,
+        'created_at': (interview_row or {}).get('created_at') or (interview_row or {}).get('start_time') or '',
+        'duration_seconds': int((interview_row or {}).get('duration') or ((report_payload.get('summary') or {}) if isinstance(report_payload, dict) else {}).get('duration_seconds') or 0),
+        'round_type': round_type,
+        'round_label': _round_label_for_insights(round_type),
+        'position': position,
+        'position_label': _position_label_for_insights(position),
+        'score': score,
+        'risk_score': risk_score,
+        'stability_score': stability_score,
+        'content_score': content_score,
+        'delivery_score': delivery_score,
+        'presence_score': presence_score,
+        'job_match_score': job_match_score,
+        'content_weak_dimensions': [
+            str((item or {}).get('label') or '').strip()
+            for item in ((content_performance.get('weak_dimensions') or [])[:3] if isinstance(content_performance, dict) else [])
+            if str((item or {}).get('label') or '').strip()
+        ],
+        'speech_diagnosis': [
+            str(item).strip()
+            for item in ((speech_performance.get('diagnosis') or [])[:3] if isinstance(speech_performance, dict) else [])
+            if str(item).strip()
+        ],
+        'camera_notes': [
+            str(item).strip()
+            for item in ((camera_performance.get('notes') or [])[:3] if isinstance(camera_performance, dict) else [])
+            if str(item).strip()
+        ],
+        'content_status_message': str((content_performance.get('status_message') or '')) if isinstance(content_performance, dict) else '',
+        'speech_status_message': speech_status_message.strip(),
+        'camera_status_message': camera_status_message.strip(),
+        'question_examples': [
+            {
+                'question': str((item or {}).get('question_excerpt') or '').strip(),
+                'round_type': str((item or {}).get('round_type') or '').strip(),
+                'overall_score': float((item or {}).get('overall_score') or 0.0) if isinstance((item or {}).get('overall_score'), (int, float)) else None,
+            }
+            for item in question_evidence[:2]
+            if str((item or {}).get('question_excerpt') or '').strip()
+        ],
+        'low_axes': low_axis_labels,
+        'report_url': f"/report?interviewId={interview_id}",
+    }
+
+
+def _build_insights_signature(interviews):
+    payload = [
+        {
+            'interview_id': str((item or {}).get('interview_id') or '').strip(),
+            'created_at': str((item or {}).get('created_at') or (item or {}).get('start_time') or ''),
+            'duration': int((item or {}).get('duration') or 0),
+        }
+        for item in (interviews or [])
+    ]
+    return hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()
+
+
+def _build_insights_recent_metrics(items):
+    ordered = sorted(
+        [item for item in (items or []) if str(item.get('interview_id') or '').strip()],
+        key=lambda item: _parse_db_datetime(item.get('created_at')) or datetime.min
+    )
+    average_score = round(_safe_avg([item.get('score') for item in ordered]), 1) if ordered else None
+    average_stability = round(_safe_avg([item.get('stability_score') for item in ordered]), 1) if ordered else None
+    average_risk = round(_safe_avg([item.get('risk_score') for item in ordered]), 1) if ordered else None
+    delta_from_previous = None
+    if len(ordered) >= 2:
+        latest = ordered[-1].get('score')
+        previous = ordered[-2].get('score')
+        if isinstance(latest, (int, float)) and isinstance(previous, (int, float)):
+            delta_from_previous = round(float(latest) - float(previous), 1)
+
+    return {
+        'items': ordered,
+        'averages': {
+            'score': average_score,
+            'stability': average_stability,
+            'risk': average_risk,
+        },
+        'axis_averages': {
+            'content': round(_safe_avg([item.get('content_score') for item in ordered]), 1) if ordered else None,
+            'delivery': round(_safe_avg([item.get('delivery_score') for item in ordered]), 1) if ordered else None,
+            'presence': round(_safe_avg([item.get('presence_score') for item in ordered]), 1) if ordered else None,
+        },
+        'delta_from_previous': delta_from_previous,
+    }
+
+
+def _build_insights_weekly_distribution(interviews):
+    threshold = datetime.now() - timedelta(days=INSIGHTS_WEEKLY_DAYS)
+    counter = Counter()
+    for item in (interviews or []):
+        created_at = _parse_db_datetime((item or {}).get('created_at') or (item or {}).get('start_time'))
+        if not created_at or created_at < threshold:
+            continue
+        round_type = _normalize_round_type((item or {}).get('dominant_round'))
+        if not round_type:
+            round_type = _infer_interview_round_for_insights((item or {}).get('interview_id'))
+        if not round_type:
+            continue
+        counter[_round_label_for_insights(round_type)] += 1
+
+    return [
+        {'name': label, 'value': int(count)}
+        for label, count in counter.items()
+    ]
+
+
+def _build_cross_round_sample_candidates(interviews):
+    threshold = datetime.now() - timedelta(days=INSIGHTS_LOOKBACK_DAYS)
+    by_round = {round_type: [] for round_type in INSIGHTS_TRACKED_ROUNDS}
+
+    for item in (interviews or []):
+        created_at = _parse_db_datetime((item or {}).get('created_at') or (item or {}).get('start_time'))
+        if not created_at or created_at < threshold:
+            continue
+        round_type = _normalize_round_type((item or {}).get('dominant_round'))
+        if not round_type:
+            round_type = _infer_interview_round_for_insights((item or {}).get('interview_id'))
+            item['dominant_round'] = round_type
+        if not round_type or len(by_round[round_type]) >= INSIGHTS_PER_ROUND_LIMIT:
+            continue
+        by_round[round_type].append(item)
+
+    return by_round
+
+
+def _build_insights_fit_breakdown(sample_items, fit_score):
+    scenario_values = [
+        item.get('content_score')
+        for item in (sample_items or [])
+        if item.get('round_type') in {'project', 'system_design'}
+    ]
+    if not scenario_values:
+        scenario_values = [item.get('content_score') for item in (sample_items or [])]
+
+    communication_values = [
+        item.get('delivery_score')
+        for item in (sample_items or [])
+    ]
+    hr_scores = [item.get('score') for item in (sample_items or []) if item.get('round_type') == 'hr']
+    if hr_scores:
+        communication_values.extend(hr_scores)
+
+    return [
+        {
+            'key': 'core_skill',
+            'label': '岗位核心技能匹配',
+            'score': round(_safe_avg([item.get('job_match_score') for item in (sample_items or [])]), 1) if sample_items else fit_score,
+        },
+        {
+            'key': 'scenario',
+            'label': '业务/场景理解匹配',
+            'score': round(_safe_avg(scenario_values), 1) if scenario_values else fit_score,
+        },
+        {
+            'key': 'communication',
+            'label': '表达与协作匹配',
+            'score': round(_safe_avg(communication_values), 1) if communication_values else fit_score,
+        },
+    ]
+
+
+def _build_insights_primary_gap_candidate(sample_items):
+    if not sample_items:
+        return {
+            'title': '综合短板待补充',
+            'reason': '近期样本不足，暂时还无法识别稳定重复出现的问题模式。',
+            'description': '近期样本量还不够，暂时不适合过早下结论。更建议先补齐不同轮次的有效面试，再观察是否存在真正重复出现的短板。',
+            'summary': '目前可用样本仍偏少，建议再补充不同轮次的有效面试后再看综合诊断。',
+            'manifestations': [],
+            'impact': '现阶段更适合先补齐样本，再判断真正的主短板。',
+            'focus': '先补齐技术面、项目面和 HR 面的有效样本，再做下一轮综合对比。',
+            'impacted_rounds': [],
+            'evidence': [],
+            'score': 0.0,
+        }
+
+    theme_defs = {
+        'scenario': {
+            'title': '岗位场景迁移不够强',
+            'reason': '回答经常停留在通用知识或标准答案层面，和目标岗位的真实业务场景连接还不够稳。',
+            'impact': '这会直接拉低岗位匹配度判断，让回答看起来“基本正确”，但不够像真实能上手的候选人。',
+            'focus': '下一轮回答里要主动补上业务背景、技术取舍和真实落地场景，而不是只停留在概念解释。',
+        },
+        'structure': {
+            'title': '回答结构感不够稳定',
+            'reason': '近期多轮样本里，问题拆解、主次排序和结尾收束反复出现波动，导致信息密度不稳。',
+            'impact': '这会让面试官难以快速判断你的思路质量，也会削弱已经掌握内容的说服力。',
+            'focus': '优先练“先结论、后拆解、再补例子”的三段式回答，把每道题压缩成更稳定的表达框架。',
+        },
+        'depth': {
+            'title': '问题深挖层次还不够',
+            'reason': '近期报告里多次出现关键概念没有展开到底、方案依据不够完整的情况。',
+            'impact': '这会让技术面和项目面更容易停留在“知道名词”，但还没有形成可验证的深入理解。',
+            'focus': '复盘时重点补“为什么这样设计、还有什么替代方案、代价是什么”这三类深挖追问。',
+        },
+        'stability': {
+            'title': '临场稳定性仍有波动',
+            'reason': '风险、镜头状态和响应节奏在近期样本里有反复，说明发挥质量还没有完全稳定下来。',
+            'impact': '当稳定性下滑时，即使答案方向正确，也会削弱表达完成度和面试整体观感。',
+            'focus': '下一阶段训练时要把限时回答和录像复盘结合起来，优先把节奏、停顿和镜头状态拉稳。',
+        },
+    }
+    keyword_map = {
+        'depth': ('深度', '原理', '底层', '技术', '设计', '架构', '完整度', '取舍', '展开'),
+        'structure': ('结构', '逻辑', '拆解', '表达', '总结', '收束', '主线', '条理', '完整'),
+        'scenario': ('场景', '业务', '岗位', '落地', '实践', '项目', '案例'),
+        'stability': ('紧张', '停顿', '镜头', '姿态', '视线', '状态', '稳定', '卡顿', '节奏'),
+    }
+    theme_scores = {key: [] for key in theme_defs}
+    theme_rounds = {key: Counter() for key in theme_defs}
+    theme_signals = {key: Counter() for key in theme_defs}
+    theme_questions = {key: [] for key in theme_defs}
+
+    for item in sample_items:
+        round_type = _normalize_round_type(item.get('round_type'))
+        weak_dims = [str(label or '').strip() for label in (item.get('content_weak_dimensions') or []) if str(label or '').strip()]
+        speech_notes = [str(label or '').strip() for label in (item.get('speech_diagnosis') or []) if str(label or '').strip()]
+        camera_notes = [str(label or '').strip() for label in (item.get('camera_notes') or []) if str(label or '').strip()]
+        question_examples = [str(label or '').strip() for label in (item.get('question_examples') or []) if str(label or '').strip()]
+        merged_notes = weak_dims + speech_notes + camera_notes
+
+        if isinstance(item.get('job_match_score'), (int, float)):
+            theme_scores['scenario'].append(float(item.get('job_match_score')))
+        if isinstance(item.get('delivery_score'), (int, float)):
+            theme_scores['structure'].append(float(item.get('delivery_score')))
+        if isinstance(item.get('content_score'), (int, float)):
+            theme_scores['depth'].append(float(item.get('content_score')))
+        stability_candidates = [
+            value for value in (
+                item.get('stability_score'),
+                item.get('presence_score'),
+                (100.0 - float(item.get('risk_score'))) if isinstance(item.get('risk_score'), (int, float)) else None,
+            ) if isinstance(value, (int, float))
+        ]
+        if stability_candidates:
+            theme_scores['stability'].append(_safe_avg(stability_candidates))
+
+        for note in merged_notes:
+            matched_theme = None
+            lowered = note.lower()
+            for theme_key, keywords in keyword_map.items():
+                if any(keyword.lower() in lowered for keyword in keywords):
+                    matched_theme = theme_key
+                    break
+            if matched_theme:
+                theme_signals[matched_theme][note] += 1
+
+        if round_type:
+            low_axes = [str(axis or '').strip() for axis in (item.get('low_axes') or []) if str(axis or '').strip()]
+            if '岗位匹配度' in low_axes or (isinstance(item.get('job_match_score'), (int, float)) and float(item.get('job_match_score')) < 65):
+                theme_rounds['scenario'][round_type] += 1
+            if '表达轴' in low_axes or (isinstance(item.get('delivery_score'), (int, float)) and float(item.get('delivery_score')) < 65):
+                theme_rounds['structure'][round_type] += 1
+            if '内容轴' in low_axes or (isinstance(item.get('content_score'), (int, float)) and float(item.get('content_score')) < 65):
+                theme_rounds['depth'][round_type] += 1
+            if '镜头轴' in low_axes or (isinstance(item.get('stability_score'), (int, float)) and float(item.get('stability_score')) < 65):
+                theme_rounds['stability'][round_type] += 1
+
+        for theme_key in theme_defs:
+            if question_examples:
+                theme_questions[theme_key].extend(question_examples[:1])
+
+    ranked = []
+    for theme_key, definition in theme_defs.items():
+        avg_score = _safe_avg(theme_scores[theme_key]) if theme_scores[theme_key] else 0.0
+        signal_bonus = min(12.0, float(sum(theme_signals[theme_key].values())) * 2.5)
+        round_bonus = min(10.0, float(sum(theme_rounds[theme_key].values())) * 1.5)
+        severity = 100.0 - float(avg_score) + signal_bonus + round_bonus
+        ranked.append({
+            'key': theme_key,
+            'score': round(float(avg_score), 1),
+            'severity': severity,
+            **definition,
+        })
+
+    top = sorted(ranked, key=lambda item: float(item.get('severity') or 0.0), reverse=True)[0]
+    top_key = str(top.get('key') or '').strip()
+    impacted_rounds = [
+        _round_label_for_insights(round_type)
+        for round_type, _ in theme_rounds[top_key].most_common(3)
+    ]
+
+    evidence = [label for label, _ in theme_signals[top_key].most_common(3)]
+    if not evidence:
+        evidence = [
+            str(item).strip()
+            for item in (theme_questions.get(top_key) or [])
+            if str(item).strip()
+        ][:3]
+
+    manifestations = []
+    for label, _ in theme_signals[top_key].most_common(2):
+        manifestations.append(f'近期多场报告反复提到“{label}”这一类问题。')
+    for question in (theme_questions.get(top_key) or [])[:2]:
+        if len(manifestations) >= 4:
+            break
+        manifestations.append(f'在题目“{question[:28]}{"..." if len(question) > 28 else ""}”中，这类问题也有重复出现。')
+
+    if not manifestations:
+        manifestations.append('近期四轮样本里，这一问题在不同类型面试中都出现了重复信号。')
+
+    if impacted_rounds:
+        summary = f'{top["title"]}不是单场偶发问题，而是在{"/".join(impacted_rounds[:3])}里都能看到相似信号。'
+    else:
+        summary = f'{top["title"]}已经在近期样本中形成重复出现的问题模式。'
+    description_parts = [
+        summary,
+        str(top.get('reason') or '').strip(),
+    ]
+    if impacted_rounds:
+        description_parts.append(f'这类问题目前主要出现在{"/".join(impacted_rounds[:3])}。')
+    if evidence:
+        description_parts.append(f'最近报告里反复出现的信号包括：{"；".join(evidence[:2])}。')
+    description_parts.append(str(top.get('focus') or '').strip())
+    description = ''.join(part for part in description_parts if part)
+
+    return {
+        'title': str(top.get('title') or '综合短板待补充'),
+        'reason': str(top.get('reason') or ''),
+        'description': description,
+        'summary': summary,
+        'manifestations': manifestations[:4],
+        'impact': str(top.get('impact') or ''),
+        'focus': str(top.get('focus') or ''),
+        'score': round(float(top.get('score') or 0.0), 1),
+        'impacted_rounds': impacted_rounds,
+        'evidence': [str(item).strip() for item in evidence if str(item).strip()][:3],
+    }
+
+
+def _build_insights_profile_summary_fallback(radar_dimensions):
+    dimension_map = {
+        str((item or {}).get('key') or '').strip(): float((item or {}).get('score') or 0.0)
+        for item in (radar_dimensions or [])
+        if str((item or {}).get('key') or '').strip()
+    }
+    content_score = dimension_map.get('content_depth', 0.0)
+    delivery_score = dimension_map.get('expression_maturity', 0.0)
+    stability_score = dimension_map.get('stability_state', 0.0)
+    fit_score = dimension_map.get('job_fit', 0.0)
+
+    strongest_key = max(dimension_map.items(), key=lambda item: item[1])[0] if dimension_map else ''
+    weakest_key = min(dimension_map.items(), key=lambda item: item[1])[0] if dimension_map else ''
+    strongest_label = {
+        'content_depth': '知识回答型',
+        'expression_maturity': '表达组织型',
+        'stability_state': '发挥稳定型',
+        'job_fit': '岗位贴合型',
+    }.get(strongest_key, '综合型')
+    weakest_hint = {
+        'content_depth': '内容深度仍需补强',
+        'expression_maturity': '表达组织仍偏弱',
+        'stability_state': '临场稳定性仍有波动',
+        'job_fit': '岗位场景贴合度仍需提高',
+    }.get(weakest_key, '仍需继续补齐短板')
+
+    if fit_score >= content_score and fit_score >= delivery_score and fit_score >= stability_score:
+        return f'你当前更接近{strongest_label}候选人，岗位理解已经形成主线，但{weakest_hint}。'
+    return f'你当前更接近{strongest_label}候选人，近期综合样本显示{weakest_hint}。'
+
+
+def _build_insights_fit_summary_fallback(position_label, fit_score, fit_breakdown):
+    breakdown_sorted = sorted(
+        [item for item in (fit_breakdown or []) if isinstance(item.get('score'), (int, float))],
+        key=lambda item: float(item.get('score') or 0.0)
+    )
+    blocker = breakdown_sorted[0]['label'] if breakdown_sorted else '岗位贴合度'
+    if isinstance(fit_score, (int, float)) and fit_score >= 75:
+        summary = f'当前已具备较强的{position_label}岗位匹配度，整体胜任画像比较完整。'
+    elif isinstance(fit_score, (int, float)) and fit_score >= 60:
+        summary = f'当前对{position_label}已有较稳定的匹配基础，但还没有形成明显优势。'
+    else:
+        summary = f'当前与{position_label}的岗位匹配仍在建立阶段，核心能力证据还不够扎实。'
+    return {
+        'summary': summary,
+        'blocker': f'当前主要限制项集中在{blocker}。'
+    }
+
+
+def _build_insights_growth_advice_fallback(primary_gap_candidate, weakest_round_label, position_label):
+    gap_title = str((primary_gap_candidate or {}).get('title') or '关键短板').strip()
+    gap_reason = str((primary_gap_candidate or {}).get('reason') or '').strip()
+    return [
+        {
+            'title': '下周最该补的一项能力',
+            'advice': f'优先围绕“{gap_title}”做专项训练，先把这一项从短板变成稳定项。{gap_reason}'.strip(),
+        },
+        {
+            'title': '最值得加练的一类面试',
+            'advice': f'下一阶段优先增加{weakest_round_label}的练习频次，用更接近{position_label}真实场景的问题去训练。'.strip(),
+        },
+        {
+            'title': '下一次复盘最该关注的观察点',
+            'advice': f'复盘时重点看这次回答有没有真正体现岗位场景、结构收束和关键点展开，而不只是回答“基本正确”。',
+        },
+    ]
+
+
+def _pick_recommended_review_for_insights(sample_items, fit_breakdown):
+    if not sample_items:
+        return None
+
+    fit_avg = _safe_avg([item.get('job_match_score') for item in sample_items])
+    stability_avg = _safe_avg([item.get('stability_score') for item in sample_items])
+
+    def _priority(item):
+        score = float(item.get('score') or 0.0) if isinstance(item.get('score'), (int, float)) else 0.0
+        job_fit = float(item.get('job_match_score') or 0.0) if isinstance(item.get('job_match_score'), (int, float)) else 0.0
+        stability = float(item.get('stability_score') or 0.0) if isinstance(item.get('stability_score'), (int, float)) else 0.0
+        risk = float(item.get('risk_score') or 0.0) if isinstance(item.get('risk_score'), (int, float)) else 0.0
+        created_at = _parse_db_datetime(item.get('created_at')) or datetime.min
+        return (score, job_fit, stability, -risk, -created_at.timestamp())
+
+    target = sorted(sample_items, key=_priority)[0]
+    reasons = []
+    if isinstance(target.get('job_match_score'), (int, float)) and isinstance(fit_avg, (int, float)) and target['job_match_score'] < fit_avg:
+        reasons.append('这场岗位贴合度明显低于你的近期综合水平')
+    if isinstance(target.get('content_score'), (int, float)):
+        round_peers = [item.get('content_score') for item in sample_items if item.get('round_type') == target.get('round_type')]
+        round_avg = _safe_avg(round_peers)
+        if isinstance(round_avg, (int, float)) and target['content_score'] < round_avg:
+            reasons.append(f"这场{target.get('round_label') or '面试'}的内容组织低于你的同类轮次均值")
+    if isinstance(target.get('stability_score'), (int, float)) and isinstance(stability_avg, (int, float)) and target['stability_score'] < stability_avg:
+        reasons.append('这场临场稳定性也低于你的近期平均值')
+    if not reasons:
+        reasons.append('这场综合表现最能代表你当前最值得优先修正的问题')
+
+    return {
+        'interview_id': target.get('interview_id'),
+        'round_label': target.get('round_label') or '面试',
+        'created_at': target.get('created_at') or '',
+        'score': target.get('score'),
+        'reason': '；'.join(reasons[:2]),
+        'report_url': target.get('report_url') or '',
+    }
+
+
+def _generate_insights_ai_summary(payload):
+    if llm_manager is None or not getattr(llm_manager, 'enabled', False):
+        return None
+
+    target_model = str(
+        config.get('assistant.qwen.fallback_text_model', '')
+        or config.get('llm.model', 'qwen-max')
+    ).strip() or 'qwen-max'
+
+    system_prompt = (
+        '你是面试训练平台的总结分析助手。'
+        '请严格输出 JSON，不要输出 Markdown，不要解释你的推理。'
+        '语言必须是自然、克制、专业的中文。'
+    )
+    user_prompt = (
+        '请基于下面的结构化聚合数据，输出一个 JSON 对象，字段必须完全匹配：\n'
+        '{\n'
+        '  "profile_summary": "一句话综合画像",\n'
+        '  "fit_summary": {"summary": "岗位匹配总结", "blocker": "限制项一句话"},\n'
+        '  "primary_gap": {\n'
+        '    "title": "主短板标题",\n'
+        '    "description": "一段 2 到 4 句的完整短板描述，要像教练复盘总结，串起问题模式、影响和下一步方向",\n'
+        '    "reason": "主短板说明",\n'
+        '    "summary": "一句话判断这为什么是当前主短板",\n'
+        '    "manifestations": ["典型表现1", "典型表现2"],\n'
+        '    "impact": "它如何拖累岗位匹配或整体表现",\n'
+        '    "focus": "下一步最该优先改什么",\n'
+        '    "impacted_rounds": ["技术面"],\n'
+        '    "evidence": ["证据1", "证据2"]\n'
+        '  },\n'
+        '  "growth_advice": [\n'
+        '    {"title": "下周最该补的一项能力", "advice": "建议内容"},\n'
+        '    {"title": "最值得加练的一类面试", "advice": "建议内容"},\n'
+        '    {"title": "下一次复盘时最该关注的观察点", "advice": "建议内容"}\n'
+        '  ]\n'
+        '}\n'
+        '要求：\n'
+        '1. 必须基于输入证据，不要编造未出现的数据。\n'
+        '2. 每段建议都要可执行，不要说空话。\n'
+        '3. impacted_rounds 最多 3 项。\n'
+        '4. evidence 最多 3 项。\n'
+        '5. manifestations 最多 4 项，每项都要写成用户能感知到的具体表现，不要只写抽象名词。\n'
+        '6. description 必须是一段自然中文，避免模板感，不要拆成列表。\n'
+        '7. focus 必须是一个明确训练方向，不能写成泛泛鼓励。\n'
+        '8. title 不要总是“知识深度不足”这类宽泛标签，优先归纳为更贴近行为的问题模式。\n'
+        '9. 不要重复页面顶部已经表达过的“最强项”式结论。\n'
+        f'输入数据：\n{json.dumps(payload, ensure_ascii=False, indent=2)}'
+    )
+
+    result = llm_manager.generate_structured_json(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        model=target_model,
+        temperature=0.2,
+        max_tokens=1200,
+        timeout=25,
+    )
+    if not result.get('success'):
+        return None
+    data = result.get('data')
+    return data if isinstance(data, dict) else None
+
+
+def _build_insights_summary_payload():
+    interviews = db_manager.get_interviews(limit=120, offset=0) or []
+    interviews = sorted(
+        interviews,
+        key=lambda item: _parse_db_datetime((item or {}).get('created_at') or (item or {}).get('start_time')) or datetime.min,
+        reverse=True,
+    )
+
+    signature = _build_insights_signature(interviews)
+    cached = INSIGHTS_SUMMARY_CACHE.get(signature)
+    if cached:
+        cached_at = float(cached.get('cached_at') or 0.0)
+        if time.time() - cached_at <= INSIGHTS_CACHE_TTL_SECONDS:
+            return cached.get('payload')
+
+    recent_rows = interviews[:INSIGHTS_RECENT_LIMIT]
+    sample_candidates_by_round = _build_cross_round_sample_candidates(interviews)
+    selected_rows = {str((item or {}).get('interview_id') or '').strip(): item for item in recent_rows}
+    for round_items in sample_candidates_by_round.values():
+        for item in round_items:
+            selected_rows[str((item or {}).get('interview_id') or '').strip()] = item
+
+    report_payloads = {}
+    enriched_items = {}
+    for interview_id, interview_row in selected_rows.items():
+        payload, _ = _build_immediate_report_payload(interview_id)
+        report_payloads[interview_id] = payload or {}
+        enriched_items[interview_id] = _build_insight_item_from_payload(interview_row, payload)
+
+    recent_items = [
+        enriched_items.get(str((item or {}).get('interview_id') or '').strip()) or _build_insight_item_from_payload(item, None)
+        for item in recent_rows
+    ]
+    weekly_distribution = _build_insights_weekly_distribution(interviews)
+
+    sample_items = []
+    for round_type in INSIGHTS_TRACKED_ROUNDS:
+        for item in sample_candidates_by_round.get(round_type, []):
+            enriched = enriched_items.get(str((item or {}).get('interview_id') or '').strip())
+            if enriched:
+                sample_items.append(enriched)
+
+    target_position = Counter(
+        str(item.get('position') or '').strip()
+        for item in sample_items
+        if str(item.get('position') or '').strip()
+    ).most_common(1)
+    target_position_value = target_position[0][0] if target_position else ''
+    target_position_label = _position_label_for_insights(target_position_value)
+
+    radar_dimensions = [
+        {
+            'key': 'content_depth',
+            'label': '内容深度',
+            'score': round(_safe_avg([item.get('content_score') for item in sample_items]), 1) if sample_items else 0.0,
+        },
+        {
+            'key': 'expression_maturity',
+            'label': '表达成熟度',
+            'score': round(_safe_avg([item.get('delivery_score') for item in sample_items]), 1) if sample_items else 0.0,
+        },
+        {
+            'key': 'stability_state',
+            'label': '状态稳定性',
+            'score': round(_safe_avg([
+                _safe_avg([
+                    item.get('stability_score'),
+                    item.get('presence_score'),
+                    (100.0 - float(item.get('risk_score'))) if isinstance(item.get('risk_score'), (int, float)) else None,
+                ])
+                for item in sample_items
+            ]), 1) if sample_items else 0.0,
+        },
+        {
+            'key': 'job_fit',
+            'label': '岗位贴合度',
+            'score': round(_safe_avg([item.get('job_match_score') for item in sample_items]), 1) if sample_items else 0.0,
+        },
+    ]
+
+    fit_score = next((float(item.get('score') or 0.0) for item in radar_dimensions if item.get('key') == 'job_fit'), 0.0)
+    fit_breakdown = _build_insights_fit_breakdown(sample_items, fit_score)
+    primary_gap_candidate = _build_insights_primary_gap_candidate(sample_items)
+
+    round_coverage = []
+    round_score_map = {}
+    for round_type in INSIGHTS_TRACKED_ROUNDS:
+        values = [item.get('score') for item in sample_items if item.get('round_type') == round_type]
+        round_score_map[round_type] = round(_safe_avg(values), 1) if values else None
+        round_coverage.append({
+            'round_type': round_type,
+            'label': _round_label_for_insights(round_type),
+            'count': len(values),
+            'status': 'ready' if values else 'insufficient',
+            'avg_score': round_score_map[round_type],
+        })
+
+    weakest_round_type = ''
+    weakest_round_score = None
+    for round_type, score in round_score_map.items():
+        if not isinstance(score, (int, float)):
+            continue
+        if weakest_round_score is None or float(score) < float(weakest_round_score):
+            weakest_round_type = round_type
+            weakest_round_score = score
+    weakest_round_label = _round_label_for_insights(weakest_round_type) if weakest_round_type else '技术面'
+
+    ai_seed_payload = {
+        'target_position': {
+            'key': target_position_value,
+            'label': target_position_label,
+        },
+        'sample_count': len(sample_items),
+        'round_coverage': round_coverage,
+        'recent_metrics': _build_insights_recent_metrics(recent_items),
+        'radar_dimensions': radar_dimensions,
+        'fit_score': fit_score,
+        'fit_breakdown': fit_breakdown,
+        'primary_gap_candidate': primary_gap_candidate,
+        'recommended_review': _pick_recommended_review_for_insights(sample_items, fit_breakdown),
+        'sample_evidence': [
+            {
+                'round_label': item.get('round_label') or '面试',
+                'score': item.get('score'),
+                'job_match_score': item.get('job_match_score'),
+                'content_score': item.get('content_score'),
+                'delivery_score': item.get('delivery_score'),
+                'presence_score': item.get('presence_score'),
+                'stability_score': item.get('stability_score'),
+                'risk_score': item.get('risk_score'),
+                'low_axes': item.get('low_axes') or [],
+                'content_weak_dimensions': item.get('content_weak_dimensions') or [],
+                'speech_diagnosis': item.get('speech_diagnosis') or [],
+                'camera_notes': item.get('camera_notes') or [],
+                'question_examples': item.get('question_examples') or [],
+            }
+            for item in sample_items[:8]
+        ],
+    }
+    ai_summary = _generate_insights_ai_summary(ai_seed_payload) or {}
+    fit_fallback = _build_insights_fit_summary_fallback(target_position_label, fit_score, fit_breakdown)
+    growth_fallback = _build_insights_growth_advice_fallback(primary_gap_candidate, weakest_round_label, target_position_label)
+    ai_primary_gap = ai_summary.get('primary_gap') if isinstance(ai_summary.get('primary_gap'), dict) else {}
+    merged_primary_gap = {
+        **(primary_gap_candidate or {}),
+        **ai_primary_gap,
+    }
+
+    final_payload = {
+        'success': True,
+        'recent_metrics': _build_insights_recent_metrics(recent_items),
+        'weekly_distribution': weekly_distribution,
+        'cross_round_profile': {
+            'sample_count': len(sample_items),
+            'covered_round_count': len([item for item in round_coverage if item.get('count')]),
+            'target_position': target_position_value,
+            'target_position_label': target_position_label,
+            'round_coverage': round_coverage,
+            'radar_dimensions': radar_dimensions,
+            'fit_score': fit_score,
+            'fit_breakdown': fit_breakdown,
+            'primary_gap_candidate': primary_gap_candidate,
+            'recommended_review': _pick_recommended_review_for_insights(sample_items, fit_breakdown),
+        },
+        'ai_summary': {
+            'profile_summary': str(ai_summary.get('profile_summary') or _build_insights_profile_summary_fallback(radar_dimensions)),
+            'fit_summary': (
+                ai_summary.get('fit_summary')
+                if isinstance(ai_summary.get('fit_summary'), dict)
+                else fit_fallback
+            ),
+            'primary_gap': merged_primary_gap,
+            'growth_advice': (
+                ai_summary.get('growth_advice')
+                if isinstance(ai_summary.get('growth_advice'), list) and ai_summary.get('growth_advice')
+                else growth_fallback
+            ),
+        },
+    }
+
+    INSIGHTS_SUMMARY_CACHE.clear()
+    INSIGHTS_SUMMARY_CACHE[signature] = {
+        'cached_at': time.time(),
+        'payload': final_payload,
+    }
+    return final_payload
 
 
 def _split_recent_sessions(rows):
@@ -5467,7 +6660,6 @@ def get_latest_immediate_report():
                 WHERE
                     (COALESCE(TRIM(end_time), '') != '')
                     OR (COALESCE(duration, 0) > 0)
-                    OR (COALESCE(TRIM(report_path), '') != '')
                 ORDER BY datetime(COALESCE(end_time, created_at)) DESC, id DESC
                 LIMIT 1
             ''')
@@ -5836,6 +7028,40 @@ def get_reports():
         }), 500
 
 
+@app.route('/api/insights/summary')
+def get_insights_summary():
+    """返回最近面试总览聚合数据。"""
+    try:
+        payload = _build_insights_summary_payload()
+        return jsonify(payload)
+    except Exception as e:
+        logger.error(f"获取 insights summary 错误: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'recent_metrics': {'items': [], 'averages': {}, 'axis_averages': {}, 'delta_from_previous': None},
+            'weekly_distribution': [],
+            'cross_round_profile': {
+                'sample_count': 0,
+                'covered_round_count': 0,
+                'target_position': '',
+                'target_position_label': '当前目标岗位',
+                'round_coverage': [],
+                'radar_dimensions': [],
+                'fit_score': 0.0,
+                'fit_breakdown': [],
+                'primary_gap_candidate': {},
+                'recommended_review': None,
+            },
+            'ai_summary': {
+                'profile_summary': '',
+                'fit_summary': {'summary': '', 'blocker': ''},
+                'primary_gap': {},
+                'growth_advice': [],
+            },
+        }), 500
+
+
 @app.route('/api/interviews')
 def get_interviews_from_db():
     """从数据库获取面试记录列表"""
@@ -5851,6 +7077,7 @@ def get_interviews_from_db():
                 item['scored_turns'] = 0
                 item['score_source'] = 'not_available'
                 item['structured_status'] = 'empty'
+                item['dominant_round'] = ''
                 continue
 
             # 历史列表与报告详情必须走同一评分逻辑：统一复用结构化快照计算。
@@ -5858,10 +7085,39 @@ def get_interviews_from_db():
             structured_snapshot = _build_structured_snapshot(interview_id, dialogues=dialogues)
             structured_status = str(structured_snapshot.get('status') or 'unknown').strip() or 'unknown'
             overall_score = structured_snapshot.get('overall_score')
+            round_aggregation = structured_snapshot.get('round_aggregation') if isinstance(structured_snapshot.get('round_aggregation'), dict) else {}
+            interview_stability = round_aggregation.get('interview_stability') if isinstance(round_aggregation.get('interview_stability'), dict) else {}
+            round_summary = round_aggregation.get('round_summary') if isinstance(round_aggregation.get('round_summary'), dict) else {}
+            round_counter = Counter(
+                str(row.get('round_type') or '').strip().lower()
+                for row in dialogues
+                if str(row.get('round_type') or '').strip()
+            )
+            dominant_round = round_counter.most_common(1)[0][0] if round_counter else ''
+            if not dominant_round:
+                dominant_round = str(
+                    interview_stability.get('dominant_round_type')
+                    or round_summary.get('dominant_round_type')
+                    or ''
+                ).strip().lower()
+            item['dominant_round'] = dominant_round
+            stable_overall_score = interview_stability.get('overall_score_stable')
             evaluated_questions = int(structured_snapshot.get('evaluated_questions') or 0)
+            display_score = None
 
-            if isinstance(overall_score, (int, float)):
-                item['overall_score'] = float(overall_score)
+            if isinstance(stable_overall_score, (int, float)):
+                display_score = float(stable_overall_score)
+            else:
+                evaluation_v2_snapshot = _build_evaluation_v2_snapshot(interview_id, dialogues=dialogues)
+                fusion_payload = evaluation_v2_snapshot.get('fusion') if isinstance(evaluation_v2_snapshot.get('fusion'), dict) else {}
+                fusion_overall_score = fusion_payload.get('overall_score')
+                if isinstance(fusion_overall_score, (int, float)):
+                    display_score = float(fusion_overall_score)
+                elif isinstance(overall_score, (int, float)):
+                    display_score = float(overall_score)
+
+            if isinstance(display_score, (int, float)):
+                item['overall_score'] = float(display_score)
                 item['scored_turns'] = evaluated_questions
                 item['score_source'] = 'structured_evaluation'
             else:
