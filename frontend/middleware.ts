@@ -9,15 +9,19 @@ type AuthSession = {
 }
 
 function parseSessionCookieValue(value?: string | null): AuthSession | null {
-    const raw = String(value || '').trim()
-    if (!raw) return null
-    const [expRaw, emailRaw, nameRaw] = raw.split('|')
-    const exp = Number(expRaw)
-    if (!Number.isFinite(exp) || exp <= 0) return null
-    const email = decodeURIComponent(String(emailRaw || '')).trim().toLowerCase()
-    const name = decodeURIComponent(String(nameRaw || '')).trim()
-    if (!email || !name) return null
-    return { email, name, exp }
+    try {
+        const raw = String(value || '').trim()
+        if (!raw) return null
+        const [expRaw, emailRaw, nameRaw] = raw.split('|')
+        const exp = Number(expRaw)
+        if (!Number.isFinite(exp) || exp <= 0) return null
+        const email = decodeURIComponent(String(emailRaw || '')).trim().toLowerCase()
+        const name = decodeURIComponent(String(nameRaw || '')).trim()
+        if (!email || !name) return null
+        return { email, name, exp }
+    } catch {
+        return null
+    }
 }
 
 function isSessionValid(session: AuthSession | null | undefined): session is AuthSession {
@@ -56,34 +60,38 @@ function isProtectedPath(pathname: string): boolean {
 }
 
 export function middleware(request: NextRequest) {
-    const { pathname, search } = request.nextUrl
-    const session = parseSessionCookieValue(request.cookies.get(AUTH_COOKIE_NAME)?.value)
-    const authenticated = isSessionValid(session)
+    try {
+        const { pathname, search } = request.nextUrl
+        const session = parseSessionCookieValue(request.cookies.get(AUTH_COOKIE_NAME)?.value)
+        const authenticated = isSessionValid(session)
 
-    if (pathname === '/') {
-        const response = NextResponse.next()
-        if (request.cookies.get(AUTH_COOKIE_NAME)?.value) {
-            response.cookies.set({
-                name: AUTH_COOKIE_NAME,
-                value: '',
-                httpOnly: true,
-                sameSite: 'lax',
-                secure: shouldUseSecureCookies(),
-                path: '/',
-                expires: new Date(0),
-                maxAge: 0,
-            })
+        if (pathname === '/') {
+            const response = NextResponse.next()
+            if (request.cookies.get(AUTH_COOKIE_NAME)?.value) {
+                response.cookies.set({
+                    name: AUTH_COOKIE_NAME,
+                    value: '',
+                    httpOnly: true,
+                    sameSite: 'lax',
+                    secure: shouldUseSecureCookies(),
+                    path: '/',
+                    expires: new Date(0),
+                    maxAge: 0,
+                })
+            }
+            return response
         }
-        return response
-    }
 
-    if (isProtectedPath(pathname) && !authenticated) {
-        const loginUrl = new URL('/', request.url)
-        loginUrl.searchParams.set('next', `${pathname}${search}`)
-        return NextResponse.redirect(loginUrl)
-    }
+        if (isProtectedPath(pathname) && !authenticated) {
+            const loginUrl = new URL('/', request.url)
+            loginUrl.searchParams.set('next', `${pathname}${search}`)
+            return NextResponse.redirect(loginUrl)
+        }
 
-    return NextResponse.next()
+        return NextResponse.next()
+    } catch {
+        return NextResponse.next()
+    }
 }
 
 export const config = {
