@@ -4,7 +4,9 @@ const trimTrailingSlash = (value = '') => value.replace(/\/+$/, '')
 const nextConfig = {
     reactStrictMode: true,
     async rewrites() {
-        const backendOrigin = trimTrailingSlash(process.env.VERCEL_BACKEND_ORIGIN || '')
+        const backendOrigin = trimTrailingSlash(
+            process.env.VERCEL_BACKEND_ORIGIN || process.env.BACKEND_ORIGIN || ''
+        )
 
         if (!backendOrigin) {
             return []
