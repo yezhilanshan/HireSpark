@@ -91,7 +91,9 @@ export default function InterviewSetupPage() {
             let localVideoStream: MediaStream | null = null
 
             try {
-                const stream = await navigator.mediaDevices.getUserMedia({ video: true })
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+                })
                 localVideoStream = stream
                 if (!mounted) {
                     stream.getTracks().forEach((track) => track.stop())

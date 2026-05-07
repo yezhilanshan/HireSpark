@@ -1038,7 +1038,11 @@ export default function InterviewPage() {
     const initCamera = async () => {
         try {
             const stream = await navigator.mediaDevices.getUserMedia({
-                video: { width: 640, height: 480 }
+                video: {
+                    width: { ideal: 640 },
+                    height: { ideal: 480 },
+                    facingMode: 'user',
+                },
             })
 
             cameraStreamRef.current = stream
@@ -1053,9 +1057,17 @@ export default function InterviewPage() {
                     })
                 }
             }
-        } catch (error) {
+        } catch (error: any) {
             console.error('Camera error:', error)
-            alert('摄像头访问被拒绝')
+            const msg =
+                error?.name === 'NotAllowedError'
+                    ? '摄像头/麦克风权限被拒绝，请在浏览器设置中允许访问。'
+                    : error?.name === 'NotFoundError'
+                    ? '未检测到摄像头设备，请确认摄像头已连接。'
+                    : error?.name === 'NotReadableError'
+                    ? '摄像头被其他应用占用，请关闭其他使用摄像头的程序后重试。'
+                    : `摄像头启动失败：${error?.message || '未知错误'}`;
+            alert(msg)
             router.push('/dashboard')
         }
     }

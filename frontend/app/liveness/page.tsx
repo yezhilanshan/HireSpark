@@ -30,7 +30,7 @@ export default function LivenessPage() {
     const initCamera = async () => {
         try {
             const stream = await navigator.mediaDevices.getUserMedia({
-                video: { width: 640, height: 480 }
+                video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' }
             })
 
             if (videoRef.current) {
