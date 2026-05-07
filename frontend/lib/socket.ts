@@ -12,6 +12,21 @@ type SocketTarget = {
 const trimTrailingSlash = (value: string): string => value.replace(/\/+$/, '')
 
 const getSocketTarget = (): SocketTarget => {
+    // Direct Socket.IO URL takes priority (bypasses Vercel proxy for long-lived connections)
+    const directSocketUrl = process.env.NEXT_PUBLIC_SOCKET_URL
+    if (directSocketUrl) {
+        try {
+            const parsed = new URL(directSocketUrl)
+            const basePath = trimTrailingSlash(parsed.pathname || '')
+            return {
+                url: `${parsed.protocol}//${parsed.host}`,
+                path: `${basePath || ''}/socket.io`,
+            }
+        } catch {
+            // fall through
+        }
+    }
+
     const backendBaseUrl = trimTrailingSlash(getBackendBaseUrl())
 
     if (!backendBaseUrl) {
