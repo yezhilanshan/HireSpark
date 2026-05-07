@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { ArrowRight, Clock3, Play, Target, TrendingUp } from 'lucide-react'
+import { ArrowRight, BellRing, Clock3, Play, Target, TrendingUp } from 'lucide-react'
 import { motion, type Variants } from 'motion/react'
 import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -64,6 +64,8 @@ type InterviewRecord = {
     interview_id?: string
     created_at?: string
     start_time?: string
+    round_type?: string
+    dominant_round?: string
     duration?: number
     risk_level?: string
     events_count?: number
@@ -94,6 +96,11 @@ type DashboardState = {
     recentSessions: RecentSession[]
 }
 
+type DashboardCachePayload = {
+    cachedAt: number
+    state: DashboardState
+}
+
 const INITIAL_STATE: DashboardState = {
     loading: true,
     dataWarning: '',
@@ -107,6 +114,102 @@ const INITIAL_STATE: DashboardState = {
     practiceHours: 0,
     weeklyScoreDelta: 0,
     recentSessions: [],
+}
+
+const DASHBOARD_CACHE_KEY = 'hirespark.dashboard.cache.v1'
+const DASHBOARD_CACHE_TTL_MS = 1000 * 60 * 10
+
+let dashboardMemoryCache: DashboardCachePayload | null = null
+
+function toFiniteNumber(value: unknown, fallback = 0): number {
+    const numeric = Number(value)
+    return Number.isFinite(numeric) ? numeric : fallback
+}
+
+function normalizeCachedDashboardState(raw: unknown): DashboardState | null {
+    if (!raw || typeof raw !== 'object') return null
+
+    const candidate = raw as Partial<DashboardState>
+    const recentSessions = Array.isArray(candidate.recentSessions)
+        ? candidate.recentSessions
+            .map((item, index) => {
+                if (!item || typeof item !== 'object') return null
+                const session = item as Partial<RecentSession>
+                const scoreRaw = session.score
+                const score = scoreRaw === null ? null : toFiniteNumber(scoreRaw, 0)
+                return {
+                    key: String(session.key || index),
+                    title: String(session.title || '未命名会话'),
+                    meta: String(session.meta || ''),
+                    score,
+                }
+            })
+            .filter((item): item is RecentSession => item !== null)
+        : []
+
+    return {
+        loading: false,
+        dataWarning: String(candidate.dataWarning || ''),
+        totalSessions: Math.max(0, toFiniteNumber(candidate.totalSessions, 0)),
+        weekPracticeCount: Math.max(0, toFiniteNumber(candidate.weekPracticeCount, 0)),
+        averageScore: toFiniteNumber(candidate.averageScore, 0),
+        latestScore: toFiniteNumber(candidate.latestScore, 0),
+        weakestLabel: String(candidate.weakestLabel || INITIAL_STATE.weakestLabel),
+        candidateName: String(candidate.candidateName || INITIAL_STATE.candidateName),
+        targetRole: String(candidate.targetRole || INITIAL_STATE.targetRole),
+        practiceHours: Math.max(0, toFiniteNumber(candidate.practiceHours, 0)),
+        weeklyScoreDelta: toFiniteNumber(candidate.weeklyScoreDelta, 0),
+        recentSessions,
+    }
+}
+
+function readDashboardCache(): DashboardState | null {
+    const now = Date.now()
+
+    if (dashboardMemoryCache && now - dashboardMemoryCache.cachedAt <= DASHBOARD_CACHE_TTL_MS) {
+        return { ...dashboardMemoryCache.state, loading: false }
+    }
+
+    try {
+        const raw = window.sessionStorage.getItem(DASHBOARD_CACHE_KEY)
+        if (!raw) return null
+
+        const parsed = JSON.parse(raw) as Partial<DashboardCachePayload>
+        const cachedAt = toFiniteNumber(parsed.cachedAt, 0)
+        if (!cachedAt || now - cachedAt > DASHBOARD_CACHE_TTL_MS) {
+            window.sessionStorage.removeItem(DASHBOARD_CACHE_KEY)
+            return null
+        }
+
+        const normalized = normalizeCachedDashboardState(parsed.state)
+        if (!normalized) {
+            window.sessionStorage.removeItem(DASHBOARD_CACHE_KEY)
+            return null
+        }
+
+        dashboardMemoryCache = {
+            cachedAt,
+            state: normalized,
+        }
+        return { ...normalized, loading: false }
+    } catch {
+        return null
+    }
+}
+
+function writeDashboardCache(state: DashboardState): void {
+    const cacheState: DashboardState = { ...state, loading: false }
+    const payload: DashboardCachePayload = {
+        cachedAt: Date.now(),
+        state: cacheState,
+    }
+
+    dashboardMemoryCache = payload
+    try {
+        window.sessionStorage.setItem(DASHBOARD_CACHE_KEY, JSON.stringify(payload))
+    } catch {
+        // ignore storage failures
+    }
 }
 
 async function parseApiPayload<T extends { success: boolean }>(response: Response): Promise<T | null> {
@@ -178,46 +281,37 @@ function extractNameFromRawText(rawText?: string): string {
     return cleaned
 }
 
+function roundLabel(roundType?: string): string {
+    const normalized = String(roundType || '').trim().toLowerCase()
+    if (normalized === 'technical') return '技术基础面'
+    if (normalized === 'project') return '项目深度面'
+    if (normalized === 'system_design') return '系统设计面'
+    if (normalized === 'hr') return 'HR 综合面'
+    return String(roundType || '').trim()
+}
+
 function formatSessionMeta(record: InterviewRecord): string {
     const timeValue = toTimestamp(record.created_at || record.start_time)
     const time = timeValue ? new Date(timeValue) : null
 
-    let dayLabel = '最近'
-    if (time) {
-        const todayStart = new Date()
-        todayStart.setHours(0, 0, 0, 0)
-        const targetDay = new Date(time)
-        targetDay.setHours(0, 0, 0, 0)
-        const delta = Math.floor((todayStart.getTime() - targetDay.getTime()) / (1000 * 60 * 60 * 24))
-        if (delta === 0) {
-            dayLabel = '今天'
-        } else if (delta === 1) {
-            dayLabel = '昨天'
-        } else {
-            dayLabel = `${time.getMonth() + 1}/${time.getDate()}`
-        }
-    }
+    const timeLabel = time
+        ? `${time.getMonth() + 1}月${time.getDate()}日 ${String(time.getHours()).padStart(2, '0')}:${String(time.getMinutes()).padStart(2, '0')}`
+        : '时间未记录'
 
     const duration = Math.max(0, Number(record.duration || 0))
     if (duration <= 0) {
-        return dayLabel
+        return `进行时间 ${timeLabel}`
     }
 
     const minutes = Math.round(duration / 60)
     if (minutes <= 0) {
-        return `${dayLabel} ${duration} 秒`
+        return `进行时间 ${timeLabel} · 时长 ${duration} 秒`
     }
-    return `${dayLabel} ${minutes} 分钟`
+    return `进行时间 ${timeLabel} · 时长 ${minutes} 分钟`
 }
 
-function buildSessionTitle(record: InterviewRecord, index: number): string {
-    const risk = (record.risk_level || '').toUpperCase()
-    if (risk === 'LOW') return '行为稳定性检查'
-    if (risk === 'MEDIUM') return '表达执行力优化'
-    if (risk === 'HIGH') return '压力恢复训练'
-
-    const suffix = record.interview_id ? `#${record.interview_id.slice(-4)}` : `#${index + 1}`
-    return `综合面试 ${suffix}`
+function buildSessionTitle(record: InterviewRecord): string {
+    return roundLabel(record.dominant_round || record.round_type)
 }
 
 function average(values: number[]): number {
@@ -237,6 +331,13 @@ function getAvatarInitial(name: string): string {
     const first = trimmed[0]
     const upper = first.toUpperCase()
     return /[A-Z]/.test(upper) ? upper : first
+}
+
+function reminderToneClasses(tone?: string): string {
+    if (tone === 'success') return 'border-emerald-200 bg-emerald-50 text-emerald-800'
+    if (tone === 'warning') return 'border-amber-200 bg-amber-50 text-amber-800'
+    if (tone === 'danger') return 'border-red-200 bg-red-50 text-red-800'
+    return 'border-sky-200 bg-sky-50 text-sky-800'
 }
 
 function normalizeDimensions(report: GrowthReport | null | undefined): GrowthDimension[] {
@@ -284,10 +385,27 @@ const itemVariants: Variants = {
 
 export default function HomePage() {
     const router = useRouter()
-    const [state, setState] = useState<DashboardState>(INITIAL_STATE)
+    const [state, setState] = useState<DashboardState>(() => {
+        if (typeof window === 'undefined') return INITIAL_STATE
+        return readDashboardCache() || INITIAL_STATE
+    })
+    const reminders: Array<{
+        id: string
+        tone?: string
+        title: string
+        message: string
+        cta_label?: string
+        cta_href?: string
+    }> = []
+    const reminderSummary: { current_streak_days?: number } = {}
 
     useEffect(() => {
         let cancelled = false
+        const cachedState = readDashboardCache()
+
+        if (cachedState) {
+            setState(cachedState)
+        }
 
         const load = async () => {
             const [growthResult, interviewsResult, resumeResult] = await Promise.allSettled([
@@ -357,10 +475,11 @@ export default function HomePage() {
 
             const recentSessions = [...interviewList]
                 .sort((a, b) => toTimestamp(b.created_at || b.start_time) - toTimestamp(a.created_at || a.start_time))
+                .filter((item) => Boolean(String(item.dominant_round || item.round_type || '').trim()))
                 .slice(0, 3)
                 .map((item, index) => ({
                     key: item.interview_id || `${item.id || index}`,
-                    title: buildSessionTitle(item, index),
+                    title: buildSessionTitle(item),
                     meta: formatSessionMeta(item),
                     score: getStructuredScore(item),
                 }))
@@ -374,7 +493,7 @@ export default function HomePage() {
 
             if (cancelled) return
 
-            setState({
+            const nextState: DashboardState = {
                 loading: false,
                 dataWarning: warningModules.length ? `以下数据暂未同步：${warningModules.join('、')}` : '',
                 totalSessions: Math.max(Number(growth?.history?.session_count || 0), Number(interviewList.length || 0)),
@@ -387,12 +506,21 @@ export default function HomePage() {
                 practiceHours: Number((totalDuration / 3600).toFixed(1)),
                 weeklyScoreDelta,
                 recentSessions,
-            })
+            }
+
+            writeDashboardCache(nextState)
+            setState(nextState)
         }
 
         load().catch(() => {
             if (!cancelled) {
-                setState((prev) => ({ ...prev, loading: false, dataWarning: '数据同步失败，请稍后重试。' }))
+                setState((prev) => ({
+                    ...prev,
+                    loading: false,
+                    dataWarning: cachedState
+                        ? (prev.dataWarning || '网络波动，已展示缓存数据。')
+                        : '数据同步失败，请稍后重试。',
+                }))
             }
         })
 
@@ -416,16 +544,16 @@ export default function HomePage() {
                     </div>
 
                     <div className="flex items-center gap-6">
-                        <div className="hidden items-center gap-2 rounded-full border border-[#E5E5E5] bg-white px-3 py-1.5 text-xs text-[#999999] shadow-sm md:flex">
+                        <div className="hidden items-center gap-2 rounded-full border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-3 py-1.5 text-xs text-[#999999] dark:text-[#8e98aa] shadow-sm md:flex">
                             <span className="font-medium">快捷键</span>
-                            <kbd className="rounded bg-[#F5F5F5] px-1.5 py-0.5 text-[#111111]">Ctrl K</kbd>
+                            <kbd className="rounded bg-[#F5F5F5] dark:bg-[#2d3542] px-1.5 py-0.5 text-[#111111] dark:text-[#f4f7fb]">Ctrl K</kbd>
                         </div>
                         <div className="flex items-center gap-4">
                             <div className="hidden text-right sm:block">
-                                <p className="text-sm font-medium text-[#111111]">{state.targetRole}</p>
-                                <p className="text-xs text-[#999999]">目标岗位</p>
+                                <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">{state.targetRole}</p>
+                                <p className="text-xs text-[#999999] dark:text-[#8e98aa]">目标岗位</p>
                             </div>
-                            <div className="flex h-10 w-10 items-center justify-center rounded-full bg-[#EBE9E0] font-medium text-[#111111]">
+                            <div className="flex h-10 w-10 items-center justify-center rounded-full bg-[#EBE9E0] dark:bg-[#2d3542] font-medium text-[#111111] dark:text-[#f4f7fb]">
                                 {avatarInitial}
                             </div>
                         </div>
@@ -433,14 +561,14 @@ export default function HomePage() {
                 </motion.header>
 
                 <motion.div variants={itemVariants}>
-                    <Card className="flex flex-col items-start justify-between gap-6 border-[#E5E5E5] bg-white p-8 transition-shadow duration-300 hover:shadow-[0_8px_24px_rgba(0,0,0,0.04)] md:flex-row md:items-center">
+                    <Card className="flex flex-col items-start justify-between gap-6 border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-8 transition-shadow duration-300 hover:shadow-[0_8px_24px_rgba(0,0,0,0.04)] dark:hover:shadow-[0_8px_24px_rgba(0,0,0,0.2)] md:flex-row md:items-center">
                         <div className="space-y-2">
                             <div className="flex items-center gap-3">
                                 <Badge variant="neutral">推荐</Badge>
-                                <span className="text-sm text-[#666666]">预计 30 分钟</span>
+                                <span className="text-sm text-[#666666] dark:text-[#bcc5d3]">预计 30 分钟</span>
                             </div>
-                            <h2 className="text-xl font-medium text-[#111111]">综合面试模拟</h2>
-                            <p className="max-w-lg text-sm leading-relaxed text-[#666666]">
+                            <h2 className="text-xl font-medium text-[#111111] dark:text-[#f4f7fb]">综合面试模拟</h2>
+                            <p className="max-w-lg text-sm leading-relaxed text-[#666666] dark:text-[#bcc5d3]">
                                 围绕 {state.targetRole} 场景进行完整模拟，重点强化 {state.weakestLabel}，并生成结构化复盘建议。
                             </p>
                         </div>
@@ -508,17 +636,23 @@ export default function HomePage() {
 
                         <div className="space-y-3">
                             {!state.loading && state.recentSessions.map((session) => (
-                                <motion.div key={session.key} whileHover={{ scale: 1.01 }} transition={{ type: 'spring', stiffness: 400, damping: 30 }}>
+                                <motion.div
+                                    key={session.key}
+                                    whileHover={{ scale: 1.01 }}
+                                    transition={{ type: 'spring', stiffness: 400, damping: 30 }}
+                                >
                                     <Card className="group flex items-center justify-between p-4 transition-colors hover:border-[#111111]">
                                         <div className="min-w-0 pr-3">
                                             <p className="break-words font-medium text-[#111111] group-hover:underline decoration-[#E5E5E5] underline-offset-4">
                                                 {session.title}
                                             </p>
-                                            <p className="mt-1 text-xs text-[#666666]">{session.meta}</p>
+                                            <p className="mt-1 text-sm text-[#666666]">{session.meta}</p>
                                         </div>
                                         <div className="shrink-0 text-right">
-                                            <p className="text-lg font-serif text-[#111111]">{session.score === null ? '--' : session.score.toFixed(1)}</p>
                                             <p className="text-xs text-[#999999]">得分</p>
+                                            <p className="text-lg font-medium text-[#111111]">
+                                                {session.score !== null ? session.score.toFixed(1) : '--'}
+                                            </p>
                                         </div>
                                     </Card>
                                 </motion.div>
@@ -538,6 +672,44 @@ export default function HomePage() {
                         </div>
                     </div>
                 </motion.section>
+
+                {false && reminders.length > 0 && (
+                    <motion.section variants={itemVariants} className="space-y-4">
+                        <div className="flex items-center justify-between gap-3">
+                            <div>
+                                <h3 className="text-sm font-medium uppercase tracking-wider text-[#999999]">行为提醒</h3>
+                                <p className="mt-1 text-sm text-[#666666]">
+                                    {reminderSummary?.current_streak_days
+                                        ? `当前连续训练 ${reminderSummary.current_streak_days} 天`
+                                        : '根据近期训练节奏和本周计划生成提醒'}
+                                </p>
+                            </div>
+                        </div>
+                        <div className="grid gap-3 md:grid-cols-2">
+                            {reminders.map((item) => (
+                                <Card key={item.id} className={`border px-5 py-4 shadow-sm ${reminderToneClasses(item.tone)}`}>
+                                    <div className="flex items-start gap-3">
+                                        <BellRing className="mt-0.5 h-4 w-4 shrink-0" />
+                                        <div className="min-w-0">
+                                            <h4 className="text-sm font-semibold">{item.title}</h4>
+                                            <p className="mt-1 text-sm leading-6 opacity-90">{item.message}</p>
+                                            {item.cta_href && item.cta_label ? (
+                                                <button
+                                                    type="button"
+                                                    onClick={() => router.push(item.cta_href || '/dashboard')}
+                                                    className="mt-3 inline-flex items-center gap-1 text-sm font-medium underline underline-offset-4"
+                                                >
+                                                    {item.cta_label}
+                                                    <ArrowRight className="h-3.5 w-3.5" />
+                                                </button>
+                                            ) : null}
+                                        </div>
+                                    </div>
+                                </Card>
+                            ))}
+                        </div>
+                    </motion.section>
+                )}
             </motion.div>
         </div>
     )

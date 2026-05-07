@@ -7,8 +7,14 @@ import { ArrowRight, CalendarDays, Clock3, Film, Tag, Timer } from 'lucide-react
 import type { ReplayPayload } from '@/types/replay'
 import PersistentSidebar from '@/components/PersistentSidebar'
 import { getBackendBaseUrl } from '@/lib/backend'
+import { buildPageCacheKey, readPageCache, writePageCache } from '@/lib/page-cache'
 
 const BACKEND_API_BASE = getBackendBaseUrl()
+const DEFAULT_RECORD_LIMIT = 10
+const REPLAY_LIST_CACHE_KEY = 'hirespark.page.replay.list.v1'
+const REPLAY_LIST_CACHE_TTL_MS = 1000 * 60 * 20
+const REPLAY_DETAIL_CACHE_PREFIX = 'hirespark.page.replay.detail.v1'
+const REPLAY_DETAIL_CACHE_TTL_MS = 1000 * 60 * 20
 
 function formatMs(ms?: number) {
     const safe = Math.max(0, Number(ms || 0))
@@ -72,6 +78,14 @@ type InterviewApiResult = {
     error?: string
 }
 
+type ReplayListCacheData = {
+    records: InterviewRecord[]
+}
+
+type ReplayDetailCacheData = {
+    payload: ReplayPayload
+}
+
 function toTime(value?: string): number {
     if (!value) return 0
     const time = new Date(value).getTime()
@@ -100,7 +114,7 @@ function roundLabel(roundType?: string): string {
     if (normalized === 'project') return '项目深度面'
     if (normalized === 'system_design') return '系统设计面'
     if (normalized === 'hr') return 'HR 综合面'
-    return '未标注轮次'
+    return ''
 }
 
 function ReplayPageContent() {
@@ -110,6 +124,7 @@ function ReplayPageContent() {
     const [error, setError] = useState('')
     const [payload, setPayload] = useState<ReplayPayload | null>(null)
     const [records, setRecords] = useState<InterviewRecord[]>([])
+    const [showAllRecords, setShowAllRecords] = useState(false)
     const [videoDurationMs, setVideoDurationMs] = useState(0)
     const [videoCurrentMs, setVideoCurrentMs] = useState(0)
     const [selectedAnchorIndex, setSelectedAnchorIndex] = useState(-1)
@@ -117,24 +132,53 @@ function ReplayPageContent() {
 
     useEffect(() => {
         const load = async () => {
+            const detailCacheKey = buildPageCacheKey(REPLAY_DETAIL_CACHE_PREFIX, interviewId)
+            const cachedList = !interviewId
+                ? readPageCache<ReplayListCacheData>(REPLAY_LIST_CACHE_KEY, REPLAY_LIST_CACHE_TTL_MS)
+                : null
+            const cachedDetail = interviewId
+                ? readPageCache<ReplayDetailCacheData>(detailCacheKey, REPLAY_DETAIL_CACHE_TTL_MS)
+                : null
+            const hasCachedList = Boolean(cachedList?.records?.length)
+            const hasCachedDetail = Boolean(cachedDetail?.payload)
+
             try {
                 setError('')
-                setLoading(true)
+                setShowAllRecords(false)
                 setVideoCurrentMs(0)
                 setVideoDurationMs(0)
                 setSelectedAnchorIndex(-1)
+
                 if (!interviewId) {
+                    setPayload(null)
+                    if (hasCachedList) {
+                        setRecords(cachedList?.records || [])
+                        setLoading(false)
+                    } else {
+                        setRecords([])
+                        setLoading(true)
+                    }
+
                     const res = await fetch(`${BACKEND_API_BASE}/api/interviews?limit=80`, { cache: 'no-store' })
                     const data: InterviewApiResult = await res.json()
                     if (!res.ok || !data.success) {
                         throw new Error(data.error || '加载复盘列表失败')
                     }
-                    setPayload(null)
-                    setRecords(Array.isArray(data.interviews) ? data.interviews : [])
+                    const nextRecords = Array.isArray(data.interviews) ? data.interviews : []
+                    setRecords(nextRecords)
+                    writePageCache<ReplayListCacheData>(REPLAY_LIST_CACHE_KEY, { records: nextRecords })
                     return
                 }
 
                 setRecords([])
+                if (hasCachedDetail) {
+                    setPayload(cachedDetail?.payload || null)
+                    setLoading(false)
+                } else {
+                    setPayload(null)
+                    setLoading(true)
+                }
+
                 await fetch(`${BACKEND_API_BASE}/api/review/generate/${encodeURIComponent(interviewId)}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -147,8 +191,13 @@ function ReplayPageContent() {
                     throw new Error(data.error || '加载复盘失败')
                 }
                 setPayload(data)
+                writePageCache<ReplayDetailCacheData>(detailCacheKey, { payload: data })
             } catch (e) {
-                setError(e instanceof Error ? e.message : '加载复盘失败')
+                if ((!interviewId && hasCachedList) || (interviewId && hasCachedDetail)) {
+                    setError(interviewId ? '复盘更新失败，已展示缓存数据。' : '复盘列表更新失败，已展示缓存数据。')
+                } else {
+                    setError(e instanceof Error ? e.message : '加载复盘失败')
+                }
             } finally {
                 setLoading(false)
             }
@@ -303,9 +352,15 @@ function ReplayPageContent() {
     }
 
     if (!interviewId) {
-        const orderedRecords = [...records].sort(
-            (a, b) => toTime(b.created_at || b.start_time) - toTime(a.created_at || a.start_time)
-        )
+        const orderedRecords = [...records]
+            .sort((a, b) => toTime(b.created_at || b.start_time) - toTime(a.created_at || a.start_time))
+            .map((item) => ({
+                ...item,
+                _roundLabel: roundLabel(item.dominant_round),
+            }))
+            .filter((item) => Boolean(item._roundLabel))
+        const visibleRecords = showAllRecords ? orderedRecords : orderedRecords.slice(0, DEFAULT_RECORD_LIMIT)
+        const hasMoreRecords = orderedRecords.length > DEFAULT_RECORD_LIMIT
 
         return (
             <div className="flex min-h-screen">
@@ -315,7 +370,7 @@ function ReplayPageContent() {
                         <section className="rounded-3xl border border-[#E5E5E5] bg-[#FAF9F6] p-8 shadow-sm">
                             <p className="text-xs uppercase tracking-[0.16em] text-[#999999]">面试回放</p>
                             <h1 className="mt-3 text-3xl font-semibold tracking-tight text-[#111111]">面试复盘</h1>
-                            <p className="mt-3 text-base text-[#666666]">选择任一面试会话，进入"文本锚点 + 视频回放"查看逐段复盘。</p>
+
                         </section>
 
                         {error ? (
@@ -326,19 +381,20 @@ function ReplayPageContent() {
 
                         {!error && orderedRecords.length === 0 ? (
                             <section className="mt-6 rounded-2xl border border-[#E5E5E5] bg-white p-8 text-center shadow-sm">
-                                <p className="text-sm text-[#666666]">暂无可复盘的会话记录。</p>
+                                <p className="text-sm text-[#666666]">暂无已标注轮次的会话记录。</p>
                             </section>
                         ) : (
                             <section className="mt-6 grid gap-5">
-                                {orderedRecords.map((item) => (
+                                {visibleRecords.map((item) => (
                                     <article key={item.interview_id} className="rounded-2xl border border-[#E5E5E5] bg-white p-6 shadow-sm transition-shadow hover:shadow-md">
                                         <div className="flex flex-wrap items-center justify-between gap-4">
-                                            <div className="min-w-0 flex-1">
+                                            <div className="min-w-0 flex-1 [&>p:nth-of-type(2)]:hidden">
+                                                <p className="text-lg font-semibold text-[#111111]">{item._roundLabel || '未标记轮次'}</p>
                                                 <p className="text-lg font-semibold text-[#111111]">面试会话</p>
                                                 <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-sm text-[#666666]">
                                                     <span className="inline-flex items-center gap-2"><CalendarDays className="h-4 w-4" />{formatDate(item.created_at || item.start_time)}</span>
                                                     <span className="inline-flex items-center gap-2"><Timer className="h-4 w-4" />{formatDuration(item.duration)}</span>
-                                                    <span className="inline-flex items-center gap-2"><Tag className="h-4 w-4" />{roundLabel(item.dominant_round)}</span>
+                                                    <span className="inline-flex items-center gap-2"><Tag className="h-4 w-4" />{item._roundLabel}</span>
                                                 </div>
                                             </div>
                                             <Link
@@ -351,6 +407,18 @@ function ReplayPageContent() {
                                         </div>
                                     </article>
                                 ))}
+
+                                {hasMoreRecords ? (
+                                    <div className="pt-1 text-center">
+                                        <button
+                                            type="button"
+                                            onClick={() => setShowAllRecords((prev) => !prev)}
+                                            className="inline-flex items-center gap-2 rounded-lg border border-[#E5E5E5] bg-white px-4 py-2 text-sm font-medium text-[#333333] transition hover:bg-[#F7F6F3]"
+                                        >
+                                            {showAllRecords ? '收起记录' : `查看更多记录（+${orderedRecords.length - DEFAULT_RECORD_LIMIT}）`}
+                                        </button>
+                                    </div>
+                                ) : null}
                             </section>
                         )}
                     </div>

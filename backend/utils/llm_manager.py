@@ -299,7 +299,14 @@ class LLMManager:
         current_question: str = "",
         rag_context: Optional[str] = None,
         user_answer: str = "",
+        reference_question: str = "",
     ) -> str:
+        normalized_reference = re.sub(r"\s+", " ", str(reference_question or "").strip())
+        if normalized_reference:
+            if normalized_reference.endswith(("？", "?")):
+                return normalized_reference
+            return f"{normalized_reference}？"
+
         context_question = cls._extract_question_from_context(rag_context)
         if context_question:
             return context_question
@@ -332,6 +339,7 @@ class LLMManager:
         current_question: str = "",
         rag_context: Optional[str] = None,
         user_answer: str = "",
+        reference_question: str = "",
     ) -> str:
         source = re.sub(r"\s+", " ", str(text or "").strip())
         if not source:
@@ -340,6 +348,7 @@ class LLMManager:
                 current_question=current_question,
                 rag_context=rag_context,
                 user_answer=user_answer,
+                reference_question=reference_question,
             )
 
         primary_question = cls._extract_primary_question(source)
@@ -354,6 +363,7 @@ class LLMManager:
             current_question=current_question,
             rag_context=rag_context,
             user_answer=user_answer,
+            reference_question=reference_question,
         )
 
     def _build_position_profile(
@@ -562,7 +572,8 @@ class LLMManager:
         position: str,
         difficulty: str = "medium",
         context: Optional[str] = None,
-        rag_context: Optional[str] = None
+        rag_context: Optional[str] = None,
+        reference_question: Optional[str] = None,
     ) -> str:
         """
         生成面试问题
@@ -591,6 +602,11 @@ class LLMManager:
                 prompt += f"背景信息：{context}\n"
             if rag_context:
                 prompt += f"参考知识：\n{rag_context}\n"
+            if reference_question and str(reference_question).strip():
+                prompt += (
+                    f"RAG候选题（必须优先参考）：{str(reference_question).strip()}\n"
+                    "要求：可改写措辞，但必须保持同一能力点和场景边界，不要发散为泛泛提问。\n"
+                )
             prompt += "参考知识只用于帮助你选题，不允许直接复述成答案、示例或讲解。请直接给出一个面试问题，不要多余解释。"
             
             messages = [
@@ -621,14 +637,23 @@ class LLMManager:
                     question,
                     round_type=self.current_round,
                     rag_context=rag_context,
+                    reference_question=str(reference_question or ""),
                 )
             else:
                 logger.error(f"✗ API 错误: {response.message}")
-                return ""
+                return self._fallback_interviewer_question(
+                    round_type=self.current_round,
+                    rag_context=rag_context,
+                    reference_question=str(reference_question or ""),
+                )
         
         except Exception as e:
             logger.error(f"✗ 生成面试问题失败: {str(e)}")
-            return ""
+            return self._fallback_interviewer_question(
+                round_type=self.current_round,
+                rag_context=rag_context,
+                reference_question=str(reference_question or ""),
+            )
     
     def process_answer(
         self,
@@ -961,7 +986,8 @@ class LLMManager:
         position: str,
         difficulty: str = "medium",
         context: Optional[str] = None,
-        rag_context: Optional[str] = None
+        rag_context: Optional[str] = None,
+        reference_question: Optional[str] = None
     ) -> str:
         """根据面试轮次生成问题"""
         if not self.check_enabled():
@@ -980,6 +1006,11 @@ class LLMManager:
         if rag_context:
             prompt += f"\n参考知识：\n{rag_context}"
         prompt += "\n参考知识只用于帮助你选题，不允许直接复述成答案、示例或讲解。请直接给出一个面试问题，不要多余解释。"
+        if reference_question and str(reference_question).strip():
+            prompt += (
+                f"\nRAG候选题（必须优先参考）：{str(reference_question).strip()}\n"
+                "要求：可改写措辞，但必须保持同一能力点和场景边界，不要发散为泛泛提问。"
+            )
         messages = [{"role": "system", "content": self.system_prompt}, {"role": "user", "content": prompt}]
         try:
             response = Generation.call(model=self.model, messages=messages, top_p=0.7, top_k=50, temperature=0.7, max_tokens=500, timeout=self.timeout)
@@ -990,13 +1021,22 @@ class LLMManager:
                     question,
                     round_type=round_type,
                     rag_context=rag_context,
+                    reference_question=str(reference_question or ""),
                 )
             else:
                 logger.error(f"✗ API 错误：{response.message}")
-                return ""
+                return self._fallback_interviewer_question(
+                    round_type=round_type,
+                    rag_context=rag_context,
+                    reference_question=str(reference_question or ""),
+                )
         except Exception as e:
             logger.error(f"✗ 生成问题失败：{e}")
-            return ""
+            return self._fallback_interviewer_question(
+                round_type=round_type,
+                rag_context=rag_context,
+                reference_question=str(reference_question or ""),
+            )
 
     def process_answer_with_round(
         self,
@@ -1051,6 +1091,204 @@ class LLMManager:
         except Exception as e:
             logger.error(f"✗ 处理回答失败：{e}")
             return ""
+
+    def generate_targeted_followup_question(
+        self,
+        *,
+        current_question: str,
+        user_answer: str,
+        position: str,
+        round_type: str,
+        followup_style: str = "detail_probe",
+        followup_hint: str = "",
+        rag_context: Optional[str] = None,
+    ) -> str:
+        """Generate one natural follow-up focused on detail, tradeoff, or scale."""
+        fallback_templates = {
+            "detail_probe": "你刚才提到了一部分关键点，但还比较概括。请继续展开：{hint}",
+            "tradeoff_probe": "如果继续往下追问，你为什么会这么选？请重点讲讲方案取舍：{hint}",
+            "scale_probe": "如果把这个场景放到更大的线上规模，你认为最先出现的问题会是什么？请结合落地展开：{hint}",
+        }
+        fallback_hint = str(followup_hint or current_question or "").strip() or "请你把刚才那部分继续讲具体一点。"
+        fallback_question = fallback_templates.get(
+            followup_style,
+            fallback_templates["detail_probe"],
+        ).format(hint=fallback_hint)
+
+        if not self.check_enabled():
+            return fallback_question
+
+        resume_data = self.resume_data if isinstance(self.resume_data, dict) else None
+        self.set_interview_round(round_type, resume_data)
+        style_instruction_map = {
+            "detail_probe": "追问目标是补细节，逼近候选人刚才没讲清楚的技术细节、职责边界或关键依据。",
+            "tradeoff_probe": "追问目标是问取舍，逼近为什么这么选、放弃了什么、代价是什么。",
+            "scale_probe": "追问目标是问落地与规模化，逼近线上量级扩大、故障、瓶颈、扩展性与稳定性。",
+        }
+        prompt = (
+            "你现在是一位经验丰富的中文技术面试官。请基于当前题目、候选人刚才的回答，以及给定的追问目标，"
+            "只输出一句自然、连续、像真人面试官会说的后续提问。不要输出点评，不要列点，不要解释。\n\n"
+            f"目标岗位：{position}\n"
+            f"面试轮次：{round_type}\n"
+            f"当前题目：{current_question}\n"
+            f"候选人刚才的回答：{user_answer}\n"
+            f"追问目标：{style_instruction_map.get(followup_style, style_instruction_map['detail_probe'])}\n"
+            f"优先追问线索：{fallback_hint}\n"
+        )
+        if rag_context:
+            prompt += (
+                "\n参考考点（只用于帮助你找追问角度，禁止直接复述成答案或讲解）：\n"
+                f"{rag_context}\n"
+            )
+        prompt += "\n请直接输出下一句追问。"
+        messages = [{"role": "system", "content": self.system_prompt}, {"role": "user", "content": prompt}]
+        try:
+            response = Generation.call(
+                model=self.model,
+                messages=messages,
+                top_p=0.7,
+                top_k=40,
+                temperature=0.55,
+                max_tokens=180,
+                timeout=self.timeout,
+            )
+            if response.status_code == 200:
+                question = response.output.text
+                return self._sanitize_interviewer_output(
+                    question,
+                    round_type=round_type,
+                    current_question=current_question,
+                    rag_context=rag_context,
+                    user_answer=user_answer,
+                ) or fallback_question
+        except Exception as e:
+            logger.error(f"✗ 生成追问失败：{e}")
+        return fallback_question
+
+    def generate_coach_followup(
+        self,
+        user_answer: str,
+        current_question: str,
+        next_question: str,
+        position: str,
+        round_type: str,
+        analysis_result: Optional[Dict] = None,
+        followup_decision: Optional[Dict] = None,
+        rag_context: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """生成“点评 + 改进建议 + 参考骨架 + 下一问”的教练式反馈。"""
+        fallback_question = str(next_question or current_question or "").strip() or "请你继续展开一下刚才的关键点。"
+        fallback_summary = "这一轮你已经触达了部分关键点，但结构和展开还不够稳定。"
+        fallback_tip = "下一次先给整体结论，再补关键依据、方案取舍和落地细节。"
+        fallback_outline = [
+            "先用一句话给出整体判断或方案结论",
+            "补充两到三个关键依据或核心设计点",
+            "说明取舍、风险或边界条件",
+            "最后总结结果与落地方式",
+        ]
+
+        if not self.check_enabled():
+            return {
+                "summary_feedback": fallback_summary,
+                "improvement_tip": fallback_tip,
+                "reference_outline": fallback_outline,
+                "next_question": fallback_question,
+                "spoken_summary": f"先提醒你一个关键改进点：{fallback_tip}。接下来请你回答：{fallback_question}",
+            }
+
+        resume_data = self.resume_data if isinstance(self.resume_data, dict) else None
+        self.set_interview_round(round_type, resume_data)
+        resume_context = self._build_resume_context(resume_data) if isinstance(resume_data, dict) else ""
+        analysis_text = json.dumps(analysis_result or {}, ensure_ascii=False, indent=2)
+        decision_text = json.dumps(followup_decision or {}, ensure_ascii=False, indent=2)
+        prompt = (
+            "你现在不是普通面试官，而是“边练边改”的面试教练。"
+            "请根据候选人刚刚的回答，先给出简短、具体、可执行的点评，再抛出下一问。"
+            "不要使用表格，不要输出 Markdown 代码块，不要长篇讲解。"
+            "请严格返回 JSON。"
+            "\n\n输出要求："
+            "\n1. summary_feedback：1-2 句，总结刚才回答哪里还不够好。"
+            "\n2. improvement_tip：只给 1 条最重要的改进建议。"
+            "\n3. reference_outline：返回 3-5 条中文短句，作为更优回答骨架，不要写完整标准答案。"
+            "\n4. next_question：直接给出下一问，像真实面试官一样提问。"
+            "\n5. spoken_summary：用于语音播报，长度控制在 2 句内，先提改进点，再自然过渡到下一问。"
+            "\n\n如果参考知识不足，也要基于当前问题和回答给出务实建议，但不要编造具体事实。"
+            f"\n\n目标岗位：{position}"
+            f"\n面试轮次：{round_type}"
+            f"\n当前问题：{current_question}"
+            f"\n候选人回答：{user_answer}"
+            f"\n建议中的下一问：{fallback_question}"
+        )
+        if resume_context:
+            prompt += f"\n\n候选人简历摘要：\n{resume_context}"
+        if rag_context:
+            prompt += f"\n\n参考知识与考点：\n{rag_context}"
+        if analysis_result:
+            prompt += f"\n\n结构化分析：\n{analysis_text}"
+        if followup_decision:
+            prompt += f"\n\n追问决策参考：\n{decision_text}"
+        prompt += (
+            "\n\n返回 JSON schema："
+            '\n{'
+            '\n  "summary_feedback": "...",'
+            '\n  "improvement_tip": "...",'
+            '\n  "reference_outline": ["...", "..."],'
+            '\n  "next_question": "...",'
+            '\n  "spoken_summary": "..."'
+            '\n}'
+        )
+
+        try:
+            response = Generation.call(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                top_p=0.6,
+                top_k=40,
+                temperature=0.3,
+                max_tokens=900,
+                timeout=self.timeout,
+            )
+            if response.status_code != 200:
+                logger.error(f"✗ 教练点评 API 错误：{response.message}")
+                raise RuntimeError(response.message)
+
+            raw_text = str(response.output.text or "").strip()
+            json_match = re.search(r"\{.*\}", raw_text, re.S)
+            if not json_match:
+                raise ValueError("coach response missing json object")
+
+            parsed = json.loads(json_match.group(0))
+            summary_feedback = str(parsed.get("summary_feedback") or "").strip() or fallback_summary
+            improvement_tip = str(parsed.get("improvement_tip") or "").strip() or fallback_tip
+            reference_outline = [
+                str(item).strip()
+                for item in (parsed.get("reference_outline") or [])
+                if str(item).strip()
+            ][:5] or fallback_outline
+            resolved_next_question = str(parsed.get("next_question") or "").strip() or fallback_question
+            spoken_summary = str(parsed.get("spoken_summary") or "").strip()
+            if not spoken_summary:
+                spoken_summary = f"先提醒你一个关键改进点：{improvement_tip}。接下来请你回答：{resolved_next_question}"
+
+            return {
+                "summary_feedback": summary_feedback,
+                "improvement_tip": improvement_tip,
+                "reference_outline": reference_outline,
+                "next_question": resolved_next_question,
+                "spoken_summary": spoken_summary,
+            }
+        except Exception as e:
+            logger.error(f"✗ 生成教练式反馈失败：{e}")
+            return {
+                "summary_feedback": fallback_summary,
+                "improvement_tip": fallback_tip,
+                "reference_outline": fallback_outline,
+                "next_question": fallback_question,
+                "spoken_summary": f"先提醒你一个关键改进点：{fallback_tip}。接下来请你回答：{fallback_question}",
+            }
 
 # 创建全局 LLM 管理器实例
 llm_manager = LLMManager()

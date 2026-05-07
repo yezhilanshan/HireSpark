@@ -13,6 +13,7 @@ import {
     Gauge,
     MessageSquare,
     Mic,
+    HeartPulse,
     ShieldCheck,
     Target,
     TrendingUp,
@@ -177,6 +178,9 @@ type CameraStatistics = {
     total_mouth_open: number
     total_multi_person: number
     off_screen_ratio: number
+    avg_heart_rate?: number | null
+    rppg_reliable_ratio?: number | null
+    heart_rate_samples?: number
     frames_processed?: number
 }
 
@@ -211,6 +215,14 @@ type CameraInsights = {
         avg_gaze_focus_score?: number
         max_drift_count?: number
         drift_jumps?: number
+    }
+    physiology?: {
+        avg_heart_rate?: number | null
+        min_heart_rate?: number | null
+        max_heart_rate?: number | null
+        heart_rate_samples?: number
+        rppg_reliable_ratio?: number | null
+        hr_out_of_range_ratio?: number | null
     }
     gaze_focus_summary?: {
         avg_focus_score?: number
@@ -366,6 +378,8 @@ type TurnScorecardEvaluation = {
     }
     layer2?: {
         dimension_evidence_json?: Record<string, TurnDimensionEvidence>
+        final_dimension_scores?: Record<string, number | { score?: number }>
+        dimension_scores?: Record<string, number | { score?: number }>
         summary?: {
             strengths?: string[]
             weaknesses?: string[]
@@ -452,7 +466,7 @@ function relativeBandTone(relativeBand: string | null) {
     if (relativeBand === 'above_baseline') return 'bg-[#E7F3EA] text-[#2E6A45]'
     if (relativeBand === 'below_baseline') return 'bg-[#FDECEC] text-[#8A3B3B]'
     if (relativeBand === 'near_baseline') return 'bg-[#F3EFE4] text-[#6A5A2B]'
-    return 'bg-[#F2F2F0] text-[#666666]'
+    return 'bg-[#F2F2F0] text-[#666666] dark:text-[#bcc5d3]'
 }
 
 function riskTone(level: string) {
@@ -466,14 +480,6 @@ function riskHeatColor(score: number) {
     const safeScore = Math.max(0, Math.min(100, Number.isFinite(score) ? score : 0))
     const hue = 140 - (safeScore / 100) * 132
     return `hsl(${hue.toFixed(1)} 58% 46%)`
-}
-
-function eventLabel(eventType: string) {
-    const normalized = String(eventType || '').toLowerCase()
-    if (normalized === 'gaze_deviation') return '视线偏离'
-    if (normalized === 'mouth_open') return '异常口型'
-    if (normalized === 'multi_person') return '多人同框'
-    return normalized || '未知事件'
 }
 
 function formatNum(value: unknown, digits = 1, fallback = '--') {
@@ -507,7 +513,7 @@ function confidenceAxisDescription(axis: string) {
 
 function confidenceTone(value: number | null | undefined) {
     const num = Number(value)
-    if (!Number.isFinite(num)) return 'bg-[#F2F2F0] text-[#666666]'
+    if (!Number.isFinite(num)) return 'bg-[#F2F2F0] text-[#666666] dark:text-[#bcc5d3]'
     if (num >= 0.8) return 'bg-[#E7F3EA] text-[#2E6A45]'
     if (num >= 0.6) return 'bg-[#F3EFE4] text-[#6A5A2B]'
     return 'bg-[#FDECEC] text-[#8A3B3B]'
@@ -788,7 +794,8 @@ function buildDimensionNarrative(
     label: string,
     answerExcerpt: string,
 ): ReadableDimensionNarrative {
-    const scoreValue = item.score == null ? 0 : Math.max(0, Math.min(100, Number(item.score)))
+    const hasScore = item.score != null && Number.isFinite(Number(item.score))
+    const scoreValue = hasScore ? Math.max(0, Math.min(100, Number(item.score))) : 0
     const narrator = DIMENSION_NARRATORS[item.key] || DEFAULT_DIMENSION_NARRATOR
     const hitText = joinReadableItems(item.hit, 2)
     const missedText = joinReadableItems(item.missed, 2)
@@ -805,7 +812,9 @@ function buildDimensionNarrative(
 
     const overview = [
         overviewLead,
-        `本题的${label}是 ${formatNum(scoreValue)} 分，${scoreBandText(scoreValue)}`,
+        hasScore
+            ? `本题的${label}是 ${formatNum(scoreValue)} 分，${scoreBandText(scoreValue)}`
+            : `本题的${label}当前暂无可用分数，先以证据说明为主`,
         reasonText,
     ].filter(Boolean).join('。') + '。'
 
@@ -998,13 +1007,34 @@ function ReportPageContent() {
     }, [report])
 
     const activeDimensionEvidenceList = useMemo<SafeDimensionEvidenceView[]>(() => {
-        const source = activeScorecard?.evaluation?.layer2?.dimension_evidence_json || {}
+        const layer2 = activeScorecard?.evaluation?.layer2 || {}
+        const source = layer2.dimension_evidence_json || {}
+        const finalScoreMap = layer2.final_dimension_scores || {}
+        const baseScoreMap = layer2.dimension_scores || {}
         const entries: SafeDimensionEvidenceView[] = []
-        for (const [key, value] of Object.entries(source)) {
+
+        const readScoreFromMap = (scoreMap: Record<string, number | { score?: number }>, key: string) => {
+            if (!scoreMap || typeof scoreMap !== 'object') return null
+            const raw = scoreMap[key]
+            if (raw == null) return null
+            const value = typeof raw === 'object' ? Number((raw as { score?: number }).score) : Number(raw)
+            return Number.isFinite(value) ? value : null
+        }
+
+        const allKeys = new Set<string>([
+            ...Object.keys(source),
+            ...Object.keys(finalScoreMap),
+            ...Object.keys(baseScoreMap),
+        ])
+
+        for (const key of allKeys) {
+            const value = source[key]
             const payload = (value && typeof value === 'object') ? value as TurnDimensionEvidence : {}
             const evidenceObj = (payload.evidence && typeof payload.evidence === 'object') ? payload.evidence : {}
             const scoreNum = Number(payload.score)
-            const score = Number.isFinite(scoreNum) ? scoreNum : null
+            const directScore = Number.isFinite(scoreNum) ? scoreNum : null
+            const fallbackScore = readScoreFromMap(finalScoreMap, key) ?? readScoreFromMap(baseScoreMap, key)
+            const score = directScore ?? fallbackScore
             const reason = String(payload.reason || '').trim()
             const hit = Array.isArray(evidenceObj.hit_rubric_points)
                 ? evidenceObj.hit_rubric_points.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
@@ -1124,8 +1154,8 @@ function ReportPageContent() {
                 <PersistentSidebar />
                 <main className="flex-1 overflow-y-auto">
                     <div className="mx-auto max-w-4xl px-6 py-8">
-                        <section className="rounded-2xl border border-[#E5E5E5] bg-white p-8 text-center shadow-sm">
-                            <p className="text-sm text-[#666666]">报告加载中...</p>
+                        <section className="rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-8 text-center shadow-sm">
+                            <p className="text-sm text-[#666666] dark:text-[#bcc5d3]">报告加载中...</p>
                         </section>
                     </div>
                 </main>
@@ -1139,11 +1169,11 @@ function ReportPageContent() {
                 <PersistentSidebar />
                 <main className="flex-1 overflow-y-auto">
                     <div className="mx-auto max-w-4xl px-6 py-8">
-                        <section className="rounded-2xl border border-[#E5E5E5] bg-white p-6 shadow-sm">
-                            <div className="flex items-center gap-2 text-[#8A3B3B]"><AlertCircle className="h-5 w-5" />报告加载失败</div>
-                            <p className="mt-2 text-sm text-[#666666]">{error || '未知错误'}</p>
+                        <section className="rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-6 shadow-sm">
+                            <div className="flex items-center gap-2 text-red-600"><AlertCircle className="h-5 w-5" />报告加载失败</div>
+                            <p className="mt-2 text-sm text-[#666666] dark:text-[#bcc5d3]">{error || '未知错误'}</p>
                             <div className="mt-4 flex flex-wrap gap-3">
-                                <Link href="/history" className="inline-flex items-center gap-2 rounded-lg border border-[#E5E5E5] px-4 py-2 text-sm font-medium text-[#111111] hover:bg-[#F5F5F5]">
+                                <Link href="/history" className="inline-flex items-center gap-2 rounded-lg border border-[var(--border)] px-4 py-2 text-sm font-medium text-[#111111] dark:text-[#f4f7fb] hover:bg-[var(--accent)]">
                                     返回历史记录
                                 </Link>
                             </div>
@@ -1160,12 +1190,27 @@ function ReportPageContent() {
     const cameraPerf = report.camera_performance
     const cameraStats = cameraPerf?.statistics || report.anti_cheat.statistics
     const cameraInsights = cameraPerf?.camera_insights
+    const cameraPhysiology = cameraInsights?.physiology
+    const avgHeartRateValue = Number(cameraStats?.avg_heart_rate ?? cameraPhysiology?.avg_heart_rate)
+    const avgHeartRateText = Number.isFinite(avgHeartRateValue) && avgHeartRateValue > 0
+        ? `${formatNum(avgHeartRateValue, 1)} bpm`
+        : '--'
     const cameraLandmarks = cameraInsights?.landmarks_3d
     const cameraBlendshape = cameraInsights?.blendshapes
     const cameraHeadPose = cameraInsights?.head_pose
     const cameraIris = cameraInsights?.iris_tracking
-    const cameraBreakdown = cameraPerf?.event_type_breakdown || report.anti_cheat.event_type_breakdown || []
     const cameraTopEvents = cameraPerf?.top_risk_events || report.anti_cheat.top_risk_events || []
+    const cameraSampleCount = Number(cameraInsights?.sample_count || 0)
+    const gazeTrendUnavailableReason = (() => {
+        if (gazeTrendData.length > 1) return ''
+        if (cameraSampleCount <= 0 && cameraTopEvents.length > 0) {
+            return '当前这场只保留了异常事件摘要（如视线偏离、姿态波动），没有逐帧专注度时间序列，所以无法绘制专注度曲线。'
+        }
+        if (cameraSampleCount <= 1) {
+            return '本场有效镜头采样帧不足，暂时无法形成连续专注度曲线。建议在光线稳定、正脸可见状态下再进行一次完整会话。'
+        }
+        return '当前暂无可绘制的专注度曲线数据。'
+    })()
     const topBlendshapeAverages = Object.entries(cameraBlendshape?.blendshape_averages || {})
         .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))
         .slice(0, 8)
@@ -1220,18 +1265,18 @@ function ReportPageContent() {
     return (
         <div className="flex min-h-screen">
             <PersistentSidebar />
-            <main className="flex-1 overflow-y-auto">
+            <main className="flex-1 overflow-y-auto dark:bg-[#101217] bg-[#FAF9F6]">
                 <div className="mx-auto max-w-6xl px-6 py-8 space-y-6">
-                    <section className="rounded-3xl border border-[#E5E5E5] bg-[#FAF9F6] p-6 shadow-sm sm:p-8">
+                    <section className="rounded-3xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-6 shadow-sm sm:p-8">
                         <div className="flex flex-wrap items-center justify-between gap-3">
-                            <span className="inline-flex items-center gap-2 rounded-full border border-[#E5E5E5] bg-white px-4 py-2 text-sm text-[#111111]">
+                            <span className="inline-flex items-center gap-2 rounded-full border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-4 py-2 text-sm text-[#111111] dark:text-[#f4f7fb]">
                                 <ShieldCheck className="h-4 w-4" /> 即时报告
                             </span>
                             <span className={`inline-flex rounded-full px-3 py-1 text-xs font-medium ${riskTone(report.anti_cheat.risk_level)}`}>
                                 风险 {(report.anti_cheat.risk_level || 'LOW').toUpperCase()}
                             </span>
                         </div>
-                        <h1 className="mt-4 text-3xl tracking-tight text-[#111111] sm:text-4xl">本场面试报告</h1>
+                        <h1 className="mt-4 text-3xl tracking-tight text-[#111111] dark:text-[#f4f7fb] sm:text-4xl">本场面试报告</h1>
 
 
                         <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -1241,12 +1286,12 @@ function ReportPageContent() {
                             <MetricCard title="会话时长" value={formatDuration(report.summary.duration_seconds)} icon={<Clock3 className="h-3.5 w-3.5" />} />
                         </div>
 
-                        <div className="mt-5 rounded-2xl border border-[#E5E5E5] bg-white p-4">
+                        <div className="mt-5 rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
                             <div className="flex items-center justify-between gap-2">
-                                <p className="text-sm font-medium text-[#111111]">风险热度条</p>
-                                <span className="text-sm text-[#666666]">{formatNum(riskHeatValue)}%</span>
+                                <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">风险指数</p>
+                                <span className="text-sm text-[#666666] dark:text-[#bcc5d3]">{formatNum(riskHeatValue)}%</span>
                             </div>
-                            <div className="mt-2 h-3 w-full overflow-hidden rounded-full bg-[#ECE9E1]">
+                            <div className="mt-2 h-3 w-full overflow-hidden rounded-full bg-[var(--accent)]">
                                 <div
                                     className="h-full rounded-full transition-[width,background] duration-500 ease-out"
                                     style={riskHeatFillStyle}
@@ -1255,10 +1300,10 @@ function ReportPageContent() {
                         </div>
                     </section>
 
-                    <section className="rounded-3xl border border-[#E5E5E5] bg-white p-6 shadow-sm">
+                    <section className="rounded-3xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-6 shadow-sm">
                         <div className="flex items-center gap-2">
-                            <TrendingUp className="h-5 w-5 text-[#556987]" />
-                            <h2 className="text-xl text-[#111111]">轮次稳定性与校准</h2>
+                            <TrendingUp className="h-5 w-5 text-[#666666] dark:text-[#bcc5d3]" />
+                            <h2 className="text-xl text-[#111111] dark:text-[#f4f7fb]">轮次稳定性与校准</h2>
                         </div>
 
                         {roundProfiles.length > 0 ? (
@@ -1280,11 +1325,11 @@ function ReportPageContent() {
 
                                         <div className="grid gap-3 xl:grid-cols-1">
                                             {roundProfiles.map((item) => (
-                                                <div key={`round-profile-${item.round_type}`} className="rounded-2xl border border-[#E5E5E5] bg-[#FCFBF8] p-4">
+                                                <div key={`round-profile-${item.round_type}`} className="rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
                                                     <div className="flex flex-wrap items-start justify-between gap-2">
                                                         <div>
-                                                            <p className="text-sm font-medium text-[#111111]">{roundLabel(item.round_type)}</p>
-                                                            <p className="mt-1 text-xs text-[#888888]">
+                                                            <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">{roundLabel(item.round_type)}</p>
+                                                            <p className="mt-1 text-xs text-[#888888] dark:text-[#8e98aa]">
                                                                 使用 {item.turn_count_used} 题 · 排除 {item.turn_count_excluded} 题 · 总计 {item.turn_count_total} 题
                                                             </p>
                                                         </div>
@@ -1294,36 +1339,36 @@ function ReportPageContent() {
                                                     </div>
 
                                                     <div className="mt-3 grid gap-2 sm:grid-cols-2">
-                                                        <div className="rounded-xl border border-[#E5E5E5] bg-white p-3">
-                                                            <p className="text-xs text-[#777777]">轮次原始分</p>
-                                                            <p className="mt-1 text-lg font-semibold text-[#111111]">{formatNum(item.round_score_raw)}</p>
+                                                        <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-3">
+                                                            <p className="text-xs text-[#888888] dark:text-[#8e98aa]">轮次原始分</p>
+                                                            <p className="mt-1 text-lg font-semibold text-[#111111] dark:text-[#f4f7fb]">{formatNum(item.round_score_raw)}</p>
                                                         </div>
-                                                        <div className="rounded-xl border border-[#E5E5E5] bg-white p-3">
-                                                            <p className="text-xs text-[#777777]">轮次稳定分</p>
-                                                            <p className="mt-1 text-lg font-semibold text-[#111111]">{formatNum(item.round_score_stable)}</p>
+                                                        <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-3">
+                                                            <p className="text-xs text-[#888888] dark:text-[#8e98aa]">轮次稳定分</p>
+                                                            <p className="mt-1 text-lg font-semibold text-[#111111] dark:text-[#f4f7fb]">{formatNum(item.round_score_stable)}</p>
                                                         </div>
-                                                        <div className="rounded-xl border border-[#E5E5E5] bg-white p-3">
-                                                            <p className="text-xs text-[#777777]">稳定度</p>
-                                                            <p className="mt-1 text-lg font-semibold text-[#111111]">{formatNum(item.round_consistency_score)}</p>
+                                                        <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-3">
+                                                            <p className="text-xs text-[#888888] dark:text-[#8e98aa]">稳定度</p>
+                                                            <p className="mt-1 text-lg font-semibold text-[#111111] dark:text-[#f4f7fb]">{formatNum(item.round_consistency_score)}</p>
                                                         </div>
-                                                        <div className="rounded-xl border border-[#E5E5E5] bg-white p-3">
-                                                            <p className="text-xs text-[#777777]">基线样本</p>
-                                                            <p className="mt-1 text-lg font-semibold text-[#111111]">{item.baseline_sample_size || 0}</p>
+                                                        <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-3">
+                                                            <p className="text-xs text-[#888888] dark:text-[#8e98aa]">基线样本</p>
+                                                            <p className="mt-1 text-lg font-semibold text-[#111111] dark:text-[#f4f7fb]">{item.baseline_sample_size || 0}</p>
                                                         </div>
                                                     </div>
 
                                                     <div className="mt-3 grid gap-2 sm:grid-cols-3">
-                                                        <div className="rounded-xl border border-[#E5E5E5] bg-white px-3 py-2">
-                                                            <p className="text-xs text-[#888888]">内容轴</p>
-                                                            <p className="mt-1 text-sm font-medium text-[#111111]">{formatNum(item.round_content_score)}</p>
+                                                        <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-3 py-2">
+                                                            <p className="text-xs text-[#888888] dark:text-[#8e98aa]">内容轴</p>
+                                                            <p className="mt-1 text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">{formatNum(item.round_content_score)}</p>
                                                         </div>
-                                                        <div className="rounded-xl border border-[#E5E5E5] bg-white px-3 py-2">
-                                                            <p className="text-xs text-[#888888]">表达轴</p>
-                                                            <p className="mt-1 text-sm font-medium text-[#111111]">{formatNum(item.round_delivery_score)}</p>
+                                                        <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-3 py-2">
+                                                            <p className="text-xs text-[#888888] dark:text-[#8e98aa]">表达轴</p>
+                                                            <p className="mt-1 text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">{formatNum(item.round_delivery_score)}</p>
                                                         </div>
-                                                        <div className="rounded-xl border border-[#E5E5E5] bg-white px-3 py-2">
-                                                            <p className="text-xs text-[#888888]">镜头轴</p>
-                                                            <p className="mt-1 text-sm font-medium text-[#111111]">{formatNum(item.round_presence_score)}</p>
+                                                        <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-3 py-2">
+                                                            <p className="text-xs text-[#888888] dark:text-[#8e98aa]">镜头轴</p>
+                                                            <p className="mt-1 text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">{formatNum(item.round_presence_score)}</p>
                                                         </div>
                                                     </div>
                                                 </div>
@@ -1331,23 +1376,23 @@ function ReportPageContent() {
                                         </div>
                                     </div>
 
-                                    <aside className="rounded-2xl border border-[#E5E5E5] bg-[#FAF9F6] p-4 shadow-sm">
+                                    <aside className="rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4 shadow-sm">
                                         <div className="flex items-center gap-2">
-                                            <Gauge className="h-4 w-4 text-[#556987]" />
-                                            <p className="text-sm font-medium text-[#111111]">稳定性解读</p>
+                                            <Gauge className="h-4 w-4 text-[#666666] dark:text-[#bcc5d3]" />
+                                            <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">稳定性解读</p>
                                         </div>
-                                        <p className="mt-3 text-sm leading-6 text-[#666666]">{stabilitySummaryText}</p>
+                                        <p className="mt-3 text-sm leading-6 text-[#666666] dark:text-[#bcc5d3]">{stabilitySummaryText}</p>
 
                                         <div className="mt-4 space-y-3">
-                                            <div className="rounded-xl border border-[#E5E5E5] bg-white p-3">
-                                                <p className="text-xs text-[#888888]">当前主轮次</p>
-                                                <p className="mt-1 text-base font-semibold text-[#111111]">
+                                            <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-3">
+                                                <p className="text-xs text-[#888888] dark:text-[#8e98aa]">当前主轮次</p>
+                                                <p className="mt-1 text-base font-semibold text-[#111111] dark:text-[#f4f7fb]">
                                                     {primaryRoundProfile ? roundLabel(primaryRoundProfile.round_type) : '--'}
                                                 </p>
                                             </div>
-                                            <div className="rounded-xl border border-[#E5E5E5] bg-white p-3">
-                                                <p className="text-xs text-[#888888]">相对基线</p>
-                                                <p className="mt-1 text-sm font-medium text-[#111111]">
+                                            <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-3">
+                                                <p className="text-xs text-[#888888] dark:text-[#8e98aa]">相对基线</p>
+                                                <p className="mt-1 text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">
                                                     {primaryRoundProfile
                                                         ? relativeBandLabel(
                                                             primaryRoundProfile.relative_band,
@@ -1357,9 +1402,9 @@ function ReportPageContent() {
                                                         : '暂无可用校准结果'}
                                                 </p>
                                             </div>
-                                            <div className="rounded-xl border border-[#E5E5E5] bg-white p-3">
-                                                <p className="text-xs text-[#888888]">优先关注</p>
-                                                <p className="mt-1 text-sm font-medium text-[#111111]">
+                                            <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-3">
+                                                <p className="text-xs text-[#888888] dark:text-[#8e98aa]">优先关注</p>
+                                                <p className="mt-1 text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">
                                                     {primaryRoundWeakestAxis
                                                         ? `${primaryRoundWeakestAxis.label} ${formatNum(primaryRoundWeakestAxis.score)}`
                                                         : '当前样本不足以识别弱项'}
@@ -1367,9 +1412,9 @@ function ReportPageContent() {
                                             </div>
                                         </div>
 
-                                        <div className="mt-4 rounded-xl border border-dashed border-[#D8D4CA] bg-white/80 p-3">
-                                            <p className="text-xs text-[#777777]">阅读建议</p>
-                                            <p className="mt-1 text-xs leading-5 text-[#666666]">
+                                        <div className="mt-4 rounded-xl border border-dashed border-[#D8D4CA] bg-[var(--surface)]/80 p-3">
+                                            <p className="text-xs text-[#888888] dark:text-[#8e98aa]">阅读建议</p>
+                                            <p className="mt-1 text-xs leading-5 text-[#666666] dark:text-[#bcc5d3]">
                                                 先看“轮次稳定分”判断本轮真实发挥，再结合三轴分数定位是内容组织、表达呈现还是镜头状态更值得优先优化。
                                             </p>
                                         </div>
@@ -1377,18 +1422,18 @@ function ReportPageContent() {
                                 </div>
                             </>
                         ) : (
-                            <div className="mt-4 rounded-2xl border border-dashed border-[#D8D4CA] bg-[#FAF9F6] p-4 text-sm text-[#666666]">
+                            <div className="mt-4 rounded-2xl border border-dashed border-[#D8D4CA] bg-[var(--surface)] p-4 text-sm text-[#666666] dark:text-[#bcc5d3]">
                                 暂无可用的轮次聚合数据，当前报告仍按单题结构化结果展示。
                             </div>
                         )}
                     </section>
 
-                    <section className="rounded-3xl border border-[#E5E5E5] bg-white p-6 shadow-sm">
+                    <section className="rounded-3xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-6 shadow-sm">
                         <div className="flex items-center gap-2">
-                            <Gauge className="h-5 w-5 text-[#556987]" />
-                            <h2 className="text-xl text-[#111111]">评分可信度拆解</h2>
+                            <Gauge className="h-5 w-5 text-[#666666] dark:text-[#bcc5d3]" />
+                            <h2 className="text-xl text-[#111111] dark:text-[#f4f7fb]">评分可信度拆解</h2>
                         </div>
-                        <p className="mt-2 text-sm text-[#666666]">
+                        <p className="mt-2 text-sm text-[#666666] dark:text-[#bcc5d3]">
                             用于解释当前分数的“可信程度”来自哪里，区分样本不足、模型不稳和证据支持不充分这三类原因。
                         </p>
 
@@ -1419,11 +1464,13 @@ function ReportPageContent() {
 
                                 <div className="mt-4 grid gap-3 xl:grid-cols-3">
                                     {Object.entries(confidenceAxes).map(([axisKey, breakdown]) => (
-                                        <div key={`confidence-${axisKey}`} className="rounded-2xl border border-[#E5E5E5] bg-[#FCFBF8] p-4">
+                                        <div key={`confidence-${axisKey}`} className="rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
                                             <div className="flex items-start justify-between gap-2">
                                                 <div>
-                                                    <p className="text-sm font-medium text-[#111111]">{confidenceAxisLabel(axisKey)}</p>
-                                                    <p className="mt-1 text-xs leading-5 text-[#777777]">{confidenceAxisDescription(axisKey)}</p>
+                                                    <div className="flex items-center gap-1.5">
+                                                        <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">{confidenceAxisLabel(axisKey)}</p>
+                                                        <InlineInfoHint text={confidenceAxisDescription(axisKey)} />
+                                                    </div>
                                                 </div>
                                                 <span className={`rounded-full px-2.5 py-1 text-xs ${confidenceTone(breakdown?.overall_confidence)}`}>
                                                     总体 {formatConfidencePercent(breakdown?.overall_confidence)}
@@ -1431,70 +1478,70 @@ function ReportPageContent() {
                                             </div>
 
                                             <div className="mt-3 grid grid-cols-2 gap-2">
-                                                <div className="rounded-xl border border-[#E5E5E5] bg-white p-3">
-                                                    <p className="text-xs text-[#777777]">数据可信度</p>
-                                                    <p className="mt-1 text-sm font-medium text-[#111111]">{formatConfidencePercent(breakdown?.data_confidence)}</p>
+                                                <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-3">
+                                                    <p className="text-xs text-[#888888] dark:text-[#8e98aa]">数据可信度</p>
+                                                    <p className="mt-1 text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">{formatConfidencePercent(breakdown?.data_confidence)}</p>
                                                 </div>
-                                                <div className="rounded-xl border border-[#E5E5E5] bg-white p-3">
-                                                    <p className="text-xs text-[#777777]">模型可信度</p>
-                                                    <p className="mt-1 text-sm font-medium text-[#111111]">{formatConfidencePercent(breakdown?.model_confidence)}</p>
+                                                <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-3">
+                                                    <p className="text-xs text-[#888888] dark:text-[#8e98aa]">模型可信度</p>
+                                                    <p className="mt-1 text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">{formatConfidencePercent(breakdown?.model_confidence)}</p>
                                                 </div>
-                                                <div className="rounded-xl border border-[#E5E5E5] bg-white p-3">
-                                                    <p className="text-xs text-[#777777]">证据/规则可信度</p>
-                                                    <p className="mt-1 text-sm font-medium text-[#111111]">{formatConfidencePercent(breakdown?.rubric_confidence)}</p>
+                                                <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-3">
+                                                    <p className="text-xs text-[#888888] dark:text-[#8e98aa]">证据/规则可信度</p>
+                                                    <p className="mt-1 text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">{formatConfidencePercent(breakdown?.rubric_confidence)}</p>
                                                 </div>
-                                                <div className="rounded-xl border border-[#E5E5E5] bg-white p-3">
-                                                    <p className="text-xs text-[#777777]">样本数</p>
-                                                    <p className="mt-1 text-sm font-medium text-[#111111]">{String(breakdown?.sample_size || 0)}</p>
+                                                <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-3">
+                                                    <p className="text-xs text-[#888888] dark:text-[#8e98aa]">样本数</p>
+                                                    <p className="mt-1 text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">{String(breakdown?.sample_size || 0)}</p>
                                                 </div>
                                             </div>
 
-                                            <p className="mt-3 text-xs leading-5 text-[#888888]">
-                                                {Number(breakdown?.sample_size || 0) > 0
-                                                    ? '分数越高，说明这一轴当前结果越建立在足够样本、稳定模型链路和充分证据支撑之上。'
-                                                    : '样本不足，当前不对这一轴给出稳定可信度判断。'}
-                                            </p>
+                                            {Number(breakdown?.sample_size || 0) <= 0 ? (
+                                                <p className="mt-3 text-xs leading-5 text-[#888888] dark:text-[#8e98aa]">
+                                                    样本不足，当前不对这一轴给出稳定可信度判断。
+                                                </p>
+                                            ) : null}
                                         </div>
                                     ))}
                                 </div>
                             </>
                         ) : (
-                            <div className="mt-4 rounded-2xl border border-dashed border-[#D8D4CA] bg-[#FAF9F6] p-4 text-sm text-[#666666]">
+                            <div className="mt-4 rounded-2xl border border-dashed border-[#D8D4CA] bg-[var(--surface)] p-4 text-sm text-[#666666] dark:text-[#bcc5d3]">
                                 当前报告还没有可用的可信度拆解数据，通常是因为这场面试尚未完成结构化评分，或历史记录生成时尚未接入该能力。
                             </div>
                         )}
                     </section>
 
-                    <section className="rounded-3xl border border-[#E5E5E5] bg-white p-6 shadow-sm">
+                    <section className="rounded-3xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-6 shadow-sm">
                         <div className="flex items-center gap-2">
-                            <Target className="h-5 w-5 text-[#556987]" />
-                            <h2 className="text-xl text-[#111111]">能力雷达（弱项优先）</h2>
+                            <Target className="h-5 w-5 text-[#666666] dark:text-[#bcc5d3]" />
+                            <h2 className="text-xl text-[#111111] dark:text-[#f4f7fb]">能力雷达（弱项优先）</h2>
                         </div>
-                        <p className="mt-2 text-sm text-[#666666]">雷达图用于快速定位本场优先改进维度。</p>
+                        <p className="mt-2 text-sm text-[#666666] dark:text-[#bcc5d3]">雷达图用于快速定位本场优先改进维度。</p>
                         <div className="mt-4">
                             <RadarSnapshot dimensions={radarDimensions} />
                         </div>
                     </section>
 
-                    <section className="rounded-3xl border border-[#E5E5E5] bg-white p-6 shadow-sm">
+                    <section className="rounded-3xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-6 shadow-sm">
                         <div className="flex items-center gap-2">
-                            <MessageSquare className="h-5 w-5 text-[#556987]" />
-                            <h2 className="text-xl text-[#111111]">内容表现与可追溯依据</h2>
+                            <MessageSquare className="h-5 w-5 text-[#666666] dark:text-[#bcc5d3]" />
+                            <h2 className="text-xl text-[#111111] dark:text-[#f4f7fb]">内容表现与可追溯依据</h2>
                         </div>
-                        <p className="mt-2 text-sm text-[#666666]">{contentPerf?.status_message || '暂无内容表现依据。'}</p>
+                        <p className="mt-2 text-sm text-[#666666] dark:text-[#bcc5d3]">{contentPerf?.status_message || '暂无内容表现依据。'}</p>
 
                         {contentPerf?.status === 'ready' ? (
                             <>
                                 <div className="mt-4 grid gap-3 md:grid-cols-2">
                                     {(contentPerf.weak_dimensions || []).slice(0, 4).map((dim) => (
-                                        <div key={dim.key} className="rounded-xl border border-[#E5E5E5] p-3">
+                                        <div key={dim.key} className="rounded-xl border border-[var(--border)] p-3">
                                             <div className="flex items-center justify-between gap-2">
-                                                <p className="text-sm font-medium text-[#111111]">{dim.label}</p>
+                                                <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">{dim.label}</p>
                                                 <span className="rounded-full bg-[#F3EFE4] px-2 py-1 text-xs text-[#6A5A2B]">
                                                     均分 {formatNum(dim.avg_score)}
                                                 </span>
                                             </div>
-                                            <p className="mt-1 text-xs text-[#777777]">样本 {dim.sample_count}</p>
+                                            <p className="mt-1 text-xs text-[#888888] dark:text-[#8e98aa]">样本 {dim.sample_count}</p>
                                             {(dim.reason_tags || []).length > 0 && (
                                                 <div className="mt-2 flex flex-wrap gap-1.5">
                                                     {(dim.reason_tags || []).map((tag) => (
@@ -1505,16 +1552,16 @@ function ReportPageContent() {
                                                 </div>
                                             )}
                                             {(dim.reasons || []).slice(0, 1).map((reason, index) => (
-                                                <p key={`${dim.key}-${index}`} className="mt-2 text-sm text-[#555555]">依据：{reason}</p>
+                                                <p key={`${dim.key}-${index}`} className="mt-2 text-sm text-[#666666] dark:text-[#bcc5d3]">依据：{reason}</p>
                                             ))}
                                         </div>
                                     ))}
                                 </div>
 
-                                <div className="mt-5 rounded-2xl border border-[#E5E5E5] bg-[#FCFBF8] p-4">
+                                <div className="mt-5 rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
                                     <div className="flex items-center gap-2">
-                                        <BarChart3 className="h-4 w-4 text-[#556987]" />
-                                        <p className="text-sm font-medium text-[#111111]">证据时间轴</p>
+                                        <BarChart3 className="h-4 w-4 text-[#666666] dark:text-[#bcc5d3]" />
+                                        <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">证据时间轴</p>
                                     </div>
                                     <div className="mt-3 hidden">
                                         {(contentPerf.question_evidence || []).slice(0, 6).map((item, index, arr) => (
@@ -1522,16 +1569,16 @@ function ReportPageContent() {
                                                 {index < arr.length - 1 && (
                                                     <span className="absolute left-[13px] top-7 h-[calc(100%-8px)] w-px bg-[#DDD7CA]" />
                                                 )}
-                                                <span className="absolute left-0 top-1.5 flex h-7 w-7 items-center justify-center rounded-full border border-[#D8D2C6] bg-white text-xs text-[#555555]">
+                                                <span className="absolute left-0 top-1.5 flex h-7 w-7 items-center justify-center rounded-full border border-[#D8D2C6] bg-[var(--surface)] text-xs text-[#666666] dark:text-[#bcc5d3]">
                                                     {index + 1}
                                                 </span>
-                                                <div className="rounded-xl border border-[#E5E5E5] bg-white p-4">
+                                                <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
                                                     <div className="flex flex-wrap items-center justify-between gap-2">
-                                                        <span className="rounded-full bg-white px-2.5 py-1 text-xs text-[#555555]">{item.round_type || 'unknown'}</span>
+                                                        <span className="rounded-full bg-[var(--surface)] px-2.5 py-1 text-xs text-[#666666] dark:text-[#bcc5d3]">{item.round_type || 'unknown'}</span>
                                                         <span className="rounded-full bg-[#FDECEC] px-2.5 py-1 text-xs text-[#8A3B3B]">单题分 {formatNum(item.overall_score)}</span>
                                                     </div>
-                                                    <p className="mt-2 text-sm font-medium text-[#111111]">Q：{item.question_excerpt || '暂无题干'}</p>
-                                                    <p className="mt-1 text-sm text-[#555555]">A：{item.answer_excerpt || '暂无回答文本'}</p>
+                                                    <p className="mt-2 text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">Q：{item.question_excerpt || '暂无题干'}</p>
+                                                    <p className="mt-1 text-sm text-[#666666] dark:text-[#bcc5d3]">A：{item.answer_excerpt || '暂无回答文本'}</p>
                                                     {(item.reason_tags || []).length > 0 && (
                                                         <div className="mt-2 flex flex-wrap gap-1.5">
                                                             {(item.reason_tags || []).map((tag) => (
@@ -1543,7 +1590,7 @@ function ReportPageContent() {
                                                     )}
                                                     <div className="mt-2 flex flex-wrap gap-2">
                                                         {(item.weak_dimensions || []).map((dim) => (
-                                                            <span key={`${item.turn_id}-${dim.key}`} className="rounded-full border border-[#E5E5E5] bg-white px-2.5 py-1 text-xs text-[#555555]">
+                                                            <span key={`${item.turn_id}-${dim.key}`} className="rounded-full border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-2.5 py-1 text-xs text-[#666666] dark:text-[#bcc5d3]">
                                                                 {dim.label} {formatNum(dim.score)}
                                                             </span>
                                                         ))}
@@ -1551,18 +1598,18 @@ function ReportPageContent() {
                                                     {(item.evidence_tags || []).length > 0 && (
                                                         <div className="mt-2 flex flex-wrap gap-2">
                                                             {(item.evidence_tags || []).map((tag, tagIndex) => (
-                                                                <span key={`${item.turn_id}-tag-${tagIndex}`} className="rounded-full bg-[#EFEDE8] px-2 py-1 text-xs text-[#666666]">
+                                                                <span key={`${item.turn_id}-tag-${tagIndex}`} className="rounded-full bg-[#EFEDE8] px-2 py-1 text-xs text-[#666666] dark:text-[#bcc5d3]">
                                                                     {tag}
                                                                 </span>
                                                             ))}
                                                         </div>
                                                     )}
-                                                    <p className="mt-2 text-xs text-[#888888]">来源：{item.trace_source || 'interview_evaluations'}</p>
+                                                    <p className="mt-2 text-xs text-[#888888] dark:text-[#8e98aa]">来源：{item.trace_source || 'interview_evaluations'}</p>
                                                 </div>
                                             </div>
                                         ))}
                                     </div>
-                                    <p className="mt-2 text-xs text-[#888888]">按题目切换查看证据摘要，下面的单题表现解读会同步联动。</p>
+                                    <p className="mt-2 text-xs text-[#888888] dark:text-[#8e98aa]">按题目切换查看证据摘要，下面的单题表现解读会同步联动。</p>
                                     <div className="mt-3 flex flex-wrap gap-2">
                                         {(contentPerf.question_evidence || []).slice(0, 8).map((item, index) => {
                                             const turnId = String(item.turn_id || '').trim()
@@ -1579,8 +1626,8 @@ function ReportPageContent() {
                                                     }}
                                                     className={`rounded-full border px-3 py-1 text-xs transition ${active
                                                         ? 'border-[#9AA7BC] bg-[#EAF0F8] text-[#2F4566]'
-                                                        : 'border-[#E0DBCF] bg-white text-[#555555] hover:bg-[#F5F2EA]'
-                                                        } ${disabled ? 'cursor-not-allowed opacity-50 hover:bg-white' : ''}`}
+                                                        : 'border-[#E0DBCF] bg-[var(--surface)] text-[#666666] dark:text-[#bcc5d3] hover:bg-[#F5F2EA]'
+                                                        } ${disabled ? 'cursor-not-allowed opacity-50 hover:bg-[var(--surface)]' : ''}`}
                                                 >
                                                     题目 {index + 1} · {formatNum(item.overall_score)}
                                                 </button>
@@ -1588,13 +1635,13 @@ function ReportPageContent() {
                                         })}
                                     </div>
                                     {activeQuestionEvidence ? (
-                                        <div className="mt-3 rounded-xl border border-[#E5E5E5] bg-white p-4">
+                                        <div className="mt-3 rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
                                             <div className="flex flex-wrap items-center justify-between gap-2">
                                                 <div className="flex flex-wrap items-center gap-2">
-                                                    <span className="rounded-full bg-[#F7F4EC] px-2.5 py-1 text-xs text-[#555555]">
+                                                    <span className="rounded-full bg-[var(--surface)] px-2.5 py-1 text-xs text-[#666666] dark:text-[#bcc5d3]">
                                                         当前查看：题目 {activeQuestionIndex >= 0 ? activeQuestionIndex + 1 : 1}
                                                     </span>
-                                                    <span className="rounded-full bg-white px-2.5 py-1 text-xs text-[#555555]">
+                                                    <span className="rounded-full bg-[var(--surface)] px-2.5 py-1 text-xs text-[#666666] dark:text-[#bcc5d3]">
                                                         {activeQuestionEvidence.round_type || 'unknown'}
                                                     </span>
                                                 </div>
@@ -1602,8 +1649,8 @@ function ReportPageContent() {
                                                     单题分 {formatNum(activeTurnOverallScore)}
                                                 </span>
                                             </div>
-                                            <p className="mt-2 text-sm font-medium text-[#111111]">Q：{activeQuestionEvidence.question_excerpt || '暂无题干'}</p>
-                                            <p className="mt-1 text-sm text-[#555555]">A：{activeQuestionEvidence.answer_excerpt || '暂无回答文本'}</p>
+                                            <p className="mt-2 text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">Q：{activeQuestionEvidence.question_excerpt || '暂无题干'}</p>
+                                            <p className="mt-1 text-sm text-[#666666] dark:text-[#bcc5d3]">A：{activeQuestionEvidence.answer_excerpt || '暂无回答文本'}</p>
                                             {activeEvidenceServices.length > 0 ? (
                                                 <div className="mt-3 grid gap-3 xl:grid-cols-3">
                                                     {activeEvidenceServices.map((service, index) => {
@@ -1614,14 +1661,14 @@ function ReportPageContent() {
                                                         return (
                                                             <div
                                                                 key={`active-evidence-service-${service.source || index}`}
-                                                                className="rounded-xl border border-[#E5E5E5] bg-[#FCFBF8] p-3"
+                                                                className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-3"
                                                             >
                                                                 <div className="flex items-start justify-between gap-2">
                                                                     <div>
-                                                                        <p className="text-sm font-medium text-[#111111]">
+                                                                        <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">
                                                                             {evidenceSourceLabel(service.source)}
                                                                         </p>
-                                                                        <p className="mt-1 text-xs text-[#888888]">
+                                                                        <p className="mt-1 text-xs text-[#888888] dark:text-[#8e98aa]">
                                                                             {service.status === 'ready' ? '证据已就绪' : `状态：${service.status || 'unknown'}`}
                                                                         </p>
                                                                     </div>
@@ -1630,7 +1677,7 @@ function ReportPageContent() {
                                                                     </span>
                                                                 </div>
                                                                 {service.quality_gate && (
-                                                                    <p className="mt-2 text-xs text-[#666666]">
+                                                                    <p className="mt-2 text-xs text-[#666666] dark:text-[#bcc5d3]">
                                                                         质量门控：{service.quality_gate.passed ? '通过' : '未通过'}
                                                                         {gateReasons.length > 0 ? `（${gateReasons.join('、')}）` : ''}
                                                                     </p>
@@ -1640,7 +1687,7 @@ function ReportPageContent() {
                                                                         {featureEntries.map(([key, value]) => (
                                                                             <span
                                                                                 key={`${service.source}-${key}`}
-                                                                                className="rounded-full border border-[#E5E5E5] bg-white px-2.5 py-1 text-xs text-[#555555]"
+                                                                                className="rounded-full border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-2.5 py-1 text-xs text-[#666666] dark:text-[#bcc5d3]"
                                                                             >
                                                                                 {evidenceFeatureLabel(key)} {formatEvidenceFeatureValue(key, value)}
                                                                             </span>
@@ -1660,7 +1707,7 @@ function ReportPageContent() {
                                                                     </div>
                                                                 )}
                                                                 {quotes.length > 0 && (
-                                                                    <p className="mt-2 text-xs leading-5 text-[#666666]">
+                                                                    <p className="mt-2 text-xs leading-5 text-[#666666] dark:text-[#bcc5d3]">
                                                                         摘录：{quotes[0]}
                                                                     </p>
                                                                 )}
@@ -1681,7 +1728,7 @@ function ReportPageContent() {
                                                     )}
                                                     <div className="mt-2 flex flex-wrap gap-2">
                                                         {(activeQuestionEvidence.weak_dimensions || []).map((dim) => (
-                                                            <span key={`active-weak-${dim.key}`} className="rounded-full border border-[#E5E5E5] bg-white px-2.5 py-1 text-xs text-[#555555]">
+                                                            <span key={`active-weak-${dim.key}`} className="rounded-full border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-2.5 py-1 text-xs text-[#666666] dark:text-[#bcc5d3]">
                                                                 {dim.label} {formatNum(dim.score)}
                                                             </span>
                                                         ))}
@@ -1689,40 +1736,40 @@ function ReportPageContent() {
                                                     {(activeQuestionEvidence.evidence_tags || []).length > 0 && (
                                                         <div className="mt-2 flex flex-wrap gap-2">
                                                             {(activeQuestionEvidence.evidence_tags || []).map((tag, tagIndex) => (
-                                                                <span key={`active-evidence-summary-tag-${tagIndex}`} className="rounded-full bg-[#EFEDE8] px-2 py-1 text-xs text-[#666666]">
+                                                                <span key={`active-evidence-summary-tag-${tagIndex}`} className="rounded-full bg-[#EFEDE8] px-2 py-1 text-xs text-[#666666] dark:text-[#bcc5d3]">
                                                                     {tag}
                                                                 </span>
                                                             ))}
                                                         </div>
                                                     )}
-                                                    <p className="mt-2 text-xs text-[#888888]">来源：{activeQuestionEvidence.trace_source || 'interview_evaluations'}</p>
+                                                    <p className="mt-2 text-xs text-[#888888] dark:text-[#8e98aa]">来源：{activeQuestionEvidence.trace_source || 'interview_evaluations'}</p>
                                                 </>
                                             )}
                                         </div>
                                     ) : (
-                                        <p className="mt-3 rounded-xl border border-dashed border-[#D8D4CA] bg-white p-4 text-sm text-[#666666]">
+                                        <p className="mt-3 rounded-xl border border-dashed border-[#D8D4CA] bg-[var(--surface)] p-4 text-sm text-[#666666] dark:text-[#bcc5d3]">
                                             当前没有可展示的单题证据摘要。
                                         </p>
                                     )}
                                 </div>
 
-                                <div className="mt-5 rounded-2xl border border-[#E5E5E5] bg-[#FCFBF8] p-4">
+                                <div className="mt-5 rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
                                     <div className="flex items-center justify-between gap-2">
                                         <div className="flex items-center gap-2">
-                                            <ShieldCheck className="h-4 w-4 text-[#556987]" />
-                                            <p className="text-sm font-medium text-[#111111]">单题表现解读</p>
+                                            <ShieldCheck className="h-4 w-4 text-[#666666] dark:text-[#bcc5d3]" />
+                                            <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">单题表现解读</p>
                                         </div>
                                         {!!activeTurnId && (
                                             <button
                                                 type="button"
                                                 onClick={refreshActiveTurnAudit}
-                                                className="rounded-lg border border-[#E5E5E5] bg-white px-2.5 py-1 text-xs text-[#555555] hover:bg-[#F5F2EA]"
+                                                className="rounded-lg border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-2.5 py-1 text-xs text-[#666666] dark:text-[#bcc5d3] hover:bg-[#F5F2EA]"
                                             >
                                                 刷新本题
                                             </button>
                                         )}
                                     </div>
-                                    <p className="mt-2 text-xs text-[#888888]">选择题目后，可查看“为什么扣分”以及“下一步怎么改”。</p>
+                                    <p className="mt-2 text-xs text-[#888888] dark:text-[#8e98aa]">选择题目后，可查看“为什么扣分”以及“下一步怎么改”。</p>
 
                                     <div className="mt-3 hidden flex flex-wrap gap-2">
                                         {(contentPerf.question_evidence || []).slice(0, 6).map((item, index) => {
@@ -1744,8 +1791,8 @@ function ReportPageContent() {
                                                     }}
                                                     className={`rounded-full border px-3 py-1 text-xs transition ${active
                                                         ? 'border-[#9AA7BC] bg-[#EAF0F8] text-[#2F4566]'
-                                                        : 'border-[#E0DBCF] bg-white text-[#555555] hover:bg-[#F5F2EA]'
-                                                        } ${disabled ? 'cursor-not-allowed opacity-50 hover:bg-white' : ''}`}
+                                                        : 'border-[#E0DBCF] bg-[var(--surface)] text-[#666666] dark:text-[#bcc5d3] hover:bg-[#F5F2EA]'
+                                                        } ${disabled ? 'cursor-not-allowed opacity-50 hover:bg-[var(--surface)]' : ''}`}
                                                 >
                                                     题目 {index + 1} · {formatNum(item.overall_score)}{disabled ? '（缺少 turn_id）' : ''}
                                                 </button>
@@ -1754,7 +1801,7 @@ function ReportPageContent() {
                                     </div>
 
                                     {scorecardLoading ? (
-                                        <p className="mt-3 rounded-xl border border-dashed border-[#D8D4CA] bg-white p-4 text-sm text-[#666666]">单题证据链加载中...</p>
+                                        <p className="mt-3 rounded-xl border border-dashed border-[#D8D4CA] bg-[var(--surface)] p-4 text-sm text-[#666666] dark:text-[#bcc5d3]">单题证据链加载中...</p>
                                     ) : scorecardError ? (
                                         <div className="mt-3 rounded-xl border border-[#F0D7D2] bg-[#FFF6F4] p-4 text-sm text-[#8A3B3B]">
                                             <p>{scorecardError}</p>
@@ -1762,7 +1809,7 @@ function ReportPageContent() {
                                                 <button
                                                     type="button"
                                                     onClick={refreshActiveTurnAudit}
-                                                    className="mt-2 rounded-lg border border-[#E5B8B1] bg-white px-3 py-1 text-xs text-[#8A3B3B] hover:bg-[#FFF0ED]"
+                                                    className="mt-2 rounded-lg border border-[#E5B8B1] bg-[var(--surface)] px-3 py-1 text-xs text-[#8A3B3B] hover:bg-[#FFF0ED]"
                                                 >
                                                     重试获取证据链
                                                 </button>
@@ -1770,24 +1817,24 @@ function ReportPageContent() {
                                         </div>
                                     ) : activeScorecard?.evaluation ? (
                                         <>
-                                            <div className="mt-3 rounded-xl border border-[#E5E5E5] bg-white p-4">
-                                                <p className="text-sm font-medium text-[#111111]">本题结论</p>
-                                                <p className="mt-2 text-sm text-[#555555]">{activeQuestionEvidence?.question_excerpt || '暂无题干信息'}</p>
+                                            <div className="mt-3 rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
+                                                <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">本题结论</p>
+                                                <p className="mt-2 text-sm text-[#666666] dark:text-[#bcc5d3]">{activeQuestionEvidence?.question_excerpt || '暂无题干信息'}</p>
 
                                                 <div className="mt-3 grid gap-2 sm:grid-cols-3">
                                                     <div className="rounded-lg border border-[#EEE9DD] bg-[#FAF8F2] px-3 py-2">
-                                                        <p className="text-xs text-[#777777]">本题得分</p>
-                                                        <p className="mt-1 text-base font-semibold text-[#111111]">
+                                                        <p className="text-xs text-[#888888] dark:text-[#8e98aa]">本题得分</p>
+                                                        <p className="mt-1 text-base font-semibold text-[#111111] dark:text-[#f4f7fb]">
                                                             {formatNum(activeTurnOverallScore)}
                                                         </p>
                                                     </div>
                                                     <div className="rounded-lg border border-[#EEE9DD] bg-[#FAF8F2] px-3 py-2">
-                                                        <p className="text-xs text-[#777777]">优先改进维度</p>
-                                                        <p className="mt-1 text-base font-semibold text-[#111111]">{weakestDimensionLabel}</p>
+                                                        <p className="text-xs text-[#888888] dark:text-[#8e98aa]">优先改进维度</p>
+                                                        <p className="mt-1 text-base font-semibold text-[#111111] dark:text-[#f4f7fb]">{weakestDimensionLabel}</p>
                                                     </div>
                                                     <div className="rounded-lg border border-[#EEE9DD] bg-[#FAF8F2] px-3 py-2">
-                                                        <p className="text-xs text-[#777777]">改进建议</p>
-                                                        <p className="mt-1 text-xs leading-5 text-[#444444]">{primaryImprovementAdvice}</p>
+                                                        <p className="text-xs text-[#888888] dark:text-[#8e98aa]">改进建议</p>
+                                                        <p className="mt-1 text-xs leading-5 text-[#444444] dark:text-[#bcc5d3]">{primaryImprovementAdvice}</p>
                                                     </div>
                                                 </div>
 
@@ -1802,16 +1849,16 @@ function ReportPageContent() {
                                                 )}
 
                                                 {!!activeQuestionEvidence?.answer_excerpt && (
-                                                    <div className="mt-3 rounded-lg border border-[#EDEBE4] bg-[#FBFBF9] p-3">
-                                                        <p className="text-xs text-[#888888]">回答摘录</p>
-                                                        <p className="mt-1 text-sm text-[#555555]">{activeQuestionEvidence.answer_excerpt}</p>
+                                                    <div className="mt-3 rounded-lg border border-[#EDEBE4] bg-[var(--surface)] p-3">
+                                                        <p className="text-xs text-[#888888] dark:text-[#8e98aa]">回答摘录</p>
+                                                        <p className="mt-1 text-sm text-[#666666] dark:text-[#bcc5d3]">{activeQuestionEvidence.answer_excerpt}</p>
                                                     </div>
                                                 )}
 
                                                 {activeQuestionSummary.length > 0 && (
-                                                    <div className="mt-3 rounded-lg border border-[#EDEBE4] bg-[#FCFBF8] p-3">
-                                                        <p className="text-xs text-[#888888]">本题总评</p>
-                                                        <div className="mt-1 space-y-1.5 text-sm leading-6 text-[#555555]">
+                                                    <div className="mt-3 rounded-lg border border-[#EDEBE4] bg-[var(--surface)] p-3">
+                                                        <p className="text-xs text-[#888888] dark:text-[#8e98aa]">本题总评</p>
+                                                        <div className="mt-1 space-y-1.5 text-sm leading-6 text-[#666666] dark:text-[#bcc5d3]">
                                                             {activeQuestionSummary.map((line, index) => (
                                                                 <p key={`active-summary-${index}`}>{line}</p>
                                                             ))}
@@ -1823,45 +1870,45 @@ function ReportPageContent() {
                                             {readableDimensionCards.length > 0 ? (
                                                 <div className="mt-3 grid gap-3 md:grid-cols-2">
                                                     {readableDimensionCards.map((dimValue) => (
-                                                        <div key={`dim-evidence-${dimValue.key}`} className="rounded-xl border border-[#E5E5E5] bg-white p-3">
+                                                        <div key={`dim-evidence-${dimValue.key}`} className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-3">
                                                             <div className="flex items-center justify-between gap-2">
-                                                                <p className="text-sm font-medium text-[#111111]">{dimValue.label}</p>
-                                                                <span className="rounded-full bg-[#F1EEE7] px-2 py-1 text-xs text-[#555555]">{formatNum(dimValue.score)}</span>
+                                                                <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">{dimValue.label}</p>
+                                                                <span className="rounded-full bg-[#F1EEE7] px-2 py-1 text-xs text-[#666666] dark:text-[#bcc5d3]">{formatNum(dimValue.score)}</span>
                                                             </div>
                                                             <progress
                                                                 className="mt-2 h-2 w-full overflow-hidden rounded-full [appearance:none] [&::-webkit-progress-bar]:bg-[#ECE9E1] [&::-webkit-progress-value]:bg-[#4C6A8A] [&::-moz-progress-bar]:bg-[#4C6A8A]"
                                                                 value={dimValue.scoreValue}
                                                                 max={100}
                                                             />
-                                                            <div className="mt-2 space-y-1.5 text-xs leading-6 text-[#555555]">
+                                                            <div className="mt-2 space-y-1.5 text-xs leading-6 text-[#666666] dark:text-[#bcc5d3]">
                                                                 <p>{dimValue.overview}</p>
                                                                 <p className="text-[#3E7657]">{dimValue.highlightText}</p>
                                                                 <p className="text-[#8A3B3B]">{dimValue.gapText}</p>
-                                                                <p className="text-[#666666]">{dimValue.evidenceText}</p>
+                                                                <p className="text-[#666666] dark:text-[#bcc5d3]">{dimValue.evidenceText}</p>
                                                             </div>
                                                         </div>
                                                     ))}
                                                 </div>
                                             ) : (
-                                                <p className="mt-3 rounded-xl border border-dashed border-[#D8D4CA] bg-white p-4 text-sm text-[#666666]">当前题目暂无维度级解释数据。</p>
+                                                <p className="mt-3 rounded-xl border border-dashed border-[#D8D4CA] bg-[var(--surface)] p-4 text-sm text-[#666666] dark:text-[#bcc5d3]">当前题目暂无维度级解释数据。</p>
                                             )}
                                         </>
                                     ) : (
-                                        <p className="mt-3 rounded-xl border border-dashed border-[#D8D4CA] bg-white p-4 text-sm text-[#666666]">当前单题暂无可展示的证据链数据。</p>
+                                        <p className="mt-3 rounded-xl border border-dashed border-[#D8D4CA] bg-[var(--surface)] p-4 text-sm text-[#666666] dark:text-[#bcc5d3]">当前单题暂无可展示的证据链数据。</p>
                                     )}
                                 </div>
                             </>
                         ) : (
-                            <p className="mt-4 rounded-xl border border-dashed border-[#D8D4CA] bg-[#FAF9F6] p-4 text-sm text-[#666666]">内容表现证据暂不可用。</p>
+                            <p className="mt-4 rounded-xl border border-dashed border-[#D8D4CA] bg-[var(--surface)] p-4 text-sm text-[#666666] dark:text-[#bcc5d3]">内容表现证据暂不可用。</p>
                         )}
                     </section>
 
-                    <section className="rounded-3xl border border-[#E5E5E5] bg-white p-6 shadow-sm">
+                    <section className="rounded-3xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-6 shadow-sm">
                         <div className="flex items-center gap-2">
-                            <Mic className="h-5 w-5 text-[#556987]" />
-                            <h2 className="text-xl text-[#111111]">语音表达分析</h2>
+                            <Mic className="h-5 w-5 text-[#666666] dark:text-[#bcc5d3]" />
+                            <h2 className="text-xl text-[#111111] dark:text-[#f4f7fb]">语音表达分析</h2>
                         </div>
-                        <p className="mt-2 text-sm text-[#666666]">{speechPerf?.status_message || '暂无语音分析。'}</p>
+                        <p className="mt-2 text-sm text-[#666666] dark:text-[#bcc5d3]">{speechPerf?.status_message || '暂无语音分析。'}</p>
 
                         <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
                             <InsightMetric title="平均语速" value={`${formatNum(speechPerf?.summary?.avg_speech_rate_wpm)} 词/分钟`} icon={<Gauge className="h-4 w-4" />} />
@@ -1873,17 +1920,17 @@ function ReportPageContent() {
                         {speechRadarDimensions.length > 0 && (
                             <div className="mt-4 grid gap-4 xl:grid-cols-[1.15fr,0.85fr]">
                                 <RadarSnapshot dimensions={speechRadarDimensions} title="语音能力雷达" />
-                                <div className="rounded-2xl border border-[#E5E5E5] bg-[#FAF9F6] p-4">
-                                    <p className="text-sm font-medium text-[#111111]">优先改进项（语音）</p>
-                                    <p className="mt-1 text-xs text-[#888888]">按得分从低到高排序，建议优先提升前两项。</p>
+                                <div className="rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
+                                    <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">优先改进项（语音）</p>
+                                    <p className="mt-1 text-xs text-[#888888] dark:text-[#8e98aa]">按得分从低到高排序，建议优先提升前两项。</p>
                                     <div className="mt-3 space-y-2">
                                         {speechWeakItems.map((item, index) => (
-                                            <div key={`speech-weak-${item.key}`} className="rounded-xl border border-[#E5E5E5] bg-white px-3 py-2">
+                                            <div key={`speech-weak-${item.key}`} className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-3 py-2">
                                                 <div className="flex items-center justify-between gap-2">
-                                                    <p className="text-sm text-[#111111]">{index + 1}. {item.label}</p>
+                                                    <p className="text-sm text-[#111111] dark:text-[#f4f7fb]">{index + 1}. {item.label}</p>
                                                     <span className="rounded-full bg-[#FDECEC] px-2 py-0.5 text-xs text-[#8A3B3B]">{formatNum(item.score)}</span>
                                                 </div>
-                                                <p className="mt-1 text-xs text-[#666666]">
+                                                <p className="mt-1 text-xs text-[#666666] dark:text-[#bcc5d3]">
                                                     {item.score < 60 ? '较弱：建议优先训练，重点改善表达稳定性。' : item.score < 75 ? '偏弱：建议通过模拟问答提升这一项。' : '可继续保持，重点巩固稳定输出。'}
                                                 </p>
                                             </div>
@@ -1894,7 +1941,7 @@ function ReportPageContent() {
                         )}
 
                         {(speechPerf?.diagnosis || []).length > 0 && (
-                            <div className="mt-4 rounded-xl border border-[#E5E5E5] bg-[#F8F7F3] p-4 text-sm text-[#555555]">
+                            <div className="mt-4 rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4 text-sm text-[#666666] dark:text-[#bcc5d3]">
                                 {(speechPerf?.diagnosis || []).map((item, index) => (
                                     <p key={`diag-${index}`} className={index === 0 ? '' : 'mt-1'}>{item}</p>
                                 ))}
@@ -1904,9 +1951,9 @@ function ReportPageContent() {
                         {(speechPerf?.evidence_samples || []).length > 0 && (
                             <div className="mt-4 space-y-3">
                                 {(speechPerf?.evidence_samples || []).slice(0, 4).map((sample) => (
-                                    <div key={sample.turn_id || sample.transcript_excerpt} className="rounded-xl border border-[#E5E5E5] p-3">
-                                        <p className="text-sm text-[#111111]">文本样本：{sample.transcript_excerpt || '暂无转写文本'}</p>
-                                        <div className="mt-2 flex flex-wrap gap-2 text-xs text-[#666666]">
+                                    <div key={sample.turn_id || sample.transcript_excerpt} className="rounded-xl border border-[var(--border)] p-3">
+                                        <p className="text-sm text-[#111111] dark:text-[#f4f7fb]">文本样本：{sample.transcript_excerpt || '暂无转写文本'}</p>
+                                        <div className="mt-2 flex flex-wrap gap-2 text-xs text-[#666666] dark:text-[#bcc5d3]">
                                             <span className="rounded-full bg-[#F0EEEA] px-2 py-1">语速 {formatNum(sample.speech_rate_wpm)} 词/分钟</span>
                                             <span className="rounded-full bg-[#F0EEEA] px-2 py-1">口头词 {formatNum(sample.fillers_per_100_words, 2)}/百词</span>
                                             <span className="rounded-full bg-[#F0EEEA] px-2 py-1">长停顿 {sample.long_pause_count}</span>
@@ -1918,26 +1965,26 @@ function ReportPageContent() {
                         )}
                     </section>
 
-                    <section className="rounded-3xl border border-[#E5E5E5] bg-white p-6 shadow-sm">
+                    <section className="rounded-3xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-6 shadow-sm">
                         <div className="flex items-center gap-2">
-                            <Camera className="h-5 w-5 text-[#556987]" />
-                            <h2 className="text-xl text-[#111111]">镜头前表现</h2>
+                            <Camera className="h-5 w-5 text-[#666666] dark:text-[#bcc5d3]" />
+                            <h2 className="text-xl text-[#111111] dark:text-[#f4f7fb]">镜头前表现</h2>
                         </div>
-                        <p className="mt-2 text-sm text-[#666666]">{cameraPerf?.status_message || '基于防作弊事件与统计指标生成。'}</p>
+                        <p className="mt-2 text-sm text-[#666666] dark:text-[#bcc5d3]">{cameraPerf?.status_message || '基于防作弊事件与统计指标生成。'}</p>
 
                         <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
                             <InsightMetric title="镜头稳定分" value={formatNum(cameraPerf?.focus_score)} icon={<Eye className="h-4 w-4" />} />
                             <InsightMetric title="规范性分" value={formatNum(cameraPerf?.compliance_score)} icon={<Users className="h-4 w-4" />} />
                             <InsightMetric title="屏幕外注视" value={`${formatNum(cameraStats?.off_screen_ratio)}%`} icon={<TrendingUp className="h-4 w-4" />} />
-                            <InsightMetric title="多人同框次数" value={String(cameraStats?.total_multi_person || 0)} icon={<Users className="h-4 w-4" />} />
+                            <InsightMetric title="平均心率" value={avgHeartRateText} icon={<HeartPulse className="h-4 w-4" />} />
                         </div>
 
                         {(cameraInsights && Number(cameraInsights.sample_count || 0) > 0) && (
                             <div className="mt-4 space-y-4">
                                 <div className="grid gap-3 lg:grid-cols-2">
-                                    <div className="rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-4">
-                                        <p className="text-sm font-medium text-[#111111]">1. 478 个 三维人脸关键点</p>
-                                        <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-[#555555]">
+                                    <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
+                                        <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">1. 478 个 三维人脸关键点</p>
+                                        <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-[#666666] dark:text-[#bcc5d3]">
                                             <DataPill label="平均关键点数" value={formatNum(cameraLandmarks?.avg_landmark_count, 1)} />
                                             <DataPill label="最大关键点数" value={formatNum(cameraLandmarks?.max_landmark_count, 0)} />
                                             <DataPill label="嘴部开合比" value={formatNum(cameraLandmarks?.avg_mouth_open_ratio, 4)} />
@@ -1947,9 +1994,9 @@ function ReportPageContent() {
                                         </div>
                                     </div>
 
-                                    <div className="rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-4">
-                                        <p className="text-sm font-medium text-[#111111]">2. 52 个表情系数</p>
-                                        <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-[#555555]">
+                                    <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
+                                        <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">2. 52 个表情系数</p>
+                                        <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-[#666666] dark:text-[#bcc5d3]">
                                             <DataPill label="跟踪系数数" value={formatNum(cameraBlendshape?.tracked_count_max, 0)} />
                                             <DataPill label="眨眼频率" value={`${formatNum(cameraBlendshape?.avg_blink_rate_per_min, 1)} 次/分钟`} />
                                             <DataPill label="browInnerUp" value={formatNum(cameraBlendshape?.avg_brow_inner_up, 4)} />
@@ -1959,9 +2006,9 @@ function ReportPageContent() {
                                         </div>
                                     </div>
 
-                                    <div className="rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-4">
-                                        <p className="text-sm font-medium text-[#111111]">3. 头部姿态（俯仰 / 偏航 / 翻滚）</p>
-                                        <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-[#555555]">
+                                    <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
+                                        <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">3. 头部姿态（俯仰 / 偏航 / 翻滚）</p>
+                                        <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-[#666666] dark:text-[#bcc5d3]">
                                             <DataPill label="平均 |Pitch|" value={`${formatNum(cameraHeadPose?.avg_abs_pitch, 2)}°`} />
                                             <DataPill label="平均 |Yaw|" value={`${formatNum(cameraHeadPose?.avg_abs_yaw, 2)}°`} />
                                             <DataPill label="平均 |Roll|" value={`${formatNum(cameraHeadPose?.avg_abs_roll, 2)}°`} />
@@ -1969,9 +2016,9 @@ function ReportPageContent() {
                                         </div>
                                     </div>
 
-                                    <div className="rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-4">
-                                        <p className="text-sm font-medium text-[#111111]">4. 虹膜追踪</p>
-                                        <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-[#555555]">
+                                    <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
+                                        <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">4. 虹膜追踪</p>
+                                        <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-[#666666] dark:text-[#bcc5d3]">
                                             <DataPill label="平均注视偏移" value={formatNum(cameraIris?.avg_gaze_offset_magnitude, 4)} />
                                             <DataPill label="平均聚焦分" value={formatNum(cameraIris?.avg_gaze_focus_score, 2)} />
                                             <DataPill label="最大漂移计数" value={formatNum(cameraIris?.max_drift_count, 0)} />
@@ -1981,18 +2028,18 @@ function ReportPageContent() {
                                 </div>
 
                                 {topBlendshapeAverages.length > 0 && (
-                                    <div className="rounded-xl border border-[#E5E5E5] bg-[#F8F7F3] p-4">
-                                        <p className="text-sm font-medium text-[#111111]">表情系数活跃度 前 8 项（柱状）</p>
+                                    <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
+                                        <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">表情系数活跃度 前 8 项（柱状）</p>
                                         <div className="mt-3 space-y-2">
                                             {topBlendshapeAverages.map(([name, value]) => (
                                                 <div key={name} className="grid grid-cols-[120px,1fr,52px] items-center gap-2 text-xs">
-                                                    <span className="truncate text-[#666666]">{name}</span>
+                                                    <span className="truncate text-[#666666] dark:text-[#bcc5d3]">{name}</span>
                                                     <progress
                                                         className="h-2 w-full overflow-hidden rounded-full [appearance:none] [&::-webkit-progress-bar]:bg-[#ECE9E1] [&::-webkit-progress-value]:bg-[#4C6A8A] [&::-moz-progress-bar]:bg-[#4C6A8A]"
                                                         value={Math.max(0, Math.min(1, Number(value || 0)))}
                                                         max={1}
                                                     />
-                                                    <span className="text-right text-[#555555]">{formatNum(value, 4)}</span>
+                                                    <span className="text-right text-[#666666] dark:text-[#bcc5d3]">{formatNum(value, 4)}</span>
                                                 </div>
                                             ))}
                                         </div>
@@ -2002,31 +2049,21 @@ function ReportPageContent() {
                         )}
 
                         {(cameraPerf?.notes || []).length > 0 && (
-                            <div className="mt-4 rounded-xl border border-[#E5E5E5] bg-[#F8F7F3] p-4 text-sm text-[#555555]">
+                            <div className="mt-4 rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4 text-sm text-[#666666] dark:text-[#bcc5d3]">
                                 {(cameraPerf?.notes || []).map((note, index) => (
                                     <p key={`camera-note-${index}`} className={index === 0 ? '' : 'mt-1'}>{note}</p>
                                 ))}
                             </div>
                         )}
 
-                        {cameraBreakdown.length > 0 && (
-                            <div className="mt-4 flex flex-wrap gap-2">
-                                {cameraBreakdown.map((item) => (
-                                    <span key={`${item.event_type}-${item.count}`} className="inline-flex items-center gap-1 rounded-full border border-[#E5E5E5] bg-white px-2.5 py-1 text-xs text-[#555555]">
-                                        {eventLabel(item.event_type)} {item.count}
-                                    </span>
-                                ))}
-                            </div>
-                        )}
-
                         {gazeTrendData.length > 1 && (
-                            <div className="mt-4 rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-4">
+                            <div className="mt-4 rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
                                 <div className="flex flex-wrap items-center justify-between gap-2">
-                                    <p className="text-sm font-medium text-[#111111]">视线专注度曲线（面试全程）</p>
-                                    <div className="flex flex-wrap items-center gap-2 text-xs text-[#666666]">
-                                        <span className="rounded-full bg-white px-2 py-1">均值 {formatNum(cameraInsights?.gaze_focus_summary?.avg_focus_score, 1)}</span>
-                                        <span className="rounded-full bg-white px-2 py-1">低专注占比 {formatNum(cameraInsights?.gaze_focus_summary?.low_focus_ratio, 1)}%</span>
-                                        <span className="rounded-full bg-white px-2 py-1">最低值 {formatNum(cameraInsights?.gaze_focus_summary?.min_focus_score, 1)}</span>
+                                    <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">视线专注度曲线（面试全程）</p>
+                                    <div className="flex flex-wrap items-center gap-2 text-xs text-[#666666] dark:text-[#bcc5d3]">
+                                        <span className="rounded-full bg-[var(--surface)] px-2 py-1">均值 {formatNum(cameraInsights?.gaze_focus_summary?.avg_focus_score, 1)}</span>
+                                        <span className="rounded-full bg-[var(--surface)] px-2 py-1">低专注占比 {formatNum(cameraInsights?.gaze_focus_summary?.low_focus_ratio, 1)}%</span>
+                                        <span className="rounded-full bg-[var(--surface)] px-2 py-1">最低值 {formatNum(cameraInsights?.gaze_focus_summary?.min_focus_score, 1)}</span>
                                     </div>
                                 </div>
                                 <div className="mt-3 h-72 w-full">
@@ -2055,8 +2092,8 @@ function ReportPageContent() {
                                 </div>
 
                                 {gazeTrendValleys.length > 0 && (
-                                    <div className="mt-3 rounded-lg border border-[#E5E5E5] bg-white p-3">
-                                        <p className="text-xs text-[#777777]">专注度最低时段（优先复盘）</p>
+                                    <div className="mt-3 rounded-lg border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-3">
+                                        <p className="text-xs text-[#888888] dark:text-[#8e98aa]">专注度最低时段（优先复盘）</p>
                                         <div className="mt-2 flex flex-wrap gap-2">
                                             {gazeTrendValleys.map((point, idx) => (
                                                 <span key={`valley-${idx}`} className="rounded-full bg-[#FDECEC] px-2.5 py-1 text-xs text-[#8A3B3B]">
@@ -2069,20 +2106,20 @@ function ReportPageContent() {
                             </div>
                         )}
 
-                        {gazeTrendData.length <= 1 && cameraTopEvents.length > 0 && (
-                            <div className="mt-4 rounded-xl border border-dashed border-[#D8D4CA] bg-[#FAF9F6] p-4 text-sm text-[#666666]">
-                                暂无可绘制的专注度曲线数据，当前仅保留异常事件摘要。建议进行一场新会话以生成完整曲线。
+                        {gazeTrendData.length <= 1 && (
+                            <div className="mt-4 rounded-xl border border-dashed border-[#D8D4CA] bg-[var(--surface)] p-4 text-sm text-[#666666] dark:text-[#bcc5d3]">
+                                {gazeTrendUnavailableReason}
                             </div>
                         )}
                     </section>
 
-                    <section className="rounded-3xl border border-[#E5E5E5] bg-white p-6 shadow-sm">
+                    <section className="rounded-3xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-6 shadow-sm">
                         <div className="flex flex-wrap gap-3">
                             <Link href={replayUrl} className="inline-flex items-center gap-2 rounded-xl bg-[#111111] px-4 py-2.5 text-sm font-medium text-white hover:bg-[#222222]">
                                 进入面试复盘
                                 <ArrowRight className="h-4 w-4" />
                             </Link>
-                            <Link href="/history" className="inline-flex items-center gap-2 rounded-xl border border-[#E5E5E5] px-4 py-2.5 text-sm font-medium text-[#111111] hover:bg-[#F5F5F5]">
+                            <Link href="/history" className="inline-flex items-center gap-2 rounded-xl border border-[var(--border)] px-4 py-2.5 text-sm font-medium text-[#111111] dark:text-[#f4f7fb] hover:bg-[#F5F5F5]">
                                 返回历史记录
                             </Link>
                         </div>
@@ -2099,8 +2136,8 @@ function ReportPageFallback() {
             <PersistentSidebar />
             <main className="flex-1 overflow-y-auto">
                 <div className="mx-auto max-w-4xl px-6 py-8">
-                    <section className="rounded-2xl border border-[#E5E5E5] bg-white p-8 text-center shadow-sm">
-                        <p className="text-sm text-[#666666]">报告加载中...</p>
+                    <section className="rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-8 text-center shadow-sm">
+                        <p className="text-sm text-[#666666] dark:text-[#bcc5d3]">报告加载中...</p>
                     </section>
                 </div>
             </main>
@@ -2116,29 +2153,61 @@ export default function ReportPage() {
     )
 }
 
+function InlineInfoHint({ text }: { text: string }) {
+    const [open, setOpen] = useState(false)
+
+    return (
+        <span
+            className="relative inline-flex"
+            onMouseEnter={() => setOpen(true)}
+            onMouseLeave={() => setOpen(false)}
+        >
+            <button
+                type="button"
+                aria-label="查看说明"
+                aria-expanded={open}
+                onFocus={() => setOpen(true)}
+                onBlur={() => setOpen(false)}
+                onClick={() => setOpen((prev) => !prev)}
+                className="inline-flex h-4 w-4 items-center justify-center rounded-full border border-[#D7D2C6] bg-[#F8F6EF] text-[10px] font-semibold leading-none text-[#6D6557] transition hover:bg-[#EFEADF]"
+            >
+                !
+            </button>
+            {open ? (
+                <span
+                    role="tooltip"
+                    className="absolute left-1/2 top-[calc(100%+8px)] z-20 w-64 -translate-x-1/2 rounded-lg border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-3 py-2 text-xs leading-5 text-[#666666] dark:text-[#bcc5d3] shadow-[0_8px_24px_rgba(17,17,17,0.08)]"
+                >
+                    {text}
+                </span>
+            ) : null}
+        </span>
+    )
+}
+
 function MetricCard({ title, value, icon }: { title: string; value: string; icon?: ReactNode }) {
     return (
-        <div className="rounded-2xl border border-[#E5E5E5] bg-white p-4">
-            <p className="text-xs uppercase tracking-[0.12em] text-[#999999]">{title}</p>
-            <p className="mt-2 flex items-center gap-1 text-2xl font-semibold text-[#111111]">{value}{icon}</p>
+        <div className="rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
+            <p className="text-xs uppercase tracking-[0.12em] text-[#888888] dark:text-[#8e98aa]">{title}</p>
+            <p className="mt-2 flex items-center gap-1 text-2xl font-semibold text-[#111111] dark:text-[#f4f7fb]">{value}{icon}</p>
         </div>
     )
 }
 
 function InsightMetric({ title, value, icon }: { title: string; value: string; icon?: ReactNode }) {
     return (
-        <div className="rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-3">
-            <p className="text-xs text-[#888888]">{title}</p>
-            <p className="mt-2 flex items-center gap-1 text-lg font-semibold text-[#111111]">{value}{icon}</p>
+        <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-3">
+            <p className="text-xs text-[#888888] dark:text-[#8e98aa]">{title}</p>
+            <p className="mt-2 flex items-center gap-1 text-lg font-semibold text-[#111111] dark:text-[#f4f7fb]">{value}{icon}</p>
         </div>
     )
 }
 
 function DataPill({ label, value }: { label: string; value: string }) {
     return (
-        <div className="rounded-lg border border-[#E5E5E5] bg-white px-2.5 py-1.5">
-            <p className="text-[11px] text-[#888888]">{label}</p>
-            <p className="mt-0.5 text-xs font-medium text-[#333333]">{value}</p>
+        <div className="rounded-lg border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-2.5 py-1.5">
+            <p className="text-[11px] text-[#888888] dark:text-[#8e98aa]">{label}</p>
+            <p className="mt-0.5 text-xs font-medium text-[#111111] dark:text-[#f4f7fb]">{value}</p>
         </div>
     )
 }
@@ -2152,7 +2221,7 @@ function RadarSnapshot({
 }) {
     const normalized = (dimensions || []).slice(0, 6)
     if (normalized.length < 3) {
-        return <p className="rounded-xl border border-dashed border-[#D8D4CA] bg-[#FAF9F6] p-4 text-sm text-[#666666]">维度数据不足，无法绘制雷达图。</p>
+        return <p className="rounded-xl border border-dashed border-[#D8D4CA] bg-[var(--surface)] p-4 text-sm text-[#666666] dark:text-[#bcc5d3]">维度数据不足，无法绘制雷达图。</p>
     }
 
     const size = 220
@@ -2193,10 +2262,10 @@ function RadarSnapshot({
     })
 
     return (
-        <div className="rounded-2xl border border-[#E5E5E5] bg-[#FAF9F6] p-4">
+        <div className="rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
             <div className="flex flex-wrap items-center justify-between gap-2">
-                <p className="text-sm font-medium text-[#111111]">{title}</p>
-                <p className="text-xs text-[#777777]">分值范围 0-100</p>
+                <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">{title}</p>
+                <p className="text-xs text-[#888888] dark:text-[#8e98aa]">分值范围 0-100</p>
             </div>
 
             <div className="mt-4 flex flex-col gap-4 md:flex-row md:items-start">
@@ -2231,9 +2300,9 @@ function RadarSnapshot({
 
                 <div className="grid flex-1 gap-2 sm:grid-cols-2">
                     {axisPoints.map((item) => (
-                        <div key={`legend-${item.key}`} className="rounded-xl border border-[#E5E5E5] bg-white px-3 py-2">
-                            <p className="text-xs text-[#777777]">{item.label}</p>
-                            <p className="mt-1 text-sm font-semibold text-[#111111]">{formatNum(item.score)}</p>
+                        <div key={`legend-${item.key}`} className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-3 py-2">
+                            <p className="text-xs text-[#888888] dark:text-[#8e98aa]">{item.label}</p>
+                            <p className="mt-1 text-sm font-semibold text-[#111111] dark:text-[#f4f7fb]">{formatNum(item.score)}</p>
                         </div>
                     ))}
                 </div>

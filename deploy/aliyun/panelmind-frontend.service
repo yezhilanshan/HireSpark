@@ -1,12 +1,12 @@
 [Unit]
-Description=PanelMind Frontend
-After=network.target panelmind-backend.service
+Description=HireSpark Frontend
+After=network.target hirespark-backend.service
 
 [Service]
 Type=simple
 User=www-data
-WorkingDirectory=/opt/panelmind/frontend
-EnvironmentFile=/opt/panelmind/.env.production
+WorkingDirectory=/opt/hirespark/frontend
+EnvironmentFile=/opt/hirespark/.env.production
 Environment=NODE_ENV=production
 ExecStart=/usr/bin/npm run start -- --hostname 0.0.0.0 --port 3000
 Restart=always

@@ -25,6 +25,25 @@ def _as_bool(value: Optional[str], default: bool) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _first_env(*keys: str, default: str = "") -> str:
+    for key in keys:
+        value = str(os.environ.get(key, "") or "").strip()
+        if value:
+            return value
+    return default
+
+
+def _canonical_provider_name(name: str) -> str:
+    normalized = str(name or "").strip().lower()
+    if normalized in {"edge", "edge-tts", "edge_tts", "edgetts"}:
+        return "edge"
+    if normalized in {"cosyvoice", "cosy", "dashscope", "cosyvoice-v3-flash"}:
+        return "cosyvoice"
+    if normalized in {"auto", ""}:
+        return "auto"
+    return normalized
+
+
 def _load_env_from_repo_root() -> None:
     """Load root .env for standalone service launches that miss shell env vars."""
     env_path = Path(__file__).resolve().parents[1] / ".env"
@@ -85,8 +104,16 @@ class CosyVoiceProvider:
         self.dashscope = dashscope
         self.audio_format_enum = AudioFormat
         self.speech_synthesizer = SpeechSynthesizer
-        self.model = os.environ.get("TTS_COSYVOICE_MODEL", "cosyvoice-v3-flash").strip() or "cosyvoice-v3-flash"
-        self.voice = os.environ.get("TTS_COSYVOICE_VOICE", "longanyang").strip()
+        self.model = _first_env(
+            "TTS_COSYVOICE_MODEL",
+            "TTS_MODEL",
+            default="cosyvoice-v3-flash",
+        )
+        self.voice = _first_env(
+            "TTS_COSYVOICE_VOICE",
+            "TTS_VOICE",
+            default="Chinese_dramatic_storyteller_vv1",
+        )
         self.timeout = float(os.environ.get("TTS_COSYVOICE_TIMEOUT", "30"))
         self.retry_count = max(int(os.environ.get("TTS_COSYVOICE_RETRIES", "1")), 0)
         self.audio_format_name = (
@@ -328,14 +355,24 @@ class ProviderRuntime:
 
 
 def _resolve_provider_order() -> list[str]:
-    requested = str(os.environ.get("TTS_PROVIDER", "auto") or "auto").strip().lower()
+    explicit_order_raw = str(os.environ.get("TTS_PROVIDER_ORDER", "") or "").strip()
+    if explicit_order_raw:
+        explicit_order: list[str] = []
+        for token in explicit_order_raw.split(","):
+            canonical = _canonical_provider_name(token)
+            if canonical in {"cosyvoice", "edge"} and canonical not in explicit_order:
+                explicit_order.append(canonical)
+        if explicit_order:
+            return explicit_order
+
+    requested = _canonical_provider_name(os.environ.get("TTS_PROVIDER", "auto") or "auto")
     strict = _as_bool(os.environ.get("TTS_PROVIDER_STRICT"), False)
 
     if requested in {"", "auto"}:
         order = ["cosyvoice", "edge"]
-    elif requested in {"cosyvoice", "cosy", "dashscope", "cosyvoice-v3-flash"}:
+    elif requested == "cosyvoice":
         order = ["cosyvoice", "edge"]
-    elif requested in {"edge", "edge-tts", "edge_tts"}:
+    elif requested == "edge":
         order = ["edge"]
     else:
         logger.warning(

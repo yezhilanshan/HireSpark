@@ -130,6 +130,8 @@ const shouldSuppressDelegateLog = (args: unknown[]): boolean => {
 const withFilteredDelegateLogs = <T,>(run: () => T): T => {
     const originalError = console.error
     const originalWarn = console.warn
+    const originalInfo = console.info
+    const originalLog = console.log
     try {
         console.error = (...args: unknown[]) => {
             if (shouldSuppressDelegateLog(args)) return
@@ -139,10 +141,20 @@ const withFilteredDelegateLogs = <T,>(run: () => T): T => {
             if (shouldSuppressDelegateLog(args)) return
             originalWarn(...args)
         }
+        console.info = (...args: unknown[]) => {
+            if (shouldSuppressDelegateLog(args)) return
+            originalInfo(...args)
+        }
+        console.log = (...args: unknown[]) => {
+            if (shouldSuppressDelegateLog(args)) return
+            originalLog(...args)
+        }
         return run()
     } finally {
         console.error = originalError
         console.warn = originalWarn
+        console.info = originalInfo
+        console.log = originalLog
     }
 }
 

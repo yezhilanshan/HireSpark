@@ -1,14 +1,14 @@
 'use client'
 
 import { usePathname } from 'next/navigation'
-import ThemeToggle from './ThemeToggle'
 import AssistantFloatingChat from './AssistantFloatingChat'
+import MembershipSubscriptionButton from './MembershipSubscriptionButton'
+import NotificationCenter from './NotificationCenter'
 
 export default function GlobalFloatingActions() {
     const pathname = usePathname()
 
     const isInterviewScene = pathname?.startsWith('/interview') || pathname?.startsWith('/liveness')
-    // 登录页只隐藏顶部按钮，保留助理入口。
     const hideTopActions = pathname === '/'
 
     if (isInterviewScene) {
@@ -17,8 +17,13 @@ export default function GlobalFloatingActions() {
 
     return (
         <>
+            {!hideTopActions ? (
+                <div className="fixed right-4 top-4 z-50 flex items-center gap-3">
+                    <MembershipSubscriptionButton mode="inline" />
+                    <NotificationCenter mode="inline" />
+                </div>
+            ) : null}
             <AssistantFloatingChat />
-            {!hideTopActions ? <ThemeToggle /> : null}
         </>
     )
 }

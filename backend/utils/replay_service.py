@@ -61,6 +61,22 @@ def _count_tokens(text: str) -> int:
     return max(1, count)
 
 
+def _filter_content_dimensions_by_round(round_type: str, dimension_map: Dict[str, Any]) -> Dict[str, Any]:
+    normalized_round = str(round_type or "").strip().lower()
+    if not isinstance(dimension_map, dict):
+        return {}
+
+    filtered: Dict[str, Any] = {}
+    for dim_key, dim_payload in dimension_map.items():
+        if not isinstance(dim_payload, dict):
+            continue
+        normalized_key = str(dim_key or "").strip().lower()
+        if normalized_round == "system_design" and normalized_key == "clarity":
+            continue
+        filtered[dim_key] = dim_payload
+    return filtered
+
+
 class ReplayService:
     """生成回放产物（A/B/C/D）并持久化。"""
 
@@ -288,7 +304,11 @@ class ReplayService:
                     "severity": "high",
                 })
 
-            dims = (layer2.get("final_dimension_scores") or layer2.get("dimension_scores") or {})
+            round_type = str(row.get("round_type") or "technical")
+            dims = _filter_content_dimensions_by_round(
+                round_type,
+                layer2.get("final_dimension_scores") or layer2.get("dimension_scores") or {},
+            )
             weakest = sorted(
                 [{"key": key, "score": _safe_float((value or {}).get("score"), 0.0)} for key, value in dims.items()],
                 key=lambda item: item["score"]
@@ -303,7 +323,6 @@ class ReplayService:
                         "suggestion": f"建议补充 {item['key']} 维度的底层原理、权衡与边界条件说明。",
                     })
 
-            round_type = str(row.get("round_type") or "technical")
             score = _safe_float(layer2.get("overall_score_final") or row.get("overall_score"), 0.0)
             coverage = _safe_float(key_points.get("coverage_ratio"), 0.0)
             round_diag[round_type]["count"] += 1
@@ -411,7 +430,11 @@ class ReplayService:
                 "turn_id": turn_id,
                 "coverage_ratio": round(coverage_ratio, 4),
             })
-            dims = (layer2.get("final_dimension_scores") or layer2.get("dimension_scores") or {})
+            round_type = str(row.get("round_type") or "technical")
+            dims = _filter_content_dimensions_by_round(
+                round_type,
+                layer2.get("final_dimension_scores") or layer2.get("dimension_scores") or {},
+            )
             for key, payload in dims.items():
                 radar_bucket[key].append(_safe_float((payload or {}).get("score"), 0.0))
 
@@ -470,7 +493,11 @@ class ReplayService:
             ev = evaluation_by_turn.get(turn_id, {})
             layer1 = ev.get("layer1") or {}
             layer2 = ev.get("layer2") or {}
-            dims = (layer2.get("final_dimension_scores") or layer2.get("dimension_scores") or {})
+            round_type = str(ev.get("round_type") or "technical")
+            dims = _filter_content_dimensions_by_round(
+                round_type,
+                layer2.get("final_dimension_scores") or layer2.get("dimension_scores") or {},
+            )
             weakest = sorted(
                 [
                     {"dimension": key, "score": round(_safe_float((value or {}).get("score"), 0.0), 2)}

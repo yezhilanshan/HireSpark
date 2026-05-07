@@ -52,8 +52,7 @@ class EvaluationService:
             "architecture_reasoning",
             "tradeoff_awareness",
             "scalability",
-            "logic",
-            "clarity"
+            "logic"
         ],
         "hr": [
             "clarity",
@@ -404,14 +403,43 @@ class EvaluationService:
         layer2_result = dict(layer2_result or {})
         dimensions = self.ROUND_DIMENSIONS.get(round_type, self.ROUND_DIMENSIONS["technical"])
         raw_dimension_scores = layer2_result.get("dimension_scores", {}) or {}
+        provided_scores = []
+        for payload in raw_dimension_scores.values():
+            if not isinstance(payload, dict):
+                continue
+            score_value = self._safe_float(payload.get("score"))
+            if score_value is None:
+                continue
+            provided_scores.append(self._clamp_score(score_value))
+        fallback_dimension_score = round(
+            sum(provided_scores) / len(provided_scores),
+            2,
+        ) if provided_scores else 60.0
 
         text_base_dimension_scores = {}
         for dim in dimensions:
-            payload = raw_dimension_scores.get(dim, {}) or {}
+            payload = raw_dimension_scores.get(dim)
+            payload_dict = payload if isinstance(payload, dict) else {}
+            has_explicit_dimension = dim in raw_dimension_scores and isinstance(payload, dict)
+            raw_score = payload_dict.get("score")
+            safe_score = self._safe_float(raw_score)
+            resolved_score = self._clamp_score(
+                safe_score if safe_score is not None else fallback_dimension_score
+            )
+            reason = str(payload_dict.get("reason", "") or "").strip()
+            evidence = payload_dict.get("evidence") if isinstance(payload_dict.get("evidence"), dict) else {}
+
+            if not has_explicit_dimension:
+                reason = "该维度未独立产出，按同题文本维度均值估算。"
+                evidence = {
+                    "estimation": "fallback_mean",
+                    "fallback_score": fallback_dimension_score,
+                }
+
             text_base_dimension_scores[dim] = {
-                "score": self._clamp_score(payload.get("score", 0.0)),
-                "reason": str(payload.get("reason", "") or "").strip(),
-                "evidence": payload.get("evidence") if isinstance(payload.get("evidence"), dict) else {},
+                "score": resolved_score,
+                "reason": reason,
+                "evidence": evidence,
             }
 
         final_dimension_scores = {

@@ -30,6 +30,7 @@ const SERVER_ASR_RECHECK_DELAY_MS = 1100
 const ENABLE_BROWSER_ASR_STALL_FALLBACK = false
 const ASR_DEBUG_PANEL_ENABLED = false
 const ASR_DEBUG_MAX_ITEMS = 120
+const KNOWLEDGE_GRAPH_REFRESH_KEY = 'hirespark:knowledge-graph:refresh'
 const BASE_SILENCE_MS = 1650
 const BROWSER_SILENCE_BONUS_MS = 220
 const NOISY_ENV_SILENCE_BONUS_MS = 320
@@ -66,6 +67,27 @@ interface ChatMessage {
     role: 'interviewer' | 'candidate'
     content: string
     timestamp: string
+}
+
+interface ForcedQuestionConfig {
+    id?: string
+    question?: string
+    category?: string
+    round_type?: string
+    position?: string
+    difficulty?: string
+}
+
+interface InterviewConfigState {
+    round: string
+    roundName: string
+    position: string
+    difficulty: string
+    selectedQuestion: ForcedQuestionConfig | null
+    trainingTaskId?: string
+    trainingMode?: string
+    auto_end_min_questions?: number
+    auto_end_max_questions?: number
 }
 
 interface AsrDebugEvent {
@@ -152,11 +174,16 @@ export default function InterviewPage() {
     const [interviewStarted, setInterviewStarted] = useState(false)
 
     // 面试配置
-    const [interviewConfig, setInterviewConfig] = useState({
+    const [interviewConfig, setInterviewConfig] = useState<InterviewConfigState>({
         round: 'technical',
         roundName: '技术基础面',
         position: 'java_backend',
-        difficulty: 'medium'
+        difficulty: 'medium',
+        selectedQuestion: null,
+        trainingTaskId: '',
+        trainingMode: '',
+        auto_end_min_questions: undefined,
+        auto_end_max_questions: undefined,
     })
 
     // 聊天相关
@@ -958,11 +985,30 @@ export default function InterviewPage() {
                 'system_design': '系统设计面',
                 'hr': 'HR 综合面'
             }
+            const selectedQuestion = config?.selectedQuestion && typeof config.selectedQuestion === 'object'
+                ? {
+                    id: String(config.selectedQuestion.id || '').trim(),
+                    question: String(config.selectedQuestion.question || '').trim(),
+                    category: String(config.selectedQuestion.category || '').trim(),
+                    round_type: String(config.selectedQuestion.round_type || '').trim(),
+                    position: String(config.selectedQuestion.position || '').trim(),
+                    difficulty: String(config.selectedQuestion.difficulty || '').trim(),
+                }
+                : null
+            const autoEndMinRaw = Number(config?.auto_end_min_questions)
+            const autoEndMaxRaw = Number(config?.auto_end_max_questions)
+            const autoEndMin = Number.isFinite(autoEndMinRaw) && autoEndMinRaw > 0 ? autoEndMinRaw : undefined
+            const autoEndMax = Number.isFinite(autoEndMaxRaw) && autoEndMaxRaw > 0 ? autoEndMaxRaw : undefined
             setInterviewConfig({
                 round: config.round || 'technical',
                 roundName: roundMap[config.round] || '技术基础面',
                 position: config.position || 'java_backend',
-                difficulty: config.difficulty || 'medium'
+                difficulty: config.difficulty || 'medium',
+                selectedQuestion: selectedQuestion && selectedQuestion.question ? selectedQuestion : null,
+                trainingTaskId: String(config?.trainingTaskId || '').trim(),
+                trainingMode: String(config?.trainingMode || '').trim(),
+                auto_end_min_questions: autoEndMin,
+                auto_end_max_questions: autoEndMax,
             })
         }
 
@@ -1498,7 +1544,7 @@ export default function InterviewPage() {
                 asrLockedRef.current = false
                 resetAnswerSessionUi()
 
-                setCurrentQuestion(data.display_text)
+                setCurrentQuestion(String(data?.followup_decision?.coach_next_question || data.display_text || ''))
                 setUserAnswer('')
                 speakText(data.spoken_text || data.display_text)
                 setChatMessages(prev => [...prev, {
@@ -1777,6 +1823,9 @@ export default function InterviewPage() {
                 console.log('Interview ended:', data)
                 const endedSessionId = String(data?.session_id || sessionIdRef.current || '').trim()
                 const endedInterviewId = String(data?.interview_id || buildInterviewId(endedSessionId)).trim()
+                if (typeof window !== 'undefined') {
+                    window.localStorage.setItem(KNOWLEDGE_GRAPH_REFRESH_KEY, `${Date.now()}:${endedInterviewId || endedSessionId}`)
+                }
                 autoEndingRef.current = false
                 setIsEndingInterview(false)
                 void stopVideoRecording(endedSessionId, true)
@@ -1837,7 +1886,21 @@ export default function InterviewPage() {
             round_type: interviewConfig.round,
             position: interviewConfig.position,
             difficulty: interviewConfig.difficulty,
-            user_id: 'default'
+            user_id: 'default',
+            training_task_id: interviewConfig.trainingTaskId || undefined,
+            training_mode: interviewConfig.trainingMode || undefined,
+            auto_end_min_questions: interviewConfig.auto_end_min_questions,
+            auto_end_max_questions: interviewConfig.auto_end_max_questions,
+            selected_question: interviewConfig.selectedQuestion
+                ? {
+                    id: interviewConfig.selectedQuestion.id || '',
+                    question: interviewConfig.selectedQuestion.question || '',
+                    category: interviewConfig.selectedQuestion.category || '',
+                    round_type: interviewConfig.selectedQuestion.round_type || interviewConfig.round,
+                    position: interviewConfig.selectedQuestion.position || interviewConfig.position,
+                    difficulty: interviewConfig.selectedQuestion.difficulty || interviewConfig.difficulty,
+                }
+                : undefined,
         })
     }
 
@@ -1941,11 +2004,11 @@ export default function InterviewPage() {
                 ? '正在处理你的回答...'
                 : answerSessionStatus === 'finalizing'
                     ? '当前回答整理中，稍候会自动续录'
-                : answerSessionStatus === 'paused_short'
-                    ? '检测到停顿，继续说话会自动并入同一题回答'
-                    : (isRecording || isListening)
-                        ? '录音自动进行中'
-                        : '等待你开始回答，系统将自动录音'
+                    : answerSessionStatus === 'paused_short'
+                        ? '检测到停顿，继续说话会自动并入同一题回答'
+                        : (isRecording || isListening)
+                            ? '录音自动进行中'
+                            : '等待你开始回答，系统将自动录音'
 
     useEffect(() => {
         if (!cameraReady || !socket || !interviewStarted || !sessionIdRef.current) return
@@ -2140,11 +2203,10 @@ export default function InterviewPage() {
                                 onClick={handleEndInterview}
                                 disabled={isEndingInterview}
                                 type="button"
-                                className={`rounded-full p-2 text-[#666666] transition-colors ${
-                                    isEndingInterview
-                                        ? 'cursor-wait opacity-60'
-                                        : 'hover:bg-[#F5F5F5] hover:text-[#111111]'
-                                }`}
+                                className={`rounded-full p-2 text-[#666666] transition-colors ${isEndingInterview
+                                    ? 'cursor-wait opacity-60'
+                                    : 'hover:bg-[#F5F5F5] hover:text-[#111111]'
+                                    }`}
                                 aria-label="结束并返回"
                             >
                                 <X size={18} />
@@ -2156,9 +2218,8 @@ export default function InterviewPage() {
                             <button
                                 onClick={handleEndInterview}
                                 disabled={isEndingInterview}
-                                className={`inline-flex items-center rounded-full border border-[#E5E5E5] bg-white px-4 py-1.5 text-sm font-medium text-[#111111] transition-colors ${
-                                    isEndingInterview ? 'cursor-wait opacity-60' : 'hover:bg-[#F5F5F5]'
-                                }`}
+                                className={`inline-flex items-center rounded-full border border-[#E5E5E5] bg-white px-4 py-1.5 text-sm font-medium text-[#111111] transition-colors ${isEndingInterview ? 'cursor-wait opacity-60' : 'hover:bg-[#F5F5F5]'
+                                    }`}
                                 type="button"
                             >
                                 结束面试
@@ -2236,13 +2297,12 @@ export default function InterviewPage() {
                                     <div className="flex items-center gap-4">
                                         <div
                                             aria-label="自动录音状态"
-                                            className={`relative inline-flex h-11 w-11 items-center justify-center rounded-full ${
-                                                isRecording
-                                                    ? 'bg-[#111111] text-white'
-                                                    : voiceInputEnabled
-                                                        ? (isAiSpeaking ? 'bg-[#ECEAE4] text-[#7D776B]' : 'bg-[#F1EFEA] text-[#555046]')
-                                                        : 'bg-[#E7E3DB] text-[#9A9387]'
-                                            }`}
+                                            className={`relative inline-flex h-11 w-11 items-center justify-center rounded-full ${isRecording
+                                                ? 'bg-[#111111] text-white'
+                                                : voiceInputEnabled
+                                                    ? (isAiSpeaking ? 'bg-[#ECEAE4] text-[#7D776B]' : 'bg-[#F1EFEA] text-[#555046]')
+                                                    : 'bg-[#E7E3DB] text-[#9A9387]'
+                                                }`}
                                         >
                                             {isRecording && (
                                                 <span className="absolute inset-0 rounded-full border border-[#111111]/65 animate-ping" />
@@ -2283,7 +2343,7 @@ export default function InterviewPage() {
 
                         <div
                             ref={chatScrollContainerRef}
-                            className="min-h-0 flex-1 space-y-4 overflow-y-auto bg-[#FCFCFB] p-4"
+                            className="min-h-0 max-h-[calc(100vh-280px)] space-y-4 overflow-y-auto bg-[#FCFCFB] p-4"
                         >
                             {chatMessages.length === 0 ? (
                                 <div className="rounded-lg border border-dashed border-[#D9D4CA] bg-[#FAFAFA] p-6 text-center text-sm text-[#777268]">
@@ -2306,11 +2366,10 @@ export default function InterviewPage() {
                                             <span className="text-[10px] text-[#999999]">{msg.timestamp}</span>
                                         </div>
                                         <div
-                                            className={`max-w-[92%] rounded-2xl p-2.5 text-sm leading-relaxed ${
-                                                msg.role === 'candidate'
-                                                    ? 'rounded-tr-sm bg-[#111111] text-white shadow-[0_12px_20px_-18px_rgba(0,0,0,0.9)]'
-                                                    : 'rounded-tl-sm border border-[#E7E3DB] bg-[#F7F6F2] text-[#111111]'
-                                            }`}
+                                            className={`max-w-[92%] rounded-2xl p-2.5 text-sm leading-relaxed ${msg.role === 'candidate'
+                                                ? 'rounded-tr-sm bg-[#111111] text-white shadow-[0_12px_20px_-18px_rgba(0,0,0,0.9)]'
+                                                : 'rounded-tl-sm border border-[#E7E3DB] bg-[#F7F6F2] text-[#111111]'
+                                                }`}
                                         >
                                             {msg.content}
                                         </div>

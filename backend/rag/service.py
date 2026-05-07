@@ -5,7 +5,9 @@ RAG service - configuration, indexing and retrieval entrypoint.
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
+import random
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -48,8 +50,15 @@ POSITION_ALIASES = {
     "java_backend": ["java_backend", "java后端", "java后端工程师", "java后端开发工程师", "后端", "后端工程师", "backend"],
     "frontend": ["frontend", "frontend_engineer", "前端", "前端工程师", "前端开发", "web前端工程师", "web前端开发工程师", "qianduan"],
     "algorithm": ["algorithm", "algorithm_engineer", "算法", "算法工程师"],
-    "fullstack": ["fullstack", "全栈", "全栈工程师"],
-    "data_engineer": ["data_engineer", "数据工程师", "dataengineer"],
+    "test_engineer": [
+        "test_engineer", "software_test", "software_test_engineer", "qa", "qa_engineer",
+        "测试", "测试工程师", "软件测试", "软件测试工程师", "质量保障",
+        "fullstack", "全栈", "全栈工程师"
+    ],
+    "agent_developer": [
+        "agent_developer", "agentdeveloper", "agent开发", "agent开发工程师", "agent工程师", "智能体开发", "智能体工程师",
+        "data_engineer", "数据工程师", "dataengineer", "agent", "agent developer"
+    ],
     "devops": ["devops", "devops工程师", "运维开发", "运维工程师"],
     "product_manager": ["product_manager", "productmanager", "产品经理", "产品", "chanpin", "pm"],
 }
@@ -83,6 +92,18 @@ class RAGService:
         self.max_context_results = int(config.get("rag.max_context_results", 2))
         self.max_similarity_gap = float(config.get("rag.max_similarity_gap", 0.08))
         self.min_lexical_score = float(config.get("rag.min_lexical_score", 0.10))
+        self.question_candidate_pool_size = max(
+            8,
+            int(config.get("rag.question_candidate_pool_size", 12) or 12),
+        )
+        self.question_selection_pool_size = max(
+            3,
+            int(config.get("rag.question_selection_pool_size", 5) or 5),
+        )
+        self.question_randomness = max(
+            0.0,
+            min(1.0, float(config.get("rag.question_randomness", 0.35) or 0.35)),
+        )
         self.auto_build = bool(config.get("rag.auto_build_on_start", False))
 
         self.embedder: Optional[TextEmbedder] = None
@@ -223,7 +244,13 @@ class RAGService:
             if not supported_files:
                 raise FileNotFoundError(f"知识库目录中没有可用文件: {path}")
             for item in supported_files:
-                records.extend(self._load_records_from_file(item))
+                try:
+                    records.extend(self._load_records_from_file(item))
+                except ValueError as exc:
+                    logger.warning(f"跳过无法解析为结构化知识的文件 {item}: {exc}")
+                    continue
+            if not records:
+                raise ValueError(f"目录中未解析到可用知识记录: {path}")
             return records
 
         if not path.exists():
@@ -341,8 +368,126 @@ class RAGService:
             elif isinstance(parsed, list):
                 records.extend(item for item in parsed if isinstance(item, dict))
 
-        if not records:
-            raise ValueError(f"Markdown 文件中未解析到 JSON 记录: {path}")
+        if records:
+            return records
+
+        fallback_records = RAGService._extract_question_records_from_plain_markdown(path, text)
+        if fallback_records:
+            logger.info(
+                "Markdown 未命中 JSON 结构，已回退为纯文本题目抽取: %s (count=%s)",
+                path,
+                len(fallback_records),
+            )
+            return fallback_records
+
+        raise ValueError(f"Markdown 文件中未解析到 JSON 记录: {path}")
+
+    @staticmethod
+    def _infer_role_from_markdown_path(path: Path) -> str:
+        stem = str(path.stem or "").strip().lower()
+        if any(token in stem for token in ("frontend", "qianduan", "fe")):
+            return "前端工程师"
+        if any(token in stem for token in ("java", "backend")):
+            return "Java后端工程师"
+        if any(token in stem for token in ("test", "qa", "ceshi", "测试")):
+            return "软件测试工程师"
+        if any(token in stem for token in ("chanpin", "product", "pm")):
+            return "产品经理"
+        if any(token in stem for token in ("agent", "智能体", "zhinengti")):
+            return "Agent开发工程师"
+        if any(token in stem for token in ("algorithm", "mianjing")):
+            return "算法工程师"
+        return "通用岗位"
+
+    @staticmethod
+    def _extract_question_candidates_from_plain_markdown(text: str) -> List[str]:
+        chinese_cues = (
+            "为什么",
+            "如何",
+            "怎么",
+            "是什么",
+            "区别",
+            "哪些",
+            "哪种",
+            "原理",
+            "流程",
+            "思路",
+            "设计",
+            "优化",
+        )
+        english_cues = ("why", "how", "what", "difference", "compare", "design", "explain")
+
+        candidates: List[str] = []
+        for raw_line in (text or "").splitlines():
+            line = str(raw_line or "").strip()
+            if not line or line.startswith("```"):
+                continue
+
+            # 清理常见 markdown / 列表前缀
+            line = re.sub(r"^[#>\-\*\+\s]+", "", line)
+            line = re.sub(r"^\d+[\.\)\、]\s*", "", line)
+            line = re.sub(r"^[（(]?\d+[）)]\s*", "", line)
+            line = re.sub(r"\s+", " ", line).strip(" \t-_")
+            if len(line) < 8 or len(line) > 160:
+                continue
+
+            lower = line.lower()
+            has_question_mark = ("?" in line) or ("？" in line)
+            has_chinese_cue = any(cue in line for cue in chinese_cues)
+            has_english_cue = any(cue in lower for cue in english_cues)
+            if not (has_question_mark or has_chinese_cue or has_english_cue):
+                continue
+
+            cleaned = line.rstrip("。；;,，、")
+            if cleaned:
+                candidates.append(cleaned)
+
+        deduped: List[str] = []
+        seen = set()
+        for question in candidates:
+            key = question.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(question)
+        return deduped
+
+    @staticmethod
+    def _extract_question_records_from_plain_markdown(path: Path, text: str) -> List[Dict[str, Any]]:
+        questions = RAGService._extract_question_candidates_from_plain_markdown(text)
+        if not questions:
+            return []
+
+        role = RAGService._infer_role_from_markdown_path(path)
+        records: List[Dict[str, Any]] = []
+        for index, question in enumerate(questions, start=1):
+            records.append(
+                {
+                    "id": f"{path.stem}_plain_{index:03d}",
+                    "role": role,
+                    "position": role,
+                    "question": question,
+                    "category": "面经整理",
+                    "subcategory": str(path.stem),
+                    "competency": [],
+                    "difficulty": "medium",
+                    "question_type": "经验问答",
+                    "round_type": "technical",
+                    "question_intent": "screening",
+                    "keywords": [],
+                    "tags": ["plain_markdown", "auto_extracted", str(path.stem)],
+                    "answer_summary": "",
+                    "key_points": [],
+                    "optional_points": [],
+                    "expected_answer_signals": [],
+                    "common_mistakes": [],
+                    "scoring_rubric": {"basic": [], "good": [], "excellent": []},
+                    "followups": [],
+                    "retrieval_text": question,
+                    "source": str(path.name),
+                    "source_type": "auto_markdown_extraction",
+                }
+            )
         return records
 
     def _normalize_record(self, raw: Dict[str, Any], index: int) -> Dict[str, Any]:
@@ -617,23 +762,23 @@ class RAGService:
         normalized = str(round_type or "technical").strip().lower()
         profiles = {
             "project": {
-                "project_limit": 3,
-                "keyword_limit": 4,
-                "skill_limit": 2,
-                "base_hit_boost": 0.08,
-                "max_hit_boost": 0.32,
-                "project_bonus": 0.10,
-                "skill_bonus": 0.04,
+                "project_limit": 4,
+                "keyword_limit": 5,
+                "skill_limit": 3,
+                "base_hit_boost": 0.10,
+                "max_hit_boost": 0.40,
+                "project_bonus": 0.14,
+                "skill_bonus": 0.06,
                 "enabled": True,
             },
             "system_design": {
-                "project_limit": 2,
-                "keyword_limit": 3,
-                "skill_limit": 2,
-                "base_hit_boost": 0.05,
-                "max_hit_boost": 0.22,
-                "project_bonus": 0.06,
-                "skill_bonus": 0.03,
+                "project_limit": 3,
+                "keyword_limit": 4,
+                "skill_limit": 3,
+                "base_hit_boost": 0.08,
+                "max_hit_boost": 0.32,
+                "project_bonus": 0.10,
+                "skill_bonus": 0.05,
                 "enabled": True,
             },
             "technical": {
@@ -713,6 +858,46 @@ class RAGService:
         item_topic = str(metadata.get("subcategory") or metadata.get("category") or "").strip()
         if current_topic and item_topic and current_topic == item_topic:
             score += 0.04
+        target_round = str(state.target_round_type or "").strip().lower()
+        item_round = str(metadata.get("round_type") or "").strip().lower()
+        if target_round and item_round:
+            if item_round == target_round:
+                score += 0.20
+            else:
+                score -= 0.18
+        round_keyword_hints = {
+            "system_design": ["系统设计", "架构", "扩展", "高并发", "可用性", "一致性", "分布式", "容量", "限流", "降级"],
+            "project": ["项目", "落地", "负责", "复盘", "协作", "推进", "实践", "交付"],
+            "hr": ["自我介绍", "职业规划", "优缺点", "冲突", "沟通", "团队", "压力", "动机"],
+            "technical": ["原理", "机制", "实现", "复杂度", "优化", "底层", "源码", "算法"],
+        }
+        if target_round in round_keyword_hints:
+            round_haystack = " ".join(
+                [
+                    str(item.get("question", "")).strip(),
+                    str(metadata.get("category", "")).strip(),
+                    str(metadata.get("subcategory", "")).strip(),
+                    " ".join(str(entry) for entry in metadata.get("keywords", []) or []),
+                ]
+            )
+            hint_hits = sum(
+                1 for token in round_keyword_hints[target_round] if token and token in round_haystack
+            )
+            if hint_hits:
+                score += min(0.22, hint_hits * 0.05)
+
+        target_difficulty = str(state.target_difficulty or "").strip().lower()
+        item_difficulty = str(metadata.get("difficulty") or "").strip().lower()
+        if target_difficulty and item_difficulty:
+            if item_difficulty == target_difficulty:
+                score += 0.08
+            else:
+                adjacent = {
+                    "easy": {"medium"},
+                    "medium": {"easy", "hard"},
+                    "hard": {"medium"},
+                }
+                score += 0.02 if item_difficulty in adjacent.get(target_difficulty, set()) else -0.06
 
         resume_terms = self._select_resume_query_terms(state)
         resume_profile = self._get_resume_weight_profile(state.target_round_type)
@@ -745,7 +930,97 @@ class RAGService:
                 ) and float(resume_profile.get("skill_bonus", 0.0)) > 0:
                     score += float(resume_profile.get("skill_bonus", 0.0))
 
+        is_first_question = not (state.asked_question_ids or [])
+        question_type = str(metadata.get("question_type") or "").strip().lower()
+        question_intent = str(metadata.get("question_intent") or "").strip().lower()
+        if is_first_question:
+            if target_round == "project":
+                if any(token in question_type for token in ["项目", "场景", "实战"]) or question_intent == "deep_dive":
+                    score += 0.18
+                if any(token in question_type for token in ["基础", "定义"]) or question_intent == "screening":
+                    score -= 0.14
+            elif target_round == "system_design":
+                if any(token in question_type for token in ["系统设计", "场景", "架构"]) or question_intent == "deep_dive":
+                    score += 0.20
+                if any(token in question_type for token in ["基础", "技术基础"]) or question_intent == "screening":
+                    score -= 0.16
+
         return round(score, 4)
+
+    def _question_selection_seed(
+        self,
+        state: InterviewState,
+        context: Optional[str] = None,
+    ) -> int:
+        seed_text = "|".join(
+            [
+                str(state.session_id or ""),
+                str(state.role or ""),
+                str(state.target_round_type or ""),
+                str(state.target_difficulty or ""),
+                str(len(state.asked_question_ids or [])),
+                str(context or ""),
+            ]
+        )
+        digest = hashlib.sha1(seed_text.encode("utf-8", errors="ignore")).hexdigest()
+        return int(digest[:12], 16)
+
+    def _select_question_from_ranked_pool(
+        self,
+        candidates: List[Dict[str, Any]],
+        state: InterviewState,
+        context: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        if not candidates:
+            return None
+
+        target_round = str(state.target_round_type or "").strip().lower()
+        is_first_question = not (state.asked_question_ids or [])
+        pool_size = max(1, min(self.question_selection_pool_size, len(candidates)))
+        effective_randomness = self.question_randomness
+        if is_first_question and target_round in {"project", "system_design"}:
+            pool_size = max(pool_size, min(len(candidates), self.question_selection_pool_size + 2))
+            effective_randomness = max(
+                self.question_randomness,
+                0.58 if target_round == "project" else 0.5,
+            )
+        pool = candidates[:pool_size]
+        if len(pool) == 1 or effective_randomness <= 0:
+            return pool[0]
+
+        max_score = max(float(item.get("score", 0.0) or 0.0) for item in pool)
+        min_score = min(float(item.get("score", 0.0) or 0.0) for item in pool)
+        spread = max(max_score - min_score, 0.0001)
+
+        weights: List[float] = []
+        for rank, item in enumerate(pool):
+            normalized = (float(item.get("score", 0.0) or 0.0) - min_score) / spread
+            rank_bias = max(0.18, 1.0 - rank * 0.14)
+            weights.append(max(0.05, (0.65 + normalized) * rank_bias))
+
+        if random.Random(self._question_selection_seed(state, context=context)).random() > effective_randomness:
+            return pool[0]
+
+        chooser = random.Random(self._question_selection_seed(state, context=context) + 17)
+        return chooser.choices(pool, weights=weights, k=1)[0]
+
+    @staticmethod
+    def _move_selected_question_first(
+        candidates: List[Dict[str, Any]],
+        selected: Optional[Dict[str, Any]],
+        max_items: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        if not selected:
+            return candidates
+        selected_id = str(selected.get("id") or "").strip()
+        ordered = [selected]
+        ordered.extend(
+            item for item in candidates
+            if str(item.get("id") or "").strip() != selected_id
+        )
+        if max_items is not None:
+            return ordered[:max(1, max_items)]
+        return ordered
 
     def get_next_question(
         self,
@@ -765,21 +1040,71 @@ class RAGService:
 
         query = self._build_question_query(state, context=context)
         resume_focus_terms = self._select_resume_query_terms(state)
-        candidate_limit = max((top_k or self.max_context_results) * 3, self.top_k)
-        items = self.retrieve_questions(
-            query=query,
-            position=state.role,
-            top_k=candidate_limit,
-            metadata_filters={"round_type": state.target_round_type},
+        visible_limit = max(top_k or self.max_context_results, self.max_context_results)
+        candidate_limit = max(
+            self.question_candidate_pool_size,
+            visible_limit * 3,
+            self.top_k,
         )
+        round_filter = {"round_type": state.target_round_type} if state.target_round_type else None
+        relaxed_similarity = max(0.42, float(self.min_similarity) - 0.10)
+        short_query = " ".join(
+            part for part in [state.role, state.target_round_type, state.target_difficulty] if part
+        ).strip() or query
+
+        retrieval_plans = [
+            {
+                "query": query,
+                "position": state.role,
+                "min_similarity": self.min_similarity,
+                "metadata_filters": round_filter,
+            },
+            {
+                "query": short_query,
+                "position": state.role,
+                "min_similarity": relaxed_similarity,
+                "metadata_filters": round_filter,
+            },
+            {
+                "query": short_query,
+                "position": None,
+                "min_similarity": relaxed_similarity,
+                "metadata_filters": round_filter,
+            },
+            {
+                "query": short_query,
+                "position": state.role,
+                "min_similarity": relaxed_similarity,
+                "metadata_filters": None,
+            },
+            {
+                "query": short_query,
+                "position": None,
+                "min_similarity": relaxed_similarity,
+                "metadata_filters": None,
+            },
+        ]
+        items: List[Dict[str, Any]] = []
+        for plan in retrieval_plans:
+            items = self.retrieve_questions(
+                query=plan["query"],
+                position=plan["position"],
+                top_k=candidate_limit,
+                min_similarity=plan["min_similarity"],
+                metadata_filters=plan["metadata_filters"],
+            )
+            if items:
+                break
 
         asked_ids = set(state.asked_question_ids)
         candidate_questions = []
+        seen_ids = set()
         for item in items:
             metadata = item.get("metadata", {}) or {}
             source_id = str(metadata.get("source_id") or item.get("id") or "").split("#")[0]
-            if not source_id or source_id in asked_ids:
+            if not source_id or source_id in asked_ids or source_id in seen_ids:
                 continue
+            seen_ids.add(source_id)
 
             competencies = [
                 str(entry).strip()
@@ -799,7 +1124,17 @@ class RAGService:
             })
 
         candidate_questions.sort(key=lambda entry: float(entry.get("score", 0)), reverse=True)
-        candidate_questions = candidate_questions[: top_k or self.max_context_results]
+        candidate_questions = candidate_questions[:candidate_limit]
+        selected_question = self._select_question_from_ranked_pool(
+            candidate_questions,
+            state,
+            context=context,
+        )
+        candidate_questions = self._move_selected_question_first(
+            candidate_questions[:visible_limit],
+            selected_question,
+            max_items=visible_limit,
+        )
 
         target_competency = []
         if candidate_questions:
@@ -825,6 +1160,13 @@ class RAGService:
             "resume_focus_terms": resume_focus_terms[:4],
             "candidate_questions": candidate_questions,
             "selection_reason": reason,
+            "selection_strategy": {
+                "mode": "weighted_top_pool",
+                "candidate_pool_size": candidate_limit,
+                "selection_pool_size": min(self.question_selection_pool_size, len(candidate_questions)),
+                "randomness": self.question_randomness,
+                "selected_question_id": str((candidate_questions[0] or {}).get("id", "")) if candidate_questions else "",
+            },
         }
 
     def format_question_plan(self, question_plan: Optional[Dict[str, Any]]) -> str:
@@ -1777,6 +2119,41 @@ class RAGService:
         current_index = difficulty_order.index(normalized)
         return difficulty_order[min(current_index + 1, len(difficulty_order) - 1)]
 
+    def _infer_followup_style(
+        self,
+        state: InterviewState,
+        analysis_result: Optional[Dict[str, Any]],
+        followup_question: str = "",
+    ) -> str:
+        normalized_round = str(state.target_round_type or "").strip().lower()
+        if not analysis_result:
+            return "detail_probe"
+
+        depth = float(analysis_result.get("depth", 0.0) or 0.0)
+        correctness = float(analysis_result.get("correctness", 0.0) or 0.0)
+        coverage = analysis_result.get("coverage", {}) or {}
+        partial_coverage = float(coverage.get("partial", 0.0) or 0.0)
+        poor_coverage = float(coverage.get("poor", 0.0) or 0.0)
+        style_hint = str(analysis_result.get("suggested_followup_type", "") or "").strip().lower()
+
+        if any(token in style_hint for token in ["tradeoff", "权衡", "取舍"]):
+            return "tradeoff_probe"
+        if any(token in style_hint for token in ["scale", "扩容", "容量", "稳定性", "高并发"]):
+            return "scale_probe"
+
+        if normalized_round in {"project", "system_design"}:
+            if depth < 0.58 or partial_coverage + poor_coverage >= 0.55:
+                return "detail_probe"
+            if normalized_round == "system_design" and correctness >= 0.55:
+                return "tradeoff_probe"
+            return "scale_probe"
+
+        if depth < 0.55 or partial_coverage >= 0.35:
+            return "detail_probe"
+        if correctness >= 0.7 and followup_question:
+            return "tradeoff_probe"
+        return "detail_probe"
+
     def decide_followup(
         self,
         question_id: Optional[str],
@@ -1792,6 +2169,7 @@ class RAGService:
                 "followup_question": "",
                 "recommended_followup_ids": [],
                 "difficulty_target": state.target_difficulty,
+                "followup_style": "detail_probe",
                 "reason": "缺少结构化分析结果，切换到下一题更稳妥",
             }
 
@@ -1814,6 +2192,7 @@ class RAGService:
                 if candidate:
                     followup_question = candidate
                     break
+        followup_style = self._infer_followup_style(state, analysis_result, followup_question)
 
         if (
             followup_question
@@ -1827,6 +2206,7 @@ class RAGService:
                 "followup_question": followup_question,
                 "recommended_followup_ids": recommended_ids[:2],
                 "difficulty_target": state.target_difficulty,
+                "followup_style": followup_style,
                 "reason": "当前回答仍有明显遗漏点，优先沿当前题继续追问",
             }
 
@@ -1843,6 +2223,7 @@ class RAGService:
                 "followup_question": "",
                 "recommended_followup_ids": [],
                 "difficulty_target": next_difficulty,
+                "followup_style": "scale_probe" if state.target_round_type == "system_design" else "tradeoff_probe",
                 "reason": "当前回答覆盖较完整，可以提升难度进入下一题",
             }
 
@@ -1854,6 +2235,7 @@ class RAGService:
                 "followup_question": "",
                 "recommended_followup_ids": recommended_ids[:2],
                 "difficulty_target": state.target_difficulty,
+                "followup_style": followup_style,
                 "reason": "当前题继续深挖收益有限，切换题目更合适",
             }
 
@@ -1865,6 +2247,7 @@ class RAGService:
                 "followup_question": followup_question,
                 "recommended_followup_ids": recommended_ids[:2],
                 "difficulty_target": state.target_difficulty,
+                "followup_style": followup_style,
                 "reason": "存在可执行的结构化追问，继续验证当前能力点",
             }
 
@@ -1875,6 +2258,7 @@ class RAGService:
             "followup_question": "",
             "recommended_followup_ids": [],
             "difficulty_target": state.target_difficulty,
+            "followup_style": followup_style,
             "reason": "未命中合适追问，进入下一题",
         }
 
@@ -1890,6 +2274,9 @@ class RAGService:
         followup_type = str(decision.get("followup_type", "")).strip()
         if followup_type:
             parts.append(f"追问类型：{followup_type}")
+        followup_style = str(decision.get("followup_style", "")).strip()
+        if followup_style:
+            parts.append(f"追问风格：{followup_style}")
         followup_question = str(decision.get("followup_question", "")).strip()
         if followup_question:
             parts.append(f"优先问题：{followup_question}")

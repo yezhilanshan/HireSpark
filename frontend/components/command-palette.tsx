@@ -6,10 +6,12 @@ import {
     ArrowRight,
     BarChart3,
     BookOpen,
+    Bot,
     Film,
     History,
     LayoutDashboard,
     LogOut,
+    Network,
     Search,
     Settings,
 } from 'lucide-react'
@@ -25,14 +27,16 @@ type CommandItem = {
 }
 
 const commands: CommandItem[] = [
-    { id: 'dashboard', title: '工作台', icon: LayoutDashboard, href: '/dashboard', section: '导航' },
-    { id: 'questions', title: '题库中心', icon: BookOpen, href: '/dashboard/questions', section: '导航' },
-    { id: 'history', title: '历史记录', icon: History, href: '/history', section: '导航' },
+    { id: 'dashboard', title: '主工作台', icon: LayoutDashboard, href: '/dashboard', section: '导航' },
+    { id: 'questions', title: '题库浏览', icon: BookOpen, href: '/dashboard/questions', section: '导航' },
+    { id: 'history', title: '面试记录', icon: History, href: '/history', section: '导航' },
     { id: 'replay', title: '面试复盘', icon: Film, href: '/replay', section: '导航' },
-    { id: 'insights', title: '近期总结', icon: BarChart3, href: '/insights', section: '导航' },
-    { id: 'start', title: '开始新面试', icon: ArrowRight, href: '/interview-setup', section: '操作' },
-    { id: 'settings', title: '设置', icon: Settings, href: '/settings', section: '账户' },
-    { id: 'logout', title: '退出登录', icon: LogOut, section: '账户', action: 'logout' },
+    { id: 'insights', title: '综合画像', icon: BarChart3, href: '/insights', section: '导航' },
+    { id: 'knowledge-graph', title: '知识图谱', icon: Network, href: '/knowledge-graph', section: '导航' },
+    { id: 'assistant', title: 'AI 问答助手', icon: Bot, href: '/assistant', section: '导航' },
+    { id: 'start', title: '开始模拟面试', icon: ArrowRight, href: '/interview-setup', section: '快捷操作' },
+    { id: 'settings', title: '设置', icon: Settings, href: '/settings', section: '系统' },
+    { id: 'logout', title: '退出登录', icon: LogOut, section: '系统', action: 'logout' },
 ]
 
 export function CommandPalette() {
@@ -135,7 +139,7 @@ export function CommandPalette() {
                                     autoFocus
                                     value={search}
                                     onChange={(event) => setSearch(event.target.value)}
-                                    placeholder="搜索页面、操作或功能"
+                                    placeholder="搜索页面、功能或操作"
                                     className="flex-1 bg-transparent text-lg text-[#111111] outline-none placeholder:text-[#999999]"
                                 />
                                 <div className="rounded bg-[#F5F5F5] px-2 py-1 font-mono text-xs text-[#999999]">esc</div>
@@ -143,7 +147,7 @@ export function CommandPalette() {
 
                             <div className="max-h-[60vh] overflow-y-auto p-2">
                                 {filteredCommands.length === 0 ? (
-                                    <div className="py-12 text-center text-sm text-[#666666]">没有找到匹配的结果</div>
+                                    <div className="py-12 text-center text-sm text-[#666666]">没有找到匹配的操作</div>
                                 ) : (
                                     <div className="space-y-1">
                                         {filteredCommands.map((command, index) => {

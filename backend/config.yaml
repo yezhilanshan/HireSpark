@@ -179,8 +179,7 @@ rag:
   embedding_model: "shibing624/text2vec-base-chinese"
   knowledge_path: "interview_knowledge"
   additional_knowledge_paths:
-    - "basic_knowledge/qianduan.md"
-    - "basic_knowledge/chanpin.md"
+    - "basic_knowledge"
   persist_dir: "rag_data"
   collection_name: "interview_questions"
   search_type: "similarity"
@@ -189,6 +188,9 @@ rag:
   max_context_results: 3
   max_similarity_gap: 0.15
   min_lexical_score: 0.08
+  question_candidate_pool_size: 12
+  question_selection_pool_size: 5
+  question_randomness: 0.35
   auto_build_on_start: false
 
 # ====================================

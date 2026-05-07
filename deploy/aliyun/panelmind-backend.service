@@ -1,13 +1,13 @@
 [Unit]
-Description=PanelMind Backend
+Description=HireSpark Backend
 After=network.target
 
 [Service]
 Type=simple
 User=www-data
-WorkingDirectory=/opt/panelmind
-EnvironmentFile=/opt/panelmind/.env.production
-ExecStart=/opt/panelmind/.venv/bin/python backend/app.py
+WorkingDirectory=/opt/hirespark
+EnvironmentFile=/opt/hirespark/.env.production
+ExecStart=/opt/hirespark/.venv/bin/python backend/app.py
 Restart=always
 RestartSec=5
 

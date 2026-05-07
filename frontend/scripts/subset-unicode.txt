@@ -1,0 +1,10 @@
+Common
+CJK
+Dingbats
+General Punctuation
+Halfwidth and Fullwidth Forms
+Hiragana
+Katakana
+Latin-1 Supplement
+Letterlike Symbols
+Mathematical Operators

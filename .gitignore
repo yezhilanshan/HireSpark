@@ -135,3 +135,19 @@ Qwen3-ForcedAligner-0.6B/
 
 # accidental mirrored system path
 %SystemDrive%/
+
+# competition submission zip
+HireSpark_submit_*.zip
+
+# external reference projects (not part of HireSpark source)
+Resume-Matcher-main/
+llm-graph-builder-main/
+llm-wiki-skill-main/
+
+# local workspace config
+.workbuddy/
+
+# test/temp knowledge files
+backend/basic_knowledge/ceshi.md
+backend/basic_knowledge/agent开发.md
+backend/interview_knowledge/test_engineer.md

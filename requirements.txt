@@ -101,6 +101,7 @@ mmh3==5.2.1
 mpmath==1.3.0
 multidict==6.7.1
 networkx==2.8.8
+neo4j==5.28.1
 nltk==3.9.4
 numba==0.64.0
 numpy==1.26.4

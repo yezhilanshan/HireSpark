@@ -32,6 +32,45 @@ type ApiResult = {
     error?: string
 }
 
+type ImmediateReportApiResult = {
+    success: boolean
+    report?: {
+        structured_evaluation?: {
+            overall_score?: number | null
+            round_aggregation?: {
+                interview_stability?: {
+                    overall_score_stable?: number | null
+                }
+            }
+        }
+        evaluation_v2?: {
+            fusion?: {
+                overall_score?: number | null
+            }
+        }
+    } | null
+}
+
+function toNullableScore(value: unknown): number | null {
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? parsed : null
+}
+
+function resolveImmediateReportOverallScore(payload: ImmediateReportApiResult | null | undefined): number | null {
+    const reportPayload = payload?.report
+    if (!reportPayload) return null
+
+    const stableScore = toNullableScore(
+        reportPayload.structured_evaluation?.round_aggregation?.interview_stability?.overall_score_stable,
+    )
+    if (stableScore != null) return stableScore
+
+    const fusionScore = toNullableScore(reportPayload.evaluation_v2?.fusion?.overall_score)
+    if (fusionScore != null) return fusionScore
+
+    return toNullableScore(reportPayload.structured_evaluation?.overall_score)
+}
+
 const roundNameMap: Record<string, string> = {
     technical: '技术基础面',
     project: '项目深度面',
@@ -52,6 +91,7 @@ function ReviewPageContent() {
     const [loading, setLoading] = useState(true)
     const [error, setError] = useState('')
     const [report, setReport] = useState<GrowthReport | null>(null)
+    const [reportOverallScore, setReportOverallScore] = useState<number | null>(null)
     const interviewId = (searchParams.get('interviewId') || '').trim()
 
     useEffect(() => {
@@ -59,7 +99,25 @@ function ReviewPageContent() {
             try {
                 setLoading(true)
                 setError('')
+                setReportOverallScore(null)
                 const latestEndpoint = `${BACKEND_API_BASE}/api/growth-report/latest`
+                const loadImmediateScore = async (endpoint: string): Promise<number | null> => {
+                    try {
+                        const scoreRes = await fetch(endpoint, { cache: 'no-store' })
+                        let scoreData: ImmediateReportApiResult | null = null
+                        try {
+                            scoreData = await scoreRes.json()
+                        } catch {
+                            scoreData = null
+                        }
+                        if (!scoreRes.ok || !scoreData?.success) {
+                            return null
+                        }
+                        return resolveImmediateReportOverallScore(scoreData)
+                    } catch {
+                        return null
+                    }
+                }
 
                 if (interviewId) {
                     const interviewEndpoint = `${BACKEND_API_BASE}/api/growth-report/interview/${encodeURIComponent(interviewId)}`
@@ -72,7 +130,21 @@ function ReviewPageContent() {
                     }
 
                     if (interviewRes.ok && interviewData?.success) {
-                        setReport(interviewData.report)
+                        const immediateEndpoint = `${BACKEND_API_BASE}/api/report/interview/${encodeURIComponent(interviewId)}`
+                        const immediateScore = await loadImmediateScore(immediateEndpoint)
+                        setReportOverallScore(immediateScore)
+                        const baseReport = interviewData.report
+                        if (baseReport && immediateScore != null) {
+                            setReport({
+                                ...baseReport,
+                                summary: {
+                                    ...baseReport.summary,
+                                    overall_score: immediateScore,
+                                },
+                            })
+                        } else {
+                            setReport(baseReport)
+                        }
                         return
                     }
                     throw new Error(interviewData?.error || interviewData?.message || '未找到指定会话复盘')
@@ -83,7 +155,20 @@ function ReviewPageContent() {
                 if (!res.ok || !data.success) {
                     throw new Error(data.error || '加载复盘失败')
                 }
-                setReport(data.report)
+                const immediateScore = await loadImmediateScore(`${BACKEND_API_BASE}/api/report/latest`)
+                setReportOverallScore(immediateScore)
+                const baseReport = data.report
+                if (baseReport && immediateScore != null) {
+                    setReport({
+                        ...baseReport,
+                        summary: {
+                            ...baseReport.summary,
+                            overall_score: immediateScore,
+                        },
+                    })
+                } else {
+                    setReport(baseReport)
+                }
             } catch (e) {
                 setError(e instanceof Error ? e.message : '加载复盘失败')
             } finally {
@@ -101,13 +186,13 @@ function ReviewPageContent() {
 
     const checklistItems = useMemo(() => {
         if (!report) return []
-        const scoreText = report.summary.overall_score.toFixed(1)
+        const scoreText = reportOverallScore == null ? '--' : reportOverallScore.toFixed(1)
         const dominantRound = roundNameMap[report.summary.dominant_round] || report.summary.dominant_round || '未分类'
         return [
             {
                 title: '确认本场关键结果',
                 detail: `总分 ${scoreText}，主轮次 ${dominantRound}，时长 ${formatDuration(report.summary.duration_seconds)}。`,
-                done: Number(report.summary.overall_score || 0) > 0,
+                done: reportOverallScore != null && reportOverallScore > 0,
             },
             {
                 title: '提炼 1-3 个亮点',
@@ -131,7 +216,7 @@ function ReviewPageContent() {
                 done: topActions.length > 0,
             },
         ]
-    }, [report, topActions])
+    }, [report, reportOverallScore, topActions])
 
     if (loading) {
         return (

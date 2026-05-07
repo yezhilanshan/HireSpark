@@ -38,8 +38,8 @@ const INTERVIEW_ROUNDS = [
 const POSITIONS = [
     { id: 'java_backend', name: 'Java 后端工程师' },
     { id: 'frontend', name: '前端工程师' },
-    { id: 'fullstack', name: '全栈工程师' },
-    { id: 'data_engineer', name: '数据工程师' },
+    { id: 'test_engineer', name: '软件测试工程师' },
+    { id: 'agent_developer', name: 'Agent开发工程师' },
     { id: 'product_manager', name: '产品经理' },
     { id: 'algorithm', name: '算法工程师' }
 ]
@@ -58,6 +58,7 @@ export default function InterviewSetupPage() {
     const [selectedRound, setSelectedRound] = useState<string>('technical')
     const [selectedPosition, setSelectedPosition] = useState<string>('java_backend')
     const [selectedDifficulty, setSelectedDifficulty] = useState<string>('medium')
+    const [selectedInterviewMode, setSelectedInterviewMode] = useState<'realistic_mock' | 'focused_training'>('realistic_mock')
     const [isStarting, setIsStarting] = useState(false)
 
     const [cameraStatus, setCameraStatus] = useState<'checking' | 'ok' | 'error'>('checking')
@@ -245,7 +246,8 @@ export default function InterviewSetupPage() {
         sessionStorage.setItem('interview_config', JSON.stringify({
             round: selectedRound,
             position: selectedPosition,
-            difficulty: selectedDifficulty
+            difficulty: selectedDifficulty,
+            trainingMode: selectedInterviewMode,
         }))
         setTimeout(() => {
             router.push('/interview')
@@ -383,6 +385,29 @@ export default function InterviewSetupPage() {
                                             <p className={`mt-0.5 text-[11px] leading-4 ${selectedDifficulty === level.id ? 'text-white/80' : 'text-[#7a7a7a]'}`}>{level.description}</p>
                                         </button>
                                     ))}
+                                </div>
+                            </div>
+                            <div className="space-y-2.5">
+                                <label className="text-sm font-medium text-[#111111]">面试方式</label>
+                                <div className="grid grid-cols-2 gap-2.5">
+                                    <button
+                                        onClick={() => setSelectedInterviewMode('realistic_mock')}
+                                        className={`motion-press rounded-lg border p-3 text-left transition-colors ${selectedInterviewMode === 'realistic_mock' ? 'border-[#111111] bg-[#111111] text-white' : 'border-[#E5E5E5] text-[#666666] hover:border-[#111111]'}`}
+                                    >
+                                        <p className="text-sm font-medium">真实面试场景</p>
+                                        <p className={`mt-1 text-[11px] leading-5 ${selectedInterviewMode === 'realistic_mock' ? 'text-white/80' : 'text-[#7a7a7a]'}`}>
+                                            开场更自然，会邀请你先做简短自我介绍，再切入正式提问。
+                                        </p>
+                                    </button>
+                                    <button
+                                        onClick={() => setSelectedInterviewMode('focused_training')}
+                                        className={`motion-press rounded-lg border p-3 text-left transition-colors ${selectedInterviewMode === 'focused_training' ? 'border-[#111111] bg-[#111111] text-white' : 'border-[#E5E5E5] text-[#666666] hover:border-[#111111]'}`}
+                                    >
+                                        <p className="text-sm font-medium">训练模式</p>
+                                        <p className={`mt-1 text-[11px] leading-5 ${selectedInterviewMode === 'focused_training' ? 'text-white/80' : 'text-[#7a7a7a]'}`}>
+                                            直接进入专项训练，减少铺垫，把时间集中用在高命中率提问和连续追问上。
+                                        </p>
+                                    </button>
                                 </div>
                             </div>
                         </div>

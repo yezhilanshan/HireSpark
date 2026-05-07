@@ -2,17 +2,19 @@
 Flask 主服务 - Socket.IO 实时通信
 AI 模拟面试与能力提升平台【改造进行中】
 """
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, Response, stream_with_context
 from flask_socketio import SocketIO, emit
 from flask_cors import CORS # 跨域资源共享中间件
 import base64
 import hashlib
+import hmac
 import time
 import os
 import json
 import threading
 import uuid
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from collections import Counter
@@ -57,6 +59,18 @@ try:
 except Exception as e:
     assistant_service = None
     assistant_import_error = str(e)
+try:
+    from utils.knowledge_graph_service import KnowledgeGraphService
+    knowledge_graph_import_error = None
+except Exception as e:
+    KnowledgeGraphService = None
+    knowledge_graph_import_error = str(e)
+try:
+    from utils.resume_optimizer import ResumeOptimizer
+    resume_optimizer_import_error = None
+except Exception as e:
+    ResumeOptimizer = None
+    resume_optimizer_import_error = str(e)
 from utils.logger import get_logger
 from utils.performance_monitor import performance_monitor, measure_time
 from utils.answer_session import (
@@ -103,12 +117,47 @@ FLASK_DEBUG = config.get('system.debug', False)# 调试模式
 
 
 INSIGHTS_RECENT_LIMIT = 5
+INSIGHTS_RECENT_SCAN_LIMIT = 30
 INSIGHTS_LOOKBACK_DAYS = 30
 INSIGHTS_WEEKLY_DAYS = 7
 INSIGHTS_PER_ROUND_LIMIT = 3
 INSIGHTS_CACHE_TTL_SECONDS = 600
 INSIGHTS_TRACKED_ROUNDS = ('technical', 'project', 'system_design', 'hr')
 INSIGHTS_SUMMARY_CACHE = {}
+TRAINING_VALIDATION_QUESTION_COUNT = 3
+TRAINING_STATUS_LABELS = {
+    'planned': '计划中',
+    'training': '训练中',
+    'validation': '待验收',
+    'reflow': '未达标待回流',
+    'completed': '已达标',
+    'rolled_over': '已回流到下周',
+}
+ASSISTANT_CITATION_MIN_SCORE = 0.5
+ASSISTANT_RETRIEVAL_MIN_SIMILARITY = 0.2
+ASSISTANT_CITATION_MAX_ITEMS = 4
+ASSISTANT_RETRIEVAL_WORKERS = 2
+ASSISTANT_HISTORY_QUERY_USER_TURNS = 2
+ASSISTANT_MODEL_HISTORY_LIMIT = 6
+ASSISTANT_FOLLOW_UP_MARKERS = (
+    '继续', '展开', '细说', '再说', '再讲', '深入', '补充', '那', '那么', '这个', '这个问题',
+    '上一题', '上一个', '它', '这块', '这一点', '刚才', '顺便', '那如果', '为什么', '然后呢',
+)
+ASSISTANT_POSITION_HINTS = {
+    'frontend': ('react', 'vue', 'javascript', 'typescript', 'css', 'html', '浏览器', '前端', 'web前端', 'vite', 'webpack', 'next.js', 'nextjs'),
+    'java_backend': ('java', 'spring', 'springboot', 'mybatis', 'redis', 'mysql', '后端', '后端开发', '微服务', 'jvm'),
+    'test_engineer': ('测试', '软件测试', '测试工程师', 'qa', 'quality assurance', '接口自动化', 'ui自动化', 'jmeter', '测试用例', '缺陷', 'bug', '回归测试'),
+    'agent_developer': ('agent', '智能体', 'mcp', 'react agent', 'tool call', 'function calling', 'langgraph', 'agent开发'),
+    'algorithm': ('算法', '机器学习', '深度学习', '模型', '训练', '推理', 'embedding', '检索', '召回', '排序', '向量'),
+    'product_manager': ('产品', '需求', 'prd', 'roadmap', '转化', '用户增长', '产品经理'),
+    'devops': ('devops', 'docker', 'kubernetes', 'k8s', 'ci/cd', '运维', '部署'),
+}
+
+
+AUTH_DEFAULT_EMAIL = str(os.environ.get('AUTH_LOGIN_EMAIL', 'admin@hirespark.cn') or '').strip().lower() or 'admin@hirespark.cn'
+AUTH_DEFAULT_PASSWORD = str(os.environ.get('AUTH_LOGIN_PASSWORD', 'HireSpark123') or '').strip() or 'HireSpark123'
+AUTH_DEFAULT_NAME = str(os.environ.get('AUTH_LOGIN_NAME', 'HireSpark 管理员') or '').strip() or 'HireSpark 管理员'
+AUTH_EMAIL_PATTERN = re.compile(r'^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$')
 
 
 def _safe_int(value, default: int) -> int:
@@ -125,6 +174,146 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw in {"0", "false", "no", "off"}:
         return False
     return bool(default)
+
+
+ASSISTANT_ASYNC_ENABLED = _env_bool("ASSISTANT_ASYNC_ENABLED", True)
+ASSISTANT_TASK_MAX_WORKERS = max(
+    1,
+    min(
+        8,
+        _safe_int(os.environ.get("ASSISTANT_TASK_MAX_WORKERS", 2), 2),
+    ),
+)
+ASSISTANT_TASK_RETENTION_SECONDS = max(
+    120,
+    min(
+        7200,
+        _safe_int(os.environ.get("ASSISTANT_TASK_RETENTION_SECONDS", 900), 900),
+    ),
+)
+ASSISTANT_FAST_ACK_TEXT = str(
+    os.environ.get("ASSISTANT_FAST_ACK_TEXT", "已接收，正在分析你的问题...")
+).strip() or "已接收，正在分析你的问题..."
+
+
+ASSISTANT_MIN_TOKENS = max(
+    64,
+    min(
+        2048,
+        _safe_int(os.environ.get("ASSISTANT_MIN_TOKENS", 256), 256),
+    ),
+)
+ASSISTANT_MAX_TOKENS = max(
+    ASSISTANT_MIN_TOKENS,
+    min(
+        4096,
+        _safe_int(os.environ.get("ASSISTANT_MAX_TOKENS", 2048), 2048),
+    ),
+)
+ASSISTANT_ADAPTIVE_BASE_TOKENS = max(
+    ASSISTANT_MIN_TOKENS,
+    min(
+        ASSISTANT_MAX_TOKENS,
+        _safe_int(os.environ.get("ASSISTANT_ADAPTIVE_BASE_TOKENS", 640), 640),
+    ),
+)
+ASSISTANT_CONTINUATION_ENABLED = _env_bool("ASSISTANT_CONTINUATION_ENABLED", True)
+ASSISTANT_CONTINUATION_MAX_TOKENS = max(
+    ASSISTANT_MIN_TOKENS,
+    min(
+        ASSISTANT_MAX_TOKENS,
+        _safe_int(os.environ.get("ASSISTANT_CONTINUATION_MAX_TOKENS", 768), 768),
+    ),
+)
+ASSISTANT_STREAM_ENABLED = _env_bool("ASSISTANT_STREAM_ENABLED", True)
+ASSISTANT_STREAM_CHUNK_CHARS = max(
+    40,
+    min(
+        400,
+        _safe_int(os.environ.get("ASSISTANT_STREAM_CHUNK_CHARS", 120), 120),
+    ),
+)
+ASSISTANT_STREAM_CHUNK_DELAY_MS = max(
+    0,
+    min(
+        300,
+        _safe_int(os.environ.get("ASSISTANT_STREAM_CHUNK_DELAY_MS", 70), 70),
+    ),
+)
+ASSISTANT_HISTORY_COMPRESS_MAX_CHARS = max(
+    1200,
+    min(
+        12000,
+        _safe_int(os.environ.get("ASSISTANT_HISTORY_COMPRESS_MAX_CHARS", 3200), 3200),
+    ),
+)
+ASSISTANT_HISTORY_COMPRESS_KEEP_TURNS = max(
+    2,
+    min(
+        12,
+        _safe_int(os.environ.get("ASSISTANT_HISTORY_COMPRESS_KEEP_TURNS", 6), 6),
+    ),
+)
+
+AUTH_PASSWORD_PBKDF2_ITERATIONS = max(
+    60000,
+    min(
+        600000,
+        _safe_int(os.environ.get('AUTH_PASSWORD_PBKDF2_ITERATIONS', 180000), 180000),
+    ),
+)
+
+
+def _normalize_auth_email(raw_email: str) -> str:
+    return str(raw_email or '').strip().lower()
+
+
+def _normalize_auth_name(raw_name: str) -> str:
+    return str(raw_name or '').strip()
+
+
+def _hash_auth_password(password: str, salt_hex: str | None = None) -> str:
+    normalized_password = str(password or '')
+    if not salt_hex:
+        salt_hex = os.urandom(16).hex()
+    try:
+        salt_bytes = bytes.fromhex(str(salt_hex))
+    except Exception:
+        salt_hex = os.urandom(16).hex()
+        salt_bytes = bytes.fromhex(salt_hex)
+
+    digest = hashlib.pbkdf2_hmac(
+        'sha256',
+        normalized_password.encode('utf-8'),
+        salt_bytes,
+        AUTH_PASSWORD_PBKDF2_ITERATIONS,
+    )
+    return f"pbkdf2_sha256${AUTH_PASSWORD_PBKDF2_ITERATIONS}${salt_hex}${digest.hex()}"
+
+
+def _verify_auth_password(password: str, stored_hash: str) -> bool:
+    normalized_hash = str(stored_hash or '').strip()
+    normalized_password = str(password or '')
+    if not normalized_hash:
+        return False
+
+    parts = normalized_hash.split('$')
+    if len(parts) != 4 or parts[0] != 'pbkdf2_sha256':
+        return hmac.compare_digest(normalized_hash, normalized_password)
+
+    try:
+        iterations = int(parts[1])
+        salt_hex = parts[2]
+        expected_digest = parts[3]
+        test_digest = hashlib.pbkdf2_hmac(
+            'sha256',
+            normalized_password.encode('utf-8'),
+            bytes.fromhex(salt_hex),
+            iterations,
+        ).hex()
+        return hmac.compare_digest(expected_digest, test_digest)
+    except Exception:
+        return False
 
 
 ASR_SPEECH_END_GRACE_MS = max(
@@ -229,6 +418,40 @@ resolved_db_path = Path(configured_db_path)
 if not resolved_db_path.is_absolute():
     resolved_db_path = (Path(__file__).resolve().parent / resolved_db_path).resolve()
 db_manager = DatabaseManager(str(resolved_db_path))
+knowledge_graph_service = None
+if KnowledgeGraphService is not None:
+    try:
+        knowledge_graph_service = KnowledgeGraphService(db_manager=db_manager, logger=logger)
+    except Exception as e:
+        knowledge_graph_service = None
+        knowledge_graph_import_error = str(e)
+resume_optimizer_service = None
+if ResumeOptimizer is not None:
+    try:
+        resume_optimizer_service = ResumeOptimizer(
+            db_manager=db_manager,
+            llm_manager=llm_manager,
+            logger=logger,
+        )
+    except Exception as e:
+        resume_optimizer_service = None
+        resume_optimizer_import_error = str(e)
+try:
+    seed_result = db_manager.ensure_user(
+        email=AUTH_DEFAULT_EMAIL,
+        password_hash=_hash_auth_password(AUTH_DEFAULT_PASSWORD),
+        display_name=AUTH_DEFAULT_NAME,
+        is_demo=True,
+    )
+    if seed_result and seed_result.get('success'):
+        if seed_result.get('created'):
+            logger.info(f"[auth] created default demo account: {AUTH_DEFAULT_EMAIL}")
+        else:
+            logger.info(f"[auth] default demo account already exists: {AUTH_DEFAULT_EMAIL}")
+    else:
+        logger.warning(f"[auth] failed to seed default demo account: {seed_result}")
+except Exception as exc:
+    logger.error(f"[auth] exception while seeding default demo account: {exc}")
 session_registry = SessionRegistry()
 state_orchestrator = StateOrchestrator(session_registry)
 speech_normalizer = SpeechTextNormalizer()
@@ -472,6 +695,176 @@ def _extract_question_id_from_plan(question_plan: dict | None) -> str:
     if not candidates:
         return ""
     return str(candidates[0].get('id', '')).strip()
+
+
+def _extract_question_text_from_plan(question_plan: dict | None) -> str:
+    """从 question_plan 中提取首个候选题文本，用于引导 LLM 基于 RAG 出题。"""
+    candidates = (question_plan or {}).get('candidate_questions', []) or []
+    if not candidates:
+        return ""
+    question_text = str(candidates[0].get('question', '')).strip()
+    return question_text
+
+
+def _build_initial_interview_context(
+    *,
+    round_type: str,
+    position: str,
+    difficulty: str,
+    training_mode: str = "",
+) -> str:
+    normalized_round = _normalize_round_type(round_type)
+    normalized_mode = str(training_mode or "").strip().lower()
+    hints: list[str] = []
+
+    if normalized_mode == 'focused_training':
+        hints.append("这是训练模式，请省略寒暄，直接进入最有针对性的训练题。")
+    else:
+        hints.append("这是更贴近真实面试场景的开场，请语气自然、像真人面试官，不要机械。")
+
+    if normalized_round == 'project':
+        hints.append("首题优先围绕候选人简历中的真实项目切入，聚焦个人职责、关键决策、技术深度和问题解决过程。")
+        hints.append("避免每次都使用同一种泛化开场，优先选择能深挖项目细节和技术判断的场景题。")
+    elif normalized_round == 'system_design':
+        hints.append("首题优先选择与岗位和简历背景贴近的系统设计场景，关注核心模块、关键数据流、容量与权衡。")
+        hints.append("避免总是使用完全相同的宽泛开场，优先给出更具体、更有业务感的系统设计问题。")
+    elif normalized_round == 'technical':
+        hints.append("首题先验证岗位关键基础能力，但不要只问过于教科书式的定义题。")
+    elif normalized_round == 'hr':
+        hints.append("开场更注重动机、经历和价值观表达，语气保持自然。")
+
+    hints.append(f"目标岗位：{position}；目标难度：{difficulty}。")
+    return "\n".join(hints)
+
+
+def _compose_initial_interviewer_message(
+    *,
+    question_text: str,
+    round_type: str,
+    position: str,
+    training_mode: str = "",
+) -> str:
+    normalized_mode = str(training_mode or "").strip().lower()
+    normalized_round = _normalize_round_type(round_type)
+    question = str(question_text or "").strip()
+    if not question:
+        if normalized_mode == 'focused_training':
+            return "我们直接进入训练，请先回答这道题。"
+        return "你好，我们先做一个简短的自我介绍，然后进入正式提问。"
+
+    if normalized_mode == 'focused_training':
+        return f"我们直接进入训练，先从这道题开始：\n\n{question}"
+
+    round_name_map = {
+        'technical': '技术面',
+        'project': '项目面',
+        'system_design': '系统设计面',
+        'hr': '综合面',
+    }
+    opener = f"你好，我们现在开始这一轮{round_name_map.get(normalized_round, '面试')}。"
+    if normalized_round in {'project', 'system_design'}:
+        return (
+            f"{opener} 你可以先用大约一分钟，结合和 {position} 相关的经历做个简短自我介绍。"
+            f"介绍完后，我们先从这个问题切入：\n\n{question}"
+        )
+    if normalized_round == 'hr':
+        return f"{opener} 你先做个简短自我介绍，我们再围绕这个问题展开：\n\n{question}"
+    return f"{opener} 你先做个简短自我介绍，然后我们开始第一题：\n\n{question}"
+
+
+def _build_intro_only_interviewer_message(*, round_type: str, position: str) -> str:
+    normalized_round = _normalize_round_type(round_type)
+    round_name_map = {
+        'technical': '技术面',
+        'project': '项目面',
+        'system_design': '系统设计面',
+        'hr': '综合面',
+    }
+    opener = f"你好，我们现在开始这一轮{round_name_map.get(normalized_round, '面试')}。"
+    if normalized_round in {'project', 'system_design'}:
+        return (
+            f"{opener} 你可以先用大约一分钟，结合和 {position} 相关的经历，"
+            "做一个简短的自我介绍。介绍完成后，我们再进入第一道正式问题。"
+        )
+    if normalized_round == 'hr':
+        return f"{opener} 你先做一个简短的自我介绍，后面我们再围绕你的经历和动机继续展开。"
+    return f"{opener} 你先做一个简短的自我介绍，后面我们再进入第一道正式问题。"
+
+
+def _build_fallback_first_formal_question(*, round_type: str, position: str) -> str:
+    normalized_round = _normalize_round_type(round_type)
+    if normalized_round == 'project':
+        return f"先从你和 {position} 最相关的一个项目讲起：这个项目的目标是什么，你负责了哪些核心部分？"
+    if normalized_round == 'system_design':
+        return "请你选一个与你目标岗位最相关的业务场景，先给出整体方案，再说明核心模块划分和关键权衡。"
+    if normalized_round == 'hr':
+        return "结合你刚才的介绍，说说你为什么会选择这个岗位方向，以及你最看重的一段经历是什么。"
+    return f"结合你刚才的自我介绍，请先展开讲一个与你目标岗位 {position} 最相关的技术经历。"
+
+
+def _normalize_interview_difficulty(value: str) -> str:
+    normalized = str(value or '').strip().lower()
+    return normalized if normalized in {'easy', 'medium', 'hard'} else ''
+
+
+def _parse_auto_end_question_limit(value, default_value: int) -> int:
+    try:
+        normalized = int(value)
+    except Exception:
+        normalized = int(default_value)
+    return max(1, min(normalized, 20))
+
+
+def _parse_selected_question_payload(payload) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+
+    question_text = str(payload.get('question') or payload.get('title') or '').strip()
+    if not question_text:
+        return None
+
+    question_id = str(payload.get('id') or '').strip()
+    if not question_id:
+        question_id = f"manual_{hashlib.sha1(question_text.encode('utf-8')).hexdigest()[:12]}"
+
+    round_type = _normalize_round_type(payload.get('round_type') or payload.get('round'))
+    position = str(payload.get('position') or '').strip().lower()
+    difficulty = _normalize_interview_difficulty(payload.get('difficulty'))
+    category = str(payload.get('category') or '').strip()
+
+    return {
+        'id': question_id,
+        'question': question_text,
+        'round_type': round_type,
+        'position': position,
+        'difficulty': difficulty,
+        'category': category,
+    }
+
+
+def _build_forced_question_plan(
+    question_id: str,
+    question_text: str,
+    round_type: str,
+    position: str,
+    difficulty: str,
+    category: str = "",
+) -> dict:
+    return {
+        'candidate_questions': [
+            {
+                'id': str(question_id or '').strip() or "manual_selected_question",
+                'question': str(question_text or '').strip(),
+                'round_type': str(round_type or '').strip(),
+                'position': str(position or '').strip(),
+                'difficulty': str(difficulty or '').strip(),
+                'category': str(category or '').strip(),
+                'source': 'manual_selected_question',
+            }
+        ],
+        'question': str(question_text or '').strip(),
+        'source': 'manual_selected_question',
+    }
 
 
 def _build_answer_rag_context(
@@ -1211,6 +1604,8 @@ def _generate_policy_response(
     difficulty: str = "medium",
     interview_state: dict | None = None,
     question_plan: dict | None = None,
+    locked_question: str = "",
+    training_mode: str = "",
 ) -> tuple[str, dict | None, dict | None, dict | None, dict | None]:
     """根据结构化分析和 FollowupPolicy 生成追问或切题结果。"""
     rag_context, analysis_result = _build_answer_rag_context(
@@ -1241,6 +1636,108 @@ def _generate_policy_response(
     if followup_decision and rag_service is not None and getattr(rag_service, 'enabled', False):
         decision_context = rag_service.format_followup_decision(followup_decision)
 
+    normalized_training_mode = str(training_mode or '').strip().lower()
+    fixed_question = str(locked_question or '').strip()
+    if normalized_training_mode == 'coach_drill':
+        coach_decision = dict(followup_decision or {})
+        coach_state = next_state
+        next_question_plan = question_plan
+        coach_reference_question = fixed_question or current_question
+        coach_question_context_parts = [rag_context, decision_context]
+        next_question_text = ""
+
+        if fixed_question:
+            coach_decision['next_action'] = 'ask_followup'
+            coach_decision['forced_question_mode'] = True
+            coach_decision['locked_question'] = fixed_question
+            coach_question_context_parts.append(
+                "【固定题目模式】请继续围绕这道题深入追问，优先补齐候选人刚才没有展开的关键点。"
+            )
+        elif (
+            str(coach_decision.get('next_action', 'ask_followup')).strip() in {'switch_question', 'raise_difficulty'}
+            and rag_service is not None
+            and getattr(rag_service, 'enabled', False)
+        ):
+            target_difficulty = str(
+                coach_decision.get('difficulty_target') or difficulty or 'medium'
+            ).strip() or 'medium'
+            planning_state = dict(next_state or {})
+            planning_state['target_difficulty'] = target_difficulty
+            next_question_plan = rag_service.get_next_question(
+                planning_state,
+                top_k=getattr(rag_service, 'max_context_results', 2)
+            )
+            next_question_context = rag_service.format_question_plan(next_question_plan)
+            coach_reference_question = _extract_question_text_from_plan(next_question_plan) or current_question
+            next_question_text = llm_manager.generate_round_question(
+                round_type=round_type,
+                position=position,
+                difficulty=target_difficulty,
+                rag_context=_merge_text_blocks(decision_context, next_question_context),
+                reference_question=coach_reference_question,
+            )
+            if next_question_text:
+                coach_state = rag_service.mark_question_asked(planning_state, next_question_plan) if next_question_plan else planning_state
+            coach_question_context_parts.append(next_question_context)
+
+        if not next_question_text:
+            next_question_text = llm_manager.generate_round_question(
+                round_type=round_type,
+                position=position,
+                difficulty=difficulty,
+                context=(
+                    f"上一题：{current_question}\n"
+                    "请继续围绕刚才回答中还不够完整的部分，提出一个更聚焦、更具体的下一问。"
+                ),
+                rag_context=_merge_text_blocks(*coach_question_context_parts),
+                reference_question=coach_reference_question,
+            )
+
+        coach_payload = llm_manager.generate_coach_followup(
+            user_answer=user_answer,
+            current_question=current_question,
+            next_question=next_question_text or coach_reference_question,
+            position=position,
+            round_type=round_type,
+            analysis_result=analysis_result,
+            followup_decision=coach_decision,
+            rag_context=_merge_text_blocks(*coach_question_context_parts),
+        )
+        coach_display_text = _format_coach_mode_reply(coach_payload)
+        coach_spoken_text = str(coach_payload.get('spoken_summary') or '').strip()
+        coach_next_question = str(
+            coach_payload.get('next_question') or next_question_text or coach_reference_question
+        ).strip()
+        coach_decision.update({
+            'coach_mode': True,
+            'coach_display_text': coach_display_text,
+            'coach_spoken_text': coach_spoken_text,
+            'coach_next_question': coach_next_question,
+            'coach_reference_outline': coach_payload.get('reference_outline') or [],
+            'coach_improvement_tip': coach_payload.get('improvement_tip') or '',
+        })
+        return coach_display_text or coach_next_question, analysis_result, coach_decision, coach_state, next_question_plan
+
+    if fixed_question:
+        fixed_decision = dict(followup_decision or {})
+        fixed_decision['next_action'] = 'ask_followup'
+        fixed_decision['forced_question_mode'] = True
+        fixed_decision['locked_question'] = fixed_question
+        fixed_context = (
+            "【固定题目模式】本轮必须围绕以下题目继续追问，不得切换到新题：\n"
+            f"{fixed_question}\n"
+            "请先给出简短反馈，再提出一个更深入且紧扣该题的追问。"
+        )
+        feedback = llm_manager.process_answer_with_round(
+            user_answer=user_answer,
+            current_question=fixed_question,
+            position=position,
+            round_type=round_type,
+            chat_history=chat_history,
+            rag_context=_merge_text_blocks(rag_context, decision_context, fixed_context)
+        )
+        return feedback, analysis_result, fixed_decision, next_state, question_plan
+
     next_action = str((followup_decision or {}).get('next_action', 'ask_followup')).strip()
     if (
         next_action in {'switch_question', 'raise_difficulty'}
@@ -1258,11 +1755,13 @@ def _generate_policy_response(
             top_k=getattr(rag_service, 'max_context_results', 2)
         )
         next_question_context = rag_service.format_question_plan(next_question_plan)
+        reference_question = _extract_question_text_from_plan(next_question_plan)
         next_question = llm_manager.generate_round_question(
             round_type=round_type,
             position=position,
             difficulty=target_difficulty,
-            rag_context=_merge_text_blocks(decision_context, next_question_context)
+            rag_context=_merge_text_blocks(decision_context, next_question_context),
+            reference_question=reference_question,
         )
         if next_question:
             intro = "这个点先到这里，我们换一个方向。" if next_action == 'switch_question' else "这部分回答得比较扎实，我们提升一点难度。"
@@ -1276,6 +1775,21 @@ def _generate_policy_response(
                 final_state,
                 next_question_plan,
             )
+
+    if next_action == 'ask_followup' and followup_decision:
+        targeted_followup_question = str(followup_decision.get('followup_question') or '').strip()
+        if targeted_followup_question:
+            followup_style = str(followup_decision.get('followup_style') or 'detail_probe').strip() or 'detail_probe'
+            followup_text = llm_manager.generate_targeted_followup_question(
+                current_question=current_question,
+                user_answer=user_answer,
+                position=position,
+                round_type=round_type,
+                followup_style=followup_style,
+                followup_hint=targeted_followup_question,
+                rag_context=_merge_text_blocks(rag_context, decision_context),
+            )
+            return followup_text, analysis_result, followup_decision, next_state, question_plan
 
     feedback = llm_manager.process_answer_with_round(
         user_answer=user_answer,
@@ -1571,6 +2085,9 @@ def _derive_detection_events_and_stats(report_data: dict) -> tuple[list[dict], d
     total_mouth_open = 0
     total_multi_person = 0
     offscreen_values: list[float] = []
+    hr_values: list[float] = []
+    rppg_reliable_frames = 0
+    rppg_frames = 0
 
     for item in timeline:
         if not isinstance(item, dict):
@@ -1588,6 +2105,12 @@ def _derive_detection_events_and_stats(report_data: dict) -> tuple[list[dict], d
         camera_insights = item.get('camera_insights') if isinstance(item.get('camera_insights'), dict) else {}
         blendshapes = camera_insights.get('blendshapes') if isinstance(camera_insights.get('blendshapes'), dict) else {}
         head_pose = camera_insights.get('head_pose') if isinstance(camera_insights.get('head_pose'), dict) else {}
+        try:
+            hr_raw = item.get('hr')
+            hr_value = float(hr_raw) if hr_raw is not None else None
+        except Exception:
+            hr_value = None
+        rppg_reliable = bool(item.get('rppg_reliable', False))
 
         jaw_open_avg = float(blendshapes.get('jaw_open_avg') or 0.0)
         mouth_status = str(item.get('mouth_status') or '').strip().lower()
@@ -1596,6 +2119,11 @@ def _derive_detection_events_and_stats(report_data: dict) -> tuple[list[dict], d
         abs_roll = abs(float(head_pose.get('roll') or item.get('roll') or 0.0))
         pose_unstable = abs_yaw >= 28.0 or abs_pitch >= 20.0 or abs_roll >= 20.0 or ('pose_unstable' in flags)
         offscreen_values.append(off_screen_ratio)
+        if isinstance(hr_value, (int, float)):
+            hr_values.append(float(hr_value))
+            rppg_frames += 1
+            if rppg_reliable:
+                rppg_reliable_frames += 1
 
         if face_count > 1 or 'multi_person' in flags:
             total_multi_person += 1
@@ -1648,12 +2176,16 @@ def _derive_detection_events_and_stats(report_data: dict) -> tuple[list[dict], d
             })
 
     avg_off_screen_ratio = (sum(offscreen_values) / len(offscreen_values)) if offscreen_values else 0.0
+    avg_heart_rate = (sum(hr_values) / len(hr_values)) if hr_values else None
+    rppg_reliable_ratio = ((rppg_reliable_frames / rppg_frames) * 100.0) if rppg_frames else None
     stats = {
         'total_deviations': int(total_deviations),
         'total_mouth_open': int(total_mouth_open),
         'total_multi_person': int(total_multi_person),
         'off_screen_ratio': round(avg_off_screen_ratio, 4),
         'frames_processed': int((report_data or {}).get('summary', {}).get('frames_processed', 0) or len(timeline)),
+        'avg_heart_rate': round(avg_heart_rate, 2) if isinstance(avg_heart_rate, (int, float)) else None,
+        'rppg_reliable_ratio': round(rppg_reliable_ratio, 2) if isinstance(rppg_reliable_ratio, (int, float)) else None,
     }
     return events, stats
 
@@ -1765,6 +2297,36 @@ def _record_runtime_dialogue(
             logger.warning(f"投递三层评估任务失败：{e}")
 
 
+def _format_coach_mode_reply(coach_payload: dict) -> str:
+    """将教练式反馈组织成稳定可读的文本结构。"""
+    if not isinstance(coach_payload, dict):
+        return ""
+
+    summary_feedback = str(coach_payload.get('summary_feedback') or '').strip()
+    improvement_tip = str(coach_payload.get('improvement_tip') or '').strip()
+    next_question = str(coach_payload.get('next_question') or '').strip()
+    reference_outline = [
+        str(item).strip()
+        for item in (coach_payload.get('reference_outline') or [])
+        if str(item).strip()
+    ][:5]
+
+    sections = []
+    if summary_feedback:
+        sections.append(f"本轮点评\n{summary_feedback}")
+    if improvement_tip:
+        sections.append(f"优先改进\n{improvement_tip}")
+    if reference_outline:
+        outline_text = "\n".join(
+            f"{index}. {item}"
+            for index, item in enumerate(reference_outline, start=1)
+        )
+        sections.append(f"参考回答骨架\n{outline_text}")
+    if next_question:
+        sections.append(f"下一问\n{next_question}")
+    return "\n\n".join(section for section in sections if section.strip())
+
+
 AUTO_END_MIN_QUESTIONS = 3
 AUTO_END_MAX_QUESTIONS = 8
 AUTO_END_RECENT_WINDOW = 2
@@ -1870,21 +2432,34 @@ def _wait_for_turn_fusion_score(
 
 
 def _should_auto_end_interview(runtime, current_turn_id: str):
-    question_count = int(getattr(runtime, 'turn_index', 0) or 0)
+    question_count = int(getattr(runtime, 'formal_question_count', 0) or 0)
     current_turn_sequence = _extract_turn_sequence(current_turn_id)
+    min_questions = _parse_auto_end_question_limit(
+        getattr(runtime, 'auto_end_min_questions', AUTO_END_MIN_QUESTIONS),
+        AUTO_END_MIN_QUESTIONS,
+    )
+    max_questions = _parse_auto_end_question_limit(
+        getattr(runtime, 'auto_end_max_questions', AUTO_END_MAX_QUESTIONS),
+        AUTO_END_MAX_QUESTIONS,
+    )
+    if max_questions < min_questions:
+        max_questions = min_questions
+
     decision = {
         'question_count': question_count,
         'recent_scores': [],
         'recent_average': None,
         'reason': '',
         'current_turn_score': None,
+        'min_questions': min_questions,
+        'max_questions': max_questions,
     }
 
-    if question_count < AUTO_END_MIN_QUESTIONS:
+    if question_count < min_questions:
         decision['reason'] = 'below_min_questions'
         return False, decision
 
-    if question_count >= AUTO_END_MAX_QUESTIONS:
+    if question_count >= max_questions:
         decision['reason'] = 'max_questions_reached'
         return True, decision
 
@@ -2467,9 +3042,78 @@ def _process_runtime_commit(runtime, answer_text: str, turn_id: str, source: str
         answer_preview=normalized_answer[:160],
     )
     _emit_orchestrator_state(runtime)
+    is_intro_commit = (
+        str(getattr(runtime, 'current_question_kind', '')).strip().lower() == 'intro'
+        and bool(str(getattr(runtime, 'pending_formal_question', '')).strip())
+    )
 
     def llm_task():
         try:
+            if is_intro_commit:
+                current = session_registry.get(runtime.client_id)
+                if not current or current.session_id != runtime.session_id or current.ended:
+                    return
+                if current.active_llm_job_id != llm_job_id or current.interrupt_epoch != interrupt_epoch:
+                    return
+
+                state_orchestrator.finish_thinking(current, llm_job_id)
+                queued_formal_question = str(current.pending_formal_question or '').strip()
+                if not queued_formal_question:
+                    state_orchestrator.begin_listening(current)
+                    _emit_orchestrator_state(current)
+                    _emit_pipeline_error(current.client_id, current.session_id, 'QUESTION_MISSING', 'Formal question is missing after intro')
+                    return
+
+                current.chat_history.append({
+                    'role': 'candidate',
+                    'content': normalized_answer,
+                    'kind': 'intro',
+                })
+                _reset_answer_session(current)
+
+                normalized_reply = speech_normalizer.normalize(queued_formal_question)
+                next_turn_id = current.next_turn()
+                _set_runtime_asr_lock(current, False)
+                current.current_question_kind = 'formal'
+                current.current_question = normalized_reply['display_text']
+                current.formal_question_count += 1
+                current.last_question_plan = current.pending_formal_question_plan
+                current.pending_formal_question = ""
+                current.pending_formal_question_plan = None
+                current.last_answer_analysis = None
+                _track_question_timeline(current, next_turn_id, normalized_reply['spoken_text'] or normalized_reply['display_text'])
+                current.chat_history.append({
+                    'role': 'interviewer',
+                    'content': normalized_reply['display_text'],
+                })
+
+                _log_runtime_event(
+                    current,
+                    'intro_turn_completed',
+                    job_id=llm_job_id,
+                    next_turn_id=next_turn_id,
+                    intro_preview=normalized_answer[:120],
+                    display_preview=normalized_reply['display_text'][:160],
+                )
+                socketio.emit('dialog_reply', {
+                    'session_id': current.session_id,
+                    'turn_id': next_turn_id,
+                    'job_id': llm_job_id,
+                    'display_text': normalized_reply['display_text'],
+                    'spoken_text': normalized_reply['spoken_text'],
+                    'analysis': None,
+                    'followup_decision': {
+                        'next_action': 'start_formal_question',
+                        'intro_only': True,
+                    },
+                    'interrupt_epoch': current.interrupt_epoch,
+                    'source': source,
+                    'timestamp': time.time()
+                }, to=current.client_id)
+
+                _start_runtime_tts(current, normalized_reply['spoken_text'], next_turn_id, source='reply')
+                return
+
             feedback, analysis_result, followup_decision, next_state, next_question_plan = _generate_policy_response(
                 user_answer=normalized_answer,
                 current_question=current_question,
@@ -2478,7 +3122,9 @@ def _process_runtime_commit(runtime, answer_text: str, turn_id: str, source: str
                 chat_history=runtime.chat_history,
                 difficulty=runtime.difficulty,
                 interview_state=runtime.interview_state,
-                question_plan=runtime.last_question_plan
+                question_plan=runtime.last_question_plan,
+                locked_question=runtime.forced_question_text,
+                training_mode=runtime.training_mode,
             )
 
             current = session_registry.get(runtime.client_id)
@@ -2561,14 +3207,22 @@ def _process_runtime_commit(runtime, answer_text: str, turn_id: str, source: str
             else:
                 current.last_answer_analysis = analysis_result
 
-            normalized_reply = speech_normalizer.normalize(feedback)
+            raw_display_text = str((followup_decision or {}).get('coach_display_text') or feedback or '').strip()
+            raw_spoken_text = str((followup_decision or {}).get('coach_spoken_text') or raw_display_text).strip()
+            normalized_reply = {
+                'display_text': speech_normalizer.normalize(raw_display_text).get('display_text', raw_display_text),
+                'spoken_text': speech_normalizer.normalize(raw_spoken_text).get('spoken_text', raw_spoken_text),
+            }
             next_turn_id = current.next_turn()
             _set_runtime_asr_lock(current, False)
-            current.current_question = normalized_reply['display_text']
-            _track_question_timeline(current, next_turn_id, normalized_reply['spoken_text'] or normalized_reply['display_text'])
+            next_runtime_question = str((followup_decision or {}).get('coach_next_question') or normalized_reply['display_text']).strip()
+            current.current_question_kind = 'formal'
+            current.current_question = next_runtime_question
+            current.formal_question_count += 1
+            _track_question_timeline(current, next_turn_id, next_runtime_question)
             current.chat_history.append({
                 'role': 'interviewer',
-                'content': current.current_question
+                'content': normalized_reply['display_text']
             })
 
             _log_runtime_event(
@@ -2647,6 +3301,14 @@ assistant_rate_limiter = RateLimiter(max_calls=20, time_window=60.0) # 助手问
 logger.info("速率限制器初始化完成")
 
 
+_assistant_task_lock = threading.RLock()
+_assistant_task_executor = ThreadPoolExecutor(
+    max_workers=ASSISTANT_TASK_MAX_WORKERS,
+    thread_name_prefix="assistant_slow_path",
+)
+_assistant_tasks: dict[str, dict] = {}
+
+
 def _assistant_client_key() -> str:
     forwarded_for = str(request.headers.get('X-Forwarded-For', '') or '').split(',')[0].strip()
     if forwarded_for:
@@ -2655,6 +3317,755 @@ def _assistant_client_key() -> str:
     if remote_addr:
         return remote_addr
     return 'assistant_unknown_client'
+
+
+def _assistant_user_id(payload: dict | None = None) -> str:
+    payload = payload or {}
+    candidates = [
+        request.headers.get('X-HireSpark-User', ''),
+        request.args.get('user_id', ''),
+        payload.get('user_id', ''),
+        payload.get('email', ''),
+    ]
+    for candidate in candidates:
+        value = str(candidate or '').strip().lower()
+        if value:
+            return value[:120]
+    return 'default'
+
+
+def _assistant_trim_text(value: str, limit: int = 120) -> str:
+    text = re.sub(r'\s+', ' ', str(value or '').strip())
+    if len(text) <= limit:
+        return text
+    return f"{text[:limit].rstrip()}..."
+
+
+def _assistant_build_title(text: str) -> str:
+    normalized = _assistant_trim_text(text, limit=36)
+    return normalized or '新对话'
+
+
+def _assistant_prune_tasks_locked(now_ts: float | None = None) -> None:
+    current = float(now_ts or time.time())
+    expired_ids: list[str] = []
+    for task_id, task in _assistant_tasks.items():
+        status = str(task.get('status') or 'queued').strip().lower()
+        updated_at = float(task.get('updated_at_ts') or task.get('created_at_ts') or current)
+        if status in {'completed', 'failed'} and (current - updated_at) > ASSISTANT_TASK_RETENTION_SECONDS:
+            expired_ids.append(task_id)
+
+    for task_id in expired_ids:
+        _assistant_tasks.pop(task_id, None)
+
+
+def _assistant_task_response(task: dict) -> dict:
+    return {
+        'task_id': str(task.get('task_id') or ''),
+        'conversation_id': str(task.get('conversation_id') or ''),
+        'user_id': str(task.get('user_id') or ''),
+        'status': str(task.get('status') or 'queued'),
+        'created_at': str(task.get('created_at') or ''),
+        'updated_at': str(task.get('updated_at') or ''),
+        'queued_at': str(task.get('queued_at') or ''),
+        'started_at': str(task.get('started_at') or ''),
+        'finished_at': str(task.get('finished_at') or ''),
+        'provider': str(task.get('provider') or ''),
+        'model': str(task.get('model') or ''),
+        'latency_ms': float(task.get('latency_ms') or 0.0),
+        'error': task.get('error') if isinstance(task.get('error'), dict) else None,
+        'stream_text': str(task.get('stream_text') or ''),
+        'stream_version': int(task.get('stream_version') or 0),
+        'stream_done': bool(task.get('stream_done')),
+    }
+
+
+def _assistant_sse_pack(event_name: str, payload: dict) -> str:
+    safe_name = str(event_name or 'message').strip() or 'message'
+    data_text = json.dumps(payload or {}, ensure_ascii=False)
+    return f"event: {safe_name}\ndata: {data_text}\n\n"
+
+
+def _assistant_create_task(
+    *,
+    conversation_id: str,
+    user_id: str,
+    message: str,
+    history_messages: list[dict],
+    system_prompt: str,
+    temperature: float,
+    max_tokens: int | None,
+) -> dict:
+    now_ts = time.time()
+    now_text = datetime.now().isoformat(timespec='seconds')
+    task_id = f"ast_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+    task_payload = {
+        'task_id': task_id,
+        'conversation_id': str(conversation_id or '').strip(),
+        'user_id': str(user_id or '').strip().lower() or 'default',
+        'status': 'queued',
+        'created_at': now_text,
+        'updated_at': now_text,
+        'queued_at': now_text,
+        'started_at': '',
+        'finished_at': '',
+        'created_at_ts': now_ts,
+        'updated_at_ts': now_ts,
+        'provider': '',
+        'model': '',
+        'latency_ms': 0.0,
+        'error': None,
+        'assistant_message': None,
+        'stream_text': '',
+        'stream_version': 0,
+        'stream_done': False,
+        'stream_error': None,
+        'request': {
+            'message': str(message or ''),
+            'history_messages': history_messages or [],
+            'system_prompt': str(system_prompt or ''),
+            'temperature': float(temperature),
+            'max_tokens': int(max_tokens) if max_tokens is not None else None,
+        },
+    }
+    with _assistant_task_lock:
+        _assistant_prune_tasks_locked(now_ts)
+        _assistant_tasks[task_id] = task_payload
+    return task_payload
+
+
+def _assistant_update_task(task_id: str, **updates) -> None:
+    now_ts = time.time()
+    now_text = datetime.now().isoformat(timespec='seconds')
+    with _assistant_task_lock:
+        task = _assistant_tasks.get(task_id)
+        if not task:
+            return
+        task.update(updates)
+        task['updated_at'] = now_text
+        task['updated_at_ts'] = now_ts
+
+
+def _assistant_update_task_stream(
+    task_id: str,
+    *,
+    stream_text: str | None = None,
+    status: str | None = None,
+    done: bool | None = None,
+    error: dict | None = None,
+) -> None:
+    now_ts = time.time()
+    now_text = datetime.now().isoformat(timespec='seconds')
+    with _assistant_task_lock:
+        task = _assistant_tasks.get(task_id)
+        if not task:
+            return
+
+        changed = False
+        if stream_text is not None:
+            next_text = str(stream_text)
+            if str(task.get('stream_text') or '') != next_text:
+                task['stream_text'] = next_text
+                changed = True
+        if status is not None and str(task.get('status') or '') != str(status):
+            task['status'] = str(status)
+            changed = True
+        if done is not None and bool(task.get('stream_done')) != bool(done):
+            task['stream_done'] = bool(done)
+            changed = True
+        if error is not None:
+            task['stream_error'] = error
+            changed = True
+
+        if changed:
+            task['stream_version'] = int(task.get('stream_version') or 0) + 1
+        task['updated_at'] = now_text
+        task['updated_at_ts'] = now_ts
+
+
+def _assistant_get_task(task_id: str, user_id: str) -> dict | None:
+    normalized_task_id = str(task_id or '').strip()
+    normalized_user_id = str(user_id or '').strip().lower() or 'default'
+    if not normalized_task_id:
+        return None
+    with _assistant_task_lock:
+        _assistant_prune_tasks_locked()
+        task = _assistant_tasks.get(normalized_task_id)
+        if not task:
+            return None
+        if str(task.get('user_id') or '').strip().lower() != normalized_user_id:
+            return None
+        return dict(task)
+
+
+def _assistant_run_task(task_id: str, *, user_id: str) -> None:
+    task = _assistant_get_task(task_id, user_id=user_id)
+    if not task:
+        return
+
+    now_text = datetime.now().isoformat(timespec='seconds')
+    _assistant_update_task(task_id, status='running', started_at=now_text)
+    _assistant_update_task_stream(
+        task_id,
+        stream_text=str(ASSISTANT_FAST_ACK_TEXT or '已接收，正在分析你的问题...'),
+        status='running',
+        done=False,
+        error=None,
+    )
+    started_at = time.perf_counter()
+
+    try:
+        request_payload = task.get('request') if isinstance(task.get('request'), dict) else {}
+        message = str(request_payload.get('message') or '').strip()
+        history_messages = request_payload.get('history_messages') if isinstance(request_payload.get('history_messages'), list) else []
+        system_prompt = str(request_payload.get('system_prompt') or '')
+        temperature = float(request_payload.get('temperature') or 0.25)
+        max_tokens = _assistant_parse_max_tokens(request_payload.get('max_tokens'))
+
+        result = _assistant_generate_reply(
+            user_message=message,
+            history_messages=history_messages,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        if not result.get('success'):
+            error_code = str(result.get('error', 'assistant error') or 'assistant error')
+            error_message = str(result.get('message', '') or '')
+            _assistant_update_task(
+                task_id,
+                status='failed',
+                finished_at=datetime.now().isoformat(timespec='seconds'),
+                error={
+                    'code': error_code,
+                    'message': error_message,
+                },
+                latency_ms=float(result.get('latency_ms') or 0.0),
+                provider=str(result.get('provider') or ''),
+                model=str(result.get('model') or ''),
+            )
+            _assistant_update_task_stream(
+                task_id,
+                status='failed',
+                done=True,
+                error={
+                    'code': error_code,
+                    'message': error_message,
+                },
+            )
+            return
+
+        reply_content = str(result.get('reply', '') or '')
+        if ASSISTANT_STREAM_ENABLED:
+            chunks = _assistant_split_stream_chunks(reply_content)
+            merged = ''
+            for idx, chunk in enumerate(chunks):
+                merged += chunk
+                _assistant_update_task_stream(
+                    task_id,
+                    stream_text=merged,
+                    status='streaming',
+                    done=False,
+                    error=None,
+                )
+                if idx < len(chunks) - 1 and ASSISTANT_STREAM_CHUNK_DELAY_MS > 0:
+                    time.sleep(ASSISTANT_STREAM_CHUNK_DELAY_MS / 1000.0)
+            _assistant_update_task_stream(
+                task_id,
+                stream_text=reply_content,
+                status='streaming',
+                done=True,
+                error=None,
+            )
+
+        assistant_message_row = db_manager.append_assistant_message(
+            task.get('conversation_id'),
+            role='assistant',
+            content=reply_content,
+            citations=result.get('citations', []),
+            answer_mode=result.get('answer_mode'),
+            retrieval_meta=result.get('retrieval_meta', {}),
+        )
+        if not assistant_message_row:
+            _assistant_update_task(
+                task_id,
+                status='failed',
+                finished_at=datetime.now().isoformat(timespec='seconds'),
+                error={
+                    'code': 'PERSIST_ERROR',
+                    'message': 'failed to persist assistant message',
+                },
+                latency_ms=float(result.get('latency_ms') or 0.0),
+                provider=str(result.get('provider') or ''),
+                model=str(result.get('model') or ''),
+            )
+            _assistant_update_task_stream(
+                task_id,
+                status='failed',
+                done=True,
+                error={
+                    'code': 'PERSIST_ERROR',
+                    'message': 'failed to persist assistant message',
+                },
+            )
+            return
+
+        _assistant_update_task(
+            task_id,
+            status='completed',
+            finished_at=datetime.now().isoformat(timespec='seconds'),
+            assistant_message=assistant_message_row,
+            error=None,
+            latency_ms=float(result.get('latency_ms') or round((time.perf_counter() - started_at) * 1000.0, 2)),
+            provider=str(result.get('provider') or ''),
+            model=str(result.get('model') or ''),
+        )
+        _assistant_update_task_stream(
+            task_id,
+            stream_text=reply_content,
+            status='completed',
+            done=True,
+            error=None,
+        )
+    except Exception as exc:
+        logger.error(f"[assistant] async task failed: task_id={task_id}, error={exc}", exc_info=True)
+        _assistant_update_task(
+            task_id,
+            status='failed',
+            finished_at=datetime.now().isoformat(timespec='seconds'),
+            error={
+                'code': 'INTERNAL_ERROR',
+                'message': str(exc),
+            },
+            latency_ms=round((time.perf_counter() - started_at) * 1000.0, 2),
+        )
+        _assistant_update_task_stream(
+            task_id,
+            status='failed',
+            done=True,
+            error={
+                'code': 'INTERNAL_ERROR',
+                'message': str(exc),
+            },
+        )
+
+
+def _assistant_model_history(messages: list[dict], limit: int = ASSISTANT_MODEL_HISTORY_LIMIT) -> list[dict]:
+    normalized = []
+    for item in messages[-max(1, limit):]:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get('role', '') or '').strip().lower()
+        content = str(item.get('content', '') or '').strip()
+        if role not in {'user', 'assistant', 'system'} or not content:
+            continue
+        normalized.append({
+            'role': role,
+            'content': content[:4000],
+        })
+    return normalized
+
+
+def _assistant_parse_max_tokens(raw_value) -> int | None:
+    if raw_value is None:
+        return None
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        return None
+    return max(ASSISTANT_MIN_TOKENS, min(ASSISTANT_MAX_TOKENS, parsed))
+
+
+def _assistant_adaptive_max_tokens(
+    *,
+    requested_max_tokens: int | None,
+    user_message: str,
+    history_messages: list[dict],
+    rag_context: str,
+) -> int:
+    if requested_max_tokens is not None:
+        return max(ASSISTANT_MIN_TOKENS, min(ASSISTANT_MAX_TOKENS, int(requested_max_tokens)))
+
+    default_tokens = int(getattr(assistant_service, 'default_max_tokens', ASSISTANT_ADAPTIVE_BASE_TOKENS) or ASSISTANT_ADAPTIVE_BASE_TOKENS)
+    target = max(ASSISTANT_MIN_TOKENS, min(ASSISTANT_MAX_TOKENS, default_tokens))
+
+    question_len = len(str(user_message or ''))
+    history_len = sum(len(str((item or {}).get('content', '') or '')) for item in (history_messages or []) if isinstance(item, dict))
+    rag_len = len(str(rag_context or ''))
+
+    if question_len > 120:
+        target += 96
+    if question_len > 240:
+        target += 96
+    if history_len > 1800:
+        target += 128
+    if history_len > 3600:
+        target += 128
+    if rag_len > 1800:
+        target += 128
+
+    return max(ASSISTANT_MIN_TOKENS, min(ASSISTANT_MAX_TOKENS, int(target)))
+
+
+def _assistant_extract_key_facts(text: str, *, max_items: int = 3) -> list[str]:
+    normalized = str(text or '').replace('\r\n', '\n').replace('\r', '\n')
+    if not normalized.strip():
+        return []
+    normalized = re.sub(r'\s+', ' ', normalized).strip()
+    pieces = re.split(r'[。！？；;\n]+', normalized)
+    facts: list[str] = []
+    for piece in pieces:
+        value = str(piece or '').strip()
+        if len(value) < 10:
+            continue
+        facts.append(value[:120])
+        if len(facts) >= max_items:
+            break
+    return facts
+
+
+def _assistant_compress_history(messages: list[dict]) -> tuple[list[dict], dict]:
+    normalized: list[dict] = []
+    for item in messages or []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get('role') or '').strip().lower()
+        content = str(item.get('content') or '').strip()
+        if role not in {'user', 'assistant', 'system'} or not content:
+            continue
+        normalized.append({'role': role, 'content': content[:4000]})
+
+    total_chars = sum(len(str(item.get('content') or '')) for item in normalized)
+    keep_turns = max(1, ASSISTANT_HISTORY_COMPRESS_KEEP_TURNS)
+    keep_messages = keep_turns * 2
+
+    if len(normalized) <= keep_messages and total_chars <= ASSISTANT_HISTORY_COMPRESS_MAX_CHARS:
+        return normalized, {
+            'history_compressed': False,
+            'history_original_count': len(normalized),
+            'history_final_count': len(normalized),
+            'history_original_chars': total_chars,
+            'history_summary_chars': 0,
+        }
+
+    recent = normalized[-keep_messages:] if keep_messages > 0 else []
+    older = normalized[:-keep_messages] if keep_messages > 0 else normalized
+
+    summary_lines: list[str] = []
+    for item in older[-12:]:
+        role = '用户' if item.get('role') == 'user' else ('助手' if item.get('role') == 'assistant' else '系统')
+        facts = _assistant_extract_key_facts(str(item.get('content') or ''), max_items=2)
+        if not facts:
+            continue
+        summary_lines.append(f"- {role}: {'；'.join(facts)}")
+
+    summary_text = ''
+    if summary_lines:
+        summary_text = (
+            "历史对话摘要（已压缩，仅保留关键事实）：\n"
+            + "\n".join(summary_lines[:12])
+        )[:1200]
+
+    compact: list[dict] = []
+    if summary_text:
+        compact.append({'role': 'system', 'content': summary_text})
+    compact.extend(recent)
+
+    return compact, {
+        'history_compressed': True,
+        'history_original_count': len(normalized),
+        'history_final_count': len(compact),
+        'history_original_chars': total_chars,
+        'history_summary_chars': len(summary_text),
+    }
+
+
+def _assistant_split_stream_chunks(text: str) -> list[str]:
+    content = str(text or '')
+    if not content.strip():
+        return []
+    sentences = [segment.strip() for segment in re.split(r'(?<=[。！？!?])', content) if segment.strip()]
+    if not sentences:
+        sentences = [content.strip()]
+
+    first_chunk = ''.join(sentences[:2]).strip()
+    remaining = ''.join(sentences[2:]).strip()
+    chunks: list[str] = []
+    if first_chunk:
+        chunks.append(first_chunk)
+    if remaining:
+        step = max(40, ASSISTANT_STREAM_CHUNK_CHARS)
+        for index in range(0, len(remaining), step):
+            chunks.append(remaining[index:index + step])
+    if not chunks:
+        chunks = [content.strip()]
+    return chunks
+
+
+def _assistant_detect_position_hint(user_message: str) -> str | None:
+    normalized = str(user_message or '').strip().lower()
+    if not normalized:
+        return None
+
+    compact = normalized.replace(' ', '')
+    for position, keywords in ASSISTANT_POSITION_HINTS.items():
+        for keyword in keywords:
+            token = str(keyword or '').strip().lower()
+            if not token:
+                continue
+            if token in normalized or token.replace(' ', '') in compact:
+                return position
+    return None
+
+
+def _assistant_should_attach_history(user_message: str, history_messages: list[dict] | None = None) -> bool:
+    history_messages = history_messages or []
+    if not history_messages:
+        return False
+
+    normalized = str(user_message or '').strip().lower()
+    if not normalized:
+        return False
+
+    if len(normalized) <= 18:
+        return True
+
+    if any(marker in normalized for marker in ASSISTANT_FOLLOW_UP_MARKERS):
+        return True
+
+    # Standalone questions with clear technical nouns should prefer the current query only.
+    if _assistant_detect_position_hint(normalized):
+        return False
+
+    return False
+
+
+def _assistant_normalize_citation(item: dict, min_score: float = ASSISTANT_CITATION_MIN_SCORE) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+
+    metadata = item.get('metadata') or {}
+    document = str(item.get('document', '') or '').strip()
+    answer_summary = str(metadata.get('answer_summary', '') or '').strip()
+    answer = str(metadata.get('answer', '') or '').strip()
+    retrieval_text = str(metadata.get('retrieval_text', '') or '').strip()
+    snippet = answer_summary or answer or retrieval_text or document
+    snippet = _assistant_trim_text(snippet, limit=180)
+    if not snippet:
+        return None
+
+    title = (
+        str(metadata.get('question', '') or '').strip()
+        or str(item.get('question', '') or '').strip()
+        or str(metadata.get('subcategory', '') or '').strip()
+        or str(metadata.get('category', '') or '').strip()
+        or '知识库片段'
+    )
+    source = (
+        str(metadata.get('source', '') or '').strip()
+        or str(metadata.get('source_id', '') or '').strip()
+        or str(metadata.get('position', '') or '').strip()
+        or '本地知识库'
+    )
+    score = item.get('similarity', item.get('rerank_score'))
+    try:
+        score = round(float(score), 4) if score is not None else None
+    except Exception:
+        score = None
+
+    if score is not None and score < min_score:
+        return None
+
+    return {
+        'title': _assistant_trim_text(title, limit=80) or '知识库片段',
+        'source': _assistant_trim_text(source, limit=80) or '本地知识库',
+        'snippet': snippet,
+        'score': score,
+        'source_type': str(metadata.get('source_type', '') or metadata.get('view_type', '') or '').strip(),
+    }
+
+
+def _assistant_collect_rag_context(user_message: str, history_messages: list[dict] | None = None) -> tuple[str, list[dict], dict, str]:
+    rag_status = rag_service.status() if rag_service is not None else {}
+    if rag_service is None or not bool(getattr(rag_service, 'enabled', False)):
+        return '', [], {
+            'rag_enabled': False,
+            'rag_ready': False,
+            'question_hits': 0,
+            'rubric_hits': 0,
+            'citation_count': 0,
+        }, 'model_fallback'
+
+    history_messages = history_messages or []
+    query = user_message.strip()
+    position_hint = _assistant_detect_position_hint(query)
+    history_attached = False
+    if _assistant_should_attach_history(query, history_messages):
+        recent_user_context = ' '.join(
+            str(item.get('content', '') or '').strip()
+            for item in history_messages[-max(1, ASSISTANT_HISTORY_QUERY_USER_TURNS * 2):]
+            if str(item.get('role', '') or '').strip().lower() == 'user'
+        ).strip()
+        if recent_user_context:
+            recent_user_context = _assistant_trim_text(recent_user_context, limit=240)
+            query = f"{recent_user_context}\n{query}".strip()
+            history_attached = True
+
+    def _retrieve_questions():
+        return rag_service.retrieve_questions(
+            query,
+            top_k=2,
+            min_similarity=ASSISTANT_RETRIEVAL_MIN_SIMILARITY,
+            position=position_hint,
+        )
+
+    def _retrieve_rubrics():
+        return rag_service.retrieve_rubrics(
+            query,
+            top_k=2,
+            min_similarity=ASSISTANT_RETRIEVAL_MIN_SIMILARITY,
+            position=position_hint,
+        )
+
+    question_hits = []
+    rubric_hits = []
+    retrieval_started_at = time.perf_counter()
+    try:
+        with ThreadPoolExecutor(max_workers=ASSISTANT_RETRIEVAL_WORKERS) as executor:
+            question_future = executor.submit(_retrieve_questions)
+            rubric_future = executor.submit(_retrieve_rubrics)
+            question_hits = question_future.result()
+            rubric_hits = rubric_future.result()
+    except Exception:
+        question_hits = _retrieve_questions()
+        rubric_hits = _retrieve_rubrics()
+    retrieval_latency_ms = round((time.perf_counter() - retrieval_started_at) * 1000.0, 2)
+
+    merged_hits = [*question_hits, *rubric_hits]
+    merged_hits.sort(
+        key=lambda item: (
+            float(item.get('rerank_score', 0.0) or 0.0),
+            float(item.get('similarity', 0.0) or 0.0),
+        ),
+        reverse=True,
+    )
+
+    context_citations: list[dict] = []
+    citations: list[dict] = []
+    seen_context = set()
+    seen_display = set()
+    for raw_item in merged_hits:
+        context_citation = _assistant_normalize_citation(
+            raw_item,
+            min_score=ASSISTANT_RETRIEVAL_MIN_SIMILARITY,
+        )
+        if context_citation:
+            context_key = (
+                context_citation.get('title', ''),
+                context_citation.get('source', ''),
+                context_citation.get('snippet', ''),
+            )
+            if context_key not in seen_context and len(context_citations) < ASSISTANT_CITATION_MAX_ITEMS:
+                seen_context.add(context_key)
+                context_citations.append(context_citation)
+
+        citation = _assistant_normalize_citation(raw_item)
+        if citation:
+            display_key = (
+                citation.get('title', ''),
+                citation.get('source', ''),
+                citation.get('snippet', ''),
+            )
+            if display_key not in seen_display and len(citations) < ASSISTANT_CITATION_MAX_ITEMS:
+                seen_display.add(display_key)
+                citations.append(citation)
+
+        if len(context_citations) >= ASSISTANT_CITATION_MAX_ITEMS and len(citations) >= ASSISTANT_CITATION_MAX_ITEMS:
+            break
+
+    rag_context = ''
+    if context_citations:
+        parts = []
+        for index, citation in enumerate(context_citations, start=1):
+            part_lines = [
+                f"{index}. 标题：{citation.get('title', '')}",
+                f"来源：{citation.get('source', '')}",
+                f"内容：{citation.get('snippet', '')}",
+            ]
+            if citation.get('source_type'):
+                part_lines.append(f"类型：{citation.get('source_type')}")
+            parts.append('\n'.join(part_lines))
+        rag_context = '\n\n'.join(parts)
+
+    answer_mode = 'model_fallback'
+    if context_citations:
+        answer_mode = 'rag_grounded' if len(citations) >= 1 else 'rag_plus_model'
+
+    retrieval_meta = {
+        'rag_enabled': True,
+        'rag_ready': bool(rag_status.get('dual_index_ready') or rag_status.get('count')),
+        'knowledge_count': int(rag_status.get('count') or 0),
+        'question_hits': len(question_hits),
+        'rubric_hits': len(rubric_hits),
+        'grounding_count': len(context_citations),
+        'citation_count': len(citations),
+        'retrieval_latency_ms': retrieval_latency_ms,
+        'retrieval_min_similarity': ASSISTANT_RETRIEVAL_MIN_SIMILARITY,
+        'citation_min_score': ASSISTANT_CITATION_MIN_SCORE,
+        'position_hint': position_hint or '',
+        'history_attached': history_attached,
+    }
+    return rag_context, citations, retrieval_meta, answer_mode
+
+
+def _assistant_base_system_prompt(extra_prompt: str = '') -> str:
+    base_prompt = (
+        "你是 HireSpark 的 AI 问答助手，主要帮助用户完成求职准备、项目表达梳理、岗位理解、"
+        "面试复盘、简历优化与训练建议总结。\n"
+        "回答风格要求：中文优先，简洁清晰，尽量给出可执行建议。\n"
+        "如果知识库证据充足，优先依据知识库回答；如果证据不足，要明确说明哪些内容属于一般经验补充。"
+    )
+    addition = str(extra_prompt or '').strip()
+    if addition:
+        return f"{base_prompt}\n\n补充要求：\n{addition}"
+    return base_prompt
+
+
+def _assistant_generate_reply(
+    *,
+    user_message: str,
+    history_messages: list[dict] | None = None,
+    system_prompt: str = '',
+    temperature: float = 0.25,
+    max_tokens: int | None = None,
+) -> dict:
+    history_messages = history_messages or []
+    compressed_history, compression_meta = _assistant_compress_history(history_messages)
+    rag_context, citations, retrieval_meta, answer_mode = _assistant_collect_rag_context(
+        user_message,
+        history_messages=history_messages,
+    )
+    effective_max_tokens = _assistant_adaptive_max_tokens(
+        requested_max_tokens=max_tokens,
+        user_message=user_message,
+        history_messages=compressed_history,
+        rag_context=rag_context,
+    )
+    result = assistant_service.chat(
+        user_message=user_message,
+        messages=compressed_history,
+        system_prompt=_assistant_base_system_prompt(system_prompt),
+        rag_context=rag_context,
+        temperature=temperature,
+        max_tokens=effective_max_tokens,
+    )
+    result['citations'] = citations
+    retrieval_meta = dict(retrieval_meta or {})
+    retrieval_meta.update(compression_meta)
+    retrieval_meta['effective_max_tokens'] = int(effective_max_tokens)
+    result['retrieval_meta'] = retrieval_meta
+    result['answer_mode'] = answer_mode
+    return result
 
 
 # ==================== 基础路由 ====================
@@ -2749,6 +4160,706 @@ def api_prewarm():
     })
 
 
+MEMBERSHIP_TEAM_DISCOUNT = 0.8
+MEMBERSHIP_PLAN_CATALOG = {
+    'single': {
+        'id': 'single',
+        'title': '按次订阅',
+        'description': '适合偶尔练习、临近面试冲刺时按需使用。',
+        'unit_label': '/次',
+        'base_price': 5,
+        'detail': '单次开通即可使用，适合先试用产品能力或补一场专项训练。',
+        'highlight': '灵活体验',
+        'quota_total': 1,
+        'duration_days': None,
+    },
+    'monthly': {
+        'id': 'monthly',
+        'title': '按月订阅',
+        'description': '适合持续打磨表达、节奏和岗位匹配度。',
+        'unit_label': '/月',
+        'base_price': 40,
+        'detail': '按月更适合稳定训练节奏，方便在求职周期内持续复盘和跟踪。',
+        'highlight': '热门选择',
+        'quota_total': 0,
+        'duration_days': 30,
+    },
+    'yearly': {
+        'id': 'yearly',
+        'title': '按年订阅',
+        'description': '适合长期提升与系统训练，综合性价比更高。',
+        'unit_label': '/年',
+        'base_price': 400,
+        'detail': '年付包含每年 200 次使用额度，适合长期备战或全年训练规划。',
+        'highlight': '年度最省',
+        'quota_total': 200,
+        'duration_days': 365,
+    },
+}
+
+
+def _normalize_membership_mode(value) -> str:
+    normalized = str(value or '').strip().lower()
+    return 'team' if normalized == 'team' else 'personal'
+
+
+def _normalize_membership_plan_id(value) -> str:
+    normalized = str(value or '').strip().lower()
+    return normalized if normalized in MEMBERSHIP_PLAN_CATALOG else ''
+
+
+def _serialize_membership_catalog():
+    return {
+        'team_discount': MEMBERSHIP_TEAM_DISCOUNT,
+        'modes': [
+            {'id': 'personal', 'label': '个人版', 'min_team_size': 1},
+            {'id': 'team', 'label': '团队版', 'min_team_size': 2},
+        ],
+        'plans': list(MEMBERSHIP_PLAN_CATALOG.values()),
+    }
+
+
+def _calculate_membership_selection(mode, plan_id, team_size):
+    normalized_mode = _normalize_membership_mode(mode)
+    normalized_plan_id = _normalize_membership_plan_id(plan_id)
+    if not normalized_plan_id:
+        raise ValueError('无效的订阅方案')
+
+    try:
+        normalized_team_size = int(team_size or 1)
+    except Exception:
+        normalized_team_size = 1
+
+    if normalized_mode == 'team':
+        normalized_team_size = max(2, min(normalized_team_size, 50))
+        discount = MEMBERSHIP_TEAM_DISCOUNT
+    else:
+        normalized_team_size = 1
+        discount = 1.0
+
+    plan = MEMBERSHIP_PLAN_CATALOG[normalized_plan_id]
+    base_price = float(plan.get('base_price') or 0)
+    unit_price = round(base_price * discount, 2)
+    total_price = round(unit_price * normalized_team_size, 2)
+    base_quota = int(plan.get('quota_total') or 0)
+    quota_total = base_quota * normalized_team_size if base_quota > 0 else 0
+    expires_at = None
+    duration_days = plan.get('duration_days')
+    if duration_days:
+        expires_at = (datetime.utcnow() + timedelta(days=int(duration_days))).isoformat(timespec='seconds')
+
+    return {
+        'membership_mode': normalized_mode,
+        'plan_id': normalized_plan_id,
+        'team_size': normalized_team_size,
+        'plan': plan,
+        'unit_price': unit_price,
+        'total_price': total_price,
+        'quota_total': quota_total,
+        'quota_used': 0,
+        'expires_at': expires_at,
+    }
+
+
+def _serialize_membership_snapshot(user):
+    if not user:
+        return {
+            'status': 'inactive',
+            'mode': 'personal',
+            'plan_id': None,
+            'plan_title': None,
+            'team_size': 1,
+            'auto_renew': False,
+            'started_at': None,
+            'expires_at': None,
+            'usage': {'total': 0, 'used': 0, 'remaining': 0},
+        }
+
+    status = str(user.get('membership_status') or 'inactive').strip() or 'inactive'
+    plan_id = _normalize_membership_plan_id(user.get('membership_plan_id'))
+    plan = MEMBERSHIP_PLAN_CATALOG.get(plan_id) if plan_id else None
+    quota_total = max(0, int(user.get('membership_cycle_quota') or 0))
+    quota_used = max(0, int(user.get('membership_cycle_used') or 0))
+    return {
+        'status': status,
+        'mode': _normalize_membership_mode(user.get('membership_mode')),
+        'plan_id': plan_id or None,
+        'plan_title': plan.get('title') if plan else None,
+        'team_size': max(1, int(user.get('membership_team_size') or 1)),
+        'auto_renew': bool(user.get('membership_auto_renew')),
+        'started_at': user.get('membership_started_at'),
+        'expires_at': user.get('membership_expires_at'),
+        'usage': {
+            'total': quota_total,
+            'used': quota_used,
+            'remaining': max(0, quota_total - quota_used),
+        },
+    }
+
+
+def _serialize_membership_order(order):
+    if not order:
+        return None
+    plan = MEMBERSHIP_PLAN_CATALOG.get(str(order.get('plan_id') or '').strip())
+    return {
+        'order_id': order.get('order_id'),
+        'membership_mode': order.get('membership_mode'),
+        'plan_id': order.get('plan_id'),
+        'plan_title': plan.get('title') if plan else None,
+        'team_size': int(order.get('team_size') or 1),
+        'unit_price': float(order.get('unit_price') or 0),
+        'total_price': float(order.get('total_price') or 0),
+        'status': str(order.get('status') or 'pending').strip() or 'pending',
+        'quota_total': int(order.get('quota_total') or 0),
+        'quota_used': int(order.get('quota_used') or 0),
+        'created_at': order.get('created_at'),
+        'updated_at': order.get('updated_at'),
+    }
+
+
+@app.route('/api/membership/overview', methods=['GET'])
+def api_membership_overview():
+    user_email = _normalize_auth_email(request.args.get('user_email', ''))
+    if not user_email:
+        return jsonify({'success': False, 'error': '缺少用户邮箱'}), 400
+
+    user = db_manager.get_user_by_email(user_email)
+    if not user:
+        return jsonify({'success': False, 'error': '用户不存在'}), 404
+
+    orders = db_manager.list_membership_orders(user_email=user_email, limit=6)
+    return jsonify({
+        'success': True,
+        'catalog': _serialize_membership_catalog(),
+        'current_membership': _serialize_membership_snapshot(user),
+        'recent_orders': [_serialize_membership_order(order) for order in orders],
+    })
+
+
+@app.route('/api/membership/orders', methods=['POST'])
+def api_membership_create_order():
+    payload = request.get_json(silent=True) or {}
+    user_email = _normalize_auth_email(payload.get('user_email', ''))
+    membership_mode = _normalize_membership_mode(payload.get('membership_mode'))
+    plan_id = _normalize_membership_plan_id(payload.get('plan_id'))
+    team_size = payload.get('team_size', 1)
+
+    if not user_email:
+        return jsonify({'success': False, 'error': '缺少用户邮箱'}), 400
+
+    user = db_manager.get_user_by_email(user_email)
+    if not user:
+        return jsonify({'success': False, 'error': '用户不存在'}), 404
+    if not plan_id:
+        return jsonify({'success': False, 'error': '请选择有效的订阅方案'}), 400
+
+    try:
+        summary = _calculate_membership_selection(membership_mode, plan_id, team_size)
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+
+    order_id = f"mem_{uuid.uuid4().hex[:12]}"
+    created = db_manager.create_membership_order({
+        'order_id': order_id,
+        'user_email': user_email,
+        'membership_mode': summary['membership_mode'],
+        'plan_id': summary['plan_id'],
+        'team_size': summary['team_size'],
+        'unit_price': summary['unit_price'],
+        'total_price': summary['total_price'],
+        'quota_total': summary['quota_total'],
+        'quota_used': summary['quota_used'],
+        'status': 'pending',
+    })
+    if not created.get('success'):
+        return jsonify({'success': False, 'error': str(created.get('error') or '创建订单失败')}), 500
+
+    return jsonify({
+        'success': True,
+        'order': _serialize_membership_order(created.get('order')),
+    }), 201
+
+
+@app.route('/api/membership/orders/pay', methods=['POST'])
+def api_membership_pay_order():
+    payload = request.get_json(silent=True) or {}
+    user_email = _normalize_auth_email(payload.get('user_email', ''))
+    order_id = str(payload.get('order_id', '') or '').strip()
+
+    if not user_email or not order_id:
+        return jsonify({'success': False, 'error': '缺少支付参数'}), 400
+
+    user = db_manager.get_user_by_email(user_email)
+    if not user:
+        return jsonify({'success': False, 'error': '用户不存在'}), 404
+
+    order = db_manager.get_membership_order(order_id=order_id, user_email=user_email)
+    if not order:
+        return jsonify({'success': False, 'error': '订单不存在'}), 404
+
+    if str(order.get('status') or '').strip() == 'paid':
+        return jsonify({
+            'success': True,
+            'order': _serialize_membership_order(order),
+            'current_membership': _serialize_membership_snapshot(user),
+        })
+
+    try:
+        summary = _calculate_membership_selection(
+            order.get('membership_mode'),
+            order.get('plan_id'),
+            order.get('team_size'),
+        )
+    except ValueError as exc:
+        return jsonify({'success': False, 'error': str(exc)}), 400
+
+    started_at = datetime.utcnow().isoformat(timespec='seconds')
+    updated_user = db_manager.update_user_membership(user_email, {
+        'membership_status': 'active',
+        'membership_mode': summary['membership_mode'],
+        'membership_plan_id': summary['plan_id'],
+        'membership_team_size': summary['team_size'],
+        'membership_cycle_quota': summary['quota_total'],
+        'membership_cycle_used': 0,
+        'membership_auto_renew': summary['plan_id'] in {'monthly', 'yearly'},
+        'membership_started_at': started_at,
+        'membership_expires_at': summary['expires_at'],
+    })
+    if not updated_user.get('success'):
+        return jsonify({'success': False, 'error': str(updated_user.get('error') or '开通会员失败')}), 500
+
+    order_update = db_manager.update_membership_order_status(order_id, 'paid', quota_used=0)
+    if not order_update.get('success'):
+        return jsonify({'success': False, 'error': str(order_update.get('error') or '更新订单状态失败')}), 500
+
+    latest_user = db_manager.get_user_by_email(user_email)
+    latest_order = db_manager.get_membership_order(order_id=order_id, user_email=user_email)
+    return jsonify({
+        'success': True,
+        'order': _serialize_membership_order(latest_order),
+        'current_membership': _serialize_membership_snapshot(latest_user),
+        'message': '会员已开通',
+    })
+
+
+@app.route('/api/auth/register', methods=['POST'])
+def api_auth_register():
+    payload = request.get_json(silent=True) or {}
+
+    email = _normalize_auth_email(payload.get('email', ''))
+    password = str(payload.get('password', '') or '')
+    display_name = _normalize_auth_name(payload.get('name', ''))
+
+    if not email or not AUTH_EMAIL_PATTERN.match(email):
+        return jsonify({
+            'success': False,
+            'error': '请输入有效邮箱地址。',
+        }), 400
+    if len(password) < 8:
+        return jsonify({
+            'success': False,
+            'error': '密码长度至少为 8 位。',
+        }), 400
+    if len(password) > 128:
+        return jsonify({
+            'success': False,
+            'error': '密码长度不能超过 128 位。',
+        }), 400
+    if len(display_name) < 2:
+        return jsonify({
+            'success': False,
+            'error': '昵称至少需要 2 个字符。',
+        }), 400
+    if len(display_name) > 40:
+        return jsonify({
+            'success': False,
+            'error': '昵称长度不能超过 40 个字符。',
+        }), 400
+
+    existing = db_manager.get_user_by_email(email)
+    if existing:
+        return jsonify({
+            'success': False,
+            'error': '该邮箱已注册，请直接登录。',
+        }), 409
+
+    created = db_manager.create_user(
+        email=email,
+        password_hash=_hash_auth_password(password),
+        display_name=display_name,
+        is_demo=False,
+    )
+    if not created or not created.get('success'):
+        return jsonify({
+            'success': False,
+            'error': str((created or {}).get('error') or '注册失败，请稍后重试。'),
+        }), 500
+
+    user = created.get('user') or {}
+    return jsonify({
+        'success': True,
+        'user': {
+            'id': user.get('id'),
+            'email': user.get('email'),
+            'name': user.get('display_name') or display_name,
+        },
+    }), 201
+
+
+@app.route('/api/auth/login', methods=['POST'])
+def api_auth_login():
+    payload = request.get_json(silent=True) or {}
+    email = _normalize_auth_email(payload.get('email', ''))
+    password = str(payload.get('password', '') or '')
+
+    if not email or not password:
+        return jsonify({
+            'success': False,
+            'error': '请输入完整的邮箱和密码。',
+        }), 400
+
+    user = db_manager.get_user_by_email(email)
+    if not user:
+        return jsonify({
+            'success': False,
+            'error': '邮箱或密码错误。',
+        }), 401
+
+    stored_hash = str(user.get('password_hash') or '')
+    if not _verify_auth_password(password, stored_hash):
+        return jsonify({
+            'success': False,
+            'error': '邮箱或密码错误。',
+        }), 401
+
+    return jsonify({
+        'success': True,
+        'user': {
+            'id': user.get('id'),
+            'email': user.get('email'),
+            'name': user.get('display_name') or AUTH_DEFAULT_NAME,
+            'is_demo': bool(user.get('is_demo')),
+        },
+    })
+
+
+@app.route('/api/auth/change-password', methods=['POST'])
+def api_auth_change_password():
+    payload = request.get_json(silent=True) or {}
+    email = _normalize_auth_email(payload.get('email', ''))
+    current_password = str(payload.get('current_password', '') or '')
+    new_password = str(payload.get('new_password', '') or '')
+
+    if not email or not current_password or not new_password:
+        return jsonify({'success': False, 'error': '请完整填写邮箱、当前密码和新密码。'}), 400
+
+    user = db_manager.get_user_by_email(email)
+    if not user:
+        return jsonify({'success': False, 'error': '用户不存在。'}), 404
+
+    stored_hash = str(user.get('password_hash') or '')
+    if not _verify_auth_password(current_password, stored_hash):
+        return jsonify({'success': False, 'error': '当前密码错误。'}), 401
+
+    if len(new_password) < 8:
+        return jsonify({'success': False, 'error': '新密码长度至少为 8 位。'}), 400
+    if len(new_password) > 128:
+        return jsonify({'success': False, 'error': '新密码长度不能超过 128 位。'}), 400
+    if new_password == current_password:
+        return jsonify({'success': False, 'error': '新密码不能与当前密码相同。'}), 400
+
+    new_hash = _hash_auth_password(new_password)
+    result = db_manager.update_password(email, new_hash)
+    if not result.get('success'):
+        return jsonify({'success': False, 'error': str(result.get('error') or '密码修改失败，请稍后重试。')}), 500
+
+    return jsonify({'success': True, 'message': '密码修改成功。'})
+
+
+def _coerce_notification_bool(value, default=True):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    normalized = str(value).strip().lower()
+    if normalized in {'1', 'true', 'yes', 'on'}:
+        return True
+    if normalized in {'0', 'false', 'no', 'off'}:
+        return False
+    return default
+
+
+def _normalize_notification_settings_payload(payload=None, user_id='default'):
+    source = payload or {}
+    return {
+        'user_id': str(user_id or 'default').strip().lower() or 'default',
+        'in_app_enabled': _coerce_notification_bool(source.get('in_app_enabled'), True),
+        'inactivity_24h_enabled': _coerce_notification_bool(source.get('inactivity_24h_enabled'), True),
+        'streak_enabled': _coerce_notification_bool(source.get('streak_enabled'), True),
+        'weekly_plan_due_enabled': _coerce_notification_bool(source.get('weekly_plan_due_enabled'), True),
+    }
+
+
+def _parse_app_datetime(value):
+    text = str(value or '').strip()
+    if not text:
+        return None
+    for parser in (
+        lambda item: datetime.fromisoformat(item.replace('Z', '+00:00')),
+        lambda item: datetime.strptime(item, '%Y-%m-%d %H:%M:%S'),
+        lambda item: datetime.strptime(item, '%Y-%m-%d'),
+    ):
+        try:
+            return parser(text)
+        except Exception:
+            continue
+    return None
+
+
+def _compute_training_streak_days(interviews):
+    day_set = set()
+    for item in interviews or []:
+        timestamp = _parse_app_datetime(item.get('start_time') or item.get('created_at'))
+        if timestamp is None:
+            continue
+        day_set.add(timestamp.date())
+
+    if not day_set:
+        return 0
+
+    streak = 0
+    cursor = datetime.now().date()
+    while cursor in day_set:
+        streak += 1
+        cursor = cursor - timedelta(days=1)
+    return streak
+
+
+def _build_behavior_reminders_payload(user_id='default'):
+    normalized_user_id = str(user_id or 'default').strip().lower() or 'default'
+    settings = db_manager.get_notification_settings(normalized_user_id) if hasattr(db_manager, 'get_notification_settings') else {
+        'user_id': normalized_user_id,
+        'in_app_enabled': True,
+        'inactivity_24h_enabled': True,
+        'streak_enabled': True,
+        'weekly_plan_due_enabled': True,
+    }
+
+    interviews = db_manager.get_interviews(limit=180, offset=0) if hasattr(db_manager, 'get_interviews') else []
+    sorted_interviews = sorted(
+        interviews or [],
+        key=lambda item: _parse_app_datetime(item.get('start_time') or item.get('created_at')) or datetime.min,
+        reverse=True,
+    )
+    last_training_dt = _parse_app_datetime(
+        (sorted_interviews[0] or {}).get('start_time') or (sorted_interviews[0] or {}).get('created_at')
+    ) if sorted_interviews else None
+
+    now = datetime.now()
+    current_streak_days = _compute_training_streak_days(sorted_interviews)
+    hours_since_training = None
+    if last_training_dt is not None:
+        hours_since_training = round(max(0.0, (now - last_training_dt).total_seconds()) / 3600, 1)
+
+    week_anchor = _parse_week_anchor('')
+    week_start, _ = _build_week_range(week_anchor)
+    current_bundle = db_manager.get_training_plan_bundle(
+        user_id=normalized_user_id,
+        week_start_date=week_start.strftime('%Y-%m-%d'),
+    ) if hasattr(db_manager, 'get_training_plan_bundle') else {'plan': None, 'tasks': []}
+    current_plan = (current_bundle or {}).get('plan') or {}
+    current_tasks = (current_bundle or {}).get('tasks') or []
+
+    unfinished_statuses = {'planned', 'training', 'validation', 'reflow'}
+    pending_tasks = [
+        item for item in current_tasks
+        if str((item or {}).get('status') or '').strip().lower() in unfinished_statuses
+    ]
+    week_end_dt = _parse_app_datetime(current_plan.get('week_end_date'))
+    days_until_week_end = None
+    if week_end_dt is not None:
+        days_until_week_end = (week_end_dt.date() - now.date()).days
+
+    reminders = []
+    if settings.get('in_app_enabled', True):
+        if settings.get('inactivity_24h_enabled', True):
+            if last_training_dt is None:
+                reminders.append({
+                    'id': 'first-training',
+                    'type': 'inactivity_24h',
+                    'tone': 'warning',
+                    'title': '今天还没有开始训练',
+                    'message': '先完成一轮短练习，能更快把状态找回来，也能避免训练节奏断掉。',
+                    'cta_label': '开始一场训练',
+                    'cta_href': '/interview/setup',
+                })
+            elif (now - last_training_dt) >= timedelta(hours=24):
+                reminders.append({
+                    'id': 'inactivity-24h',
+                    'type': 'inactivity_24h',
+                    'tone': 'warning',
+                    'title': '你已经超过 24 小时没有训练',
+                    'message': f'上一次训练时间是 {last_training_dt.strftime("%m-%d %H:%M")}，建议今天先完成一场 15 到 30 分钟的专项练习。',
+                    'cta_label': '恢复训练',
+                    'cta_href': '/interview/setup',
+                })
+
+        if settings.get('streak_enabled', True) and current_streak_days >= 3:
+            reminders.append({
+                'id': f'streak-{current_streak_days}',
+                'type': 'streak',
+                'tone': 'success',
+                'title': f'你已连续训练 {current_streak_days} 天',
+                'message': '现在最适合继续巩固同一类短板，把“偶尔答对”拉成“稳定答好”。',
+                'cta_label': '继续保持',
+                'cta_href': '/insights',
+            })
+
+        if settings.get('weekly_plan_due_enabled', True) and pending_tasks:
+            if days_until_week_end is not None and days_until_week_end < 0:
+                reminders.append({
+                    'id': 'weekly-plan-overdue',
+                    'type': 'weekly_plan_due',
+                    'tone': 'danger',
+                    'title': '本周训练计划已到期，仍有任务未验收',
+                    'message': f'还有 {len(pending_tasks)} 项任务未完成，建议先完成最高优先级任务，再决定是否回流到下周。',
+                    'cta_label': '查看周计划',
+                    'cta_href': '/insights',
+                })
+            elif days_until_week_end is not None and days_until_week_end <= 1:
+                reminders.append({
+                    'id': 'weekly-plan-due-soon',
+                    'type': 'weekly_plan_due',
+                    'tone': 'info',
+                    'title': '本周训练计划即将到期',
+                    'message': f'还有 {len(pending_tasks)} 项任务待验收，建议优先处理本周最关键的一项。',
+                    'cta_label': '去完成任务',
+                    'cta_href': '/insights',
+                })
+
+    return {
+        'settings': settings,
+        'summary': {
+            'last_training_at': last_training_dt.strftime('%Y-%m-%d %H:%M:%S') if last_training_dt else '',
+            'hours_since_training': hours_since_training,
+            'current_streak_days': current_streak_days,
+            'weekly_plan_pending_count': len(pending_tasks),
+            'weekly_plan_due_at': week_end_dt.strftime('%Y-%m-%d') if week_end_dt else '',
+            'in_app_enabled': bool(settings.get('in_app_enabled', True)),
+        },
+        'reminders': reminders,
+    }
+
+
+@app.route('/api/user/notification-settings', methods=['GET'])
+def api_get_notification_settings():
+    user_id = str(request.args.get('user_id', 'default') or 'default').strip().lower() or 'default'
+    settings = db_manager.get_notification_settings(user_id) if hasattr(db_manager, 'get_notification_settings') else {}
+    return jsonify({
+        'success': True,
+        'settings': settings,
+    })
+
+
+@app.route('/api/user/notification-settings', methods=['PUT'])
+def api_update_notification_settings():
+    if not hasattr(db_manager, 'upsert_notification_settings'):
+        return jsonify({'success': False, 'error': 'notification settings unavailable'}), 503
+
+    payload = request.get_json(silent=True) or {}
+    user_id = str(payload.get('user_id') or request.args.get('user_id', 'default') or 'default').strip().lower() or 'default'
+    normalized_payload = _normalize_notification_settings_payload(payload, user_id=user_id)
+    result = db_manager.upsert_notification_settings(normalized_payload)
+    if not result.get('success'):
+        return jsonify({'success': False, 'error': result.get('error') or 'update notification settings failed'}), 500
+    return jsonify({
+        'success': True,
+        'settings': result.get('settings') or normalized_payload,
+    })
+
+
+@app.route('/api/user/reminders', methods=['GET'])
+def api_user_reminders():
+    try:
+        user_id = str(request.args.get('user_id', 'default') or 'default').strip().lower() or 'default'
+        payload = _build_behavior_reminders_payload(user_id=user_id)
+        return jsonify({
+            'success': True,
+            **payload,
+        })
+    except Exception as e:
+        logger.error(f"获取用户提醒失败: {e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e), 'reminders': [], 'summary': {}}), 500
+
+
+@app.route('/api/knowledge-graph/health', methods=['GET'])
+def api_knowledge_graph_health():
+    if knowledge_graph_service is None:
+        return jsonify({
+            'success': False,
+            'enabled': False,
+            'error': 'knowledge graph service unavailable',
+            'details': knowledge_graph_import_error or '',
+        }), 503
+
+    return jsonify({
+        'success': True,
+        'data': knowledge_graph_service.health(),
+    })
+
+
+@app.route('/api/knowledge-graph/profile', methods=['GET'])
+def api_knowledge_graph_profile():
+    if knowledge_graph_service is None:
+        return jsonify({
+            'success': False,
+            'error': 'knowledge graph service unavailable',
+            'details': knowledge_graph_import_error or '',
+        }), 503
+
+    try:
+        user_id = str(request.args.get('user_id', 'default') or 'default').strip().lower() or 'default'
+        payload = knowledge_graph_service.build_user_graph(user_id=user_id)
+        return jsonify({
+            'success': True,
+            **payload,
+        })
+    except Exception as e:
+        logger.error(f"生成知识图谱失败: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'summary': {},
+            'nodes': [],
+            'edges': [],
+        }), 500
+
+
+@app.route('/api/knowledge-graph/sync', methods=['POST'])
+def api_knowledge_graph_sync():
+    if knowledge_graph_service is None:
+        return jsonify({
+            'success': False,
+            'error': 'knowledge graph service unavailable',
+            'details': knowledge_graph_import_error or '',
+        }), 503
+
+    try:
+        payload = request.get_json(silent=True) or {}
+        user_id = str(payload.get('user_id') or request.args.get('user_id', 'default') or 'default').strip().lower() or 'default'
+        result = knowledge_graph_service.sync_user_graph(user_id=user_id)
+        return jsonify({
+            'success': True,
+            'data': result,
+        })
+    except Exception as e:
+        logger.error(f"同步知识图谱到 Neo4j 失败: {e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e),
+        }), 500
+
+
 @app.route('/api/assistant/health')
 def api_assistant_health():
     """检查全局助手可用状态。"""
@@ -2760,11 +4871,382 @@ def api_assistant_health():
         }), 503
 
     status_payload = assistant_service.health()
+    rag_payload = rag_service.status() if rag_service is not None else {
+        'enabled': False,
+        'dual_index_ready': False,
+        'count': 0,
+        'question_count': 0,
+        'rubric_count': 0,
+    }
     success = bool(status_payload.get('success'))
     return jsonify({
         'success': success,
-        'data': status_payload,
+        'data': {
+            **status_payload,
+            'rag': rag_payload,
+            'async_mode': {
+                'enabled': bool(ASSISTANT_ASYNC_ENABLED),
+                'task_max_workers': int(ASSISTANT_TASK_MAX_WORKERS),
+                'task_retention_seconds': int(ASSISTANT_TASK_RETENTION_SECONDS),
+            },
+        },
     }), (200 if success else 503)
+
+@app.route('/api/assistant/conversations', methods=['GET'])
+def api_assistant_conversations():
+    user_id = _assistant_user_id()
+    limit = max(1, min(request.args.get('limit', 50, type=int) or 50, 200))
+    conversations = db_manager.list_assistant_conversations(user_id=user_id, limit=limit)
+    return jsonify({
+        'success': True,
+        'conversations': conversations,
+        'count': len(conversations),
+        'user_id': user_id,
+    })
+
+
+@app.route('/api/assistant/conversations', methods=['POST'])
+def api_create_assistant_conversation():
+    payload = request.get_json(silent=True) or {}
+    user_id = _assistant_user_id(payload)
+    raw_title = str(payload.get('title', '') or '').strip()
+    title = _assistant_build_title(raw_title or '新对话')
+    conversation = db_manager.create_assistant_conversation(user_id=user_id, title=title)
+    if not conversation:
+        return jsonify({
+            'success': False,
+            'error': 'failed to create conversation',
+        }), 500
+
+    return jsonify({
+        'success': True,
+        'conversation': conversation,
+    }), 201
+
+
+@app.route('/api/assistant/conversations/<conversation_id>', methods=['GET'])
+def api_get_assistant_conversation(conversation_id):
+    user_id = _assistant_user_id()
+    conversation = db_manager.get_assistant_conversation(conversation_id, user_id=user_id)
+    if not conversation:
+        return jsonify({
+            'success': False,
+            'error': 'conversation not found',
+        }), 404
+
+    messages = db_manager.get_assistant_messages(conversation_id, user_id=user_id, limit=500)
+    return jsonify({
+        'success': True,
+        'conversation': conversation,
+        'messages': messages,
+    })
+
+
+@app.route('/api/assistant/conversations/<conversation_id>', methods=['DELETE'])
+def api_delete_assistant_conversation(conversation_id):
+    payload = request.get_json(silent=True) or {}
+    user_id = _assistant_user_id(payload)
+
+    deleted = db_manager.delete_assistant_conversation(
+        conversation_id,
+        user_id=user_id,
+    )
+    if not deleted:
+        return jsonify({
+            'success': False,
+            'error': 'conversation not found',
+        }), 404
+
+    return jsonify({
+        'success': True,
+        'conversation_id': str(conversation_id or '').strip(),
+        'user_id': user_id,
+    })
+
+
+@app.route('/api/assistant/conversations/<conversation_id>/messages', methods=['POST'])
+def api_post_assistant_message(conversation_id):
+    if assistant_service is None:
+        return jsonify({
+            'success': False,
+            'error': 'assistant service unavailable',
+            'details': assistant_import_error or '',
+        }), 503
+
+    if not bool(getattr(assistant_service, 'enabled', False)):
+        return jsonify({
+            'success': False,
+            'error': 'assistant disabled',
+        }), 503
+
+    client_key = _assistant_client_key()
+    if not assistant_rate_limiter.is_allowed(client_key):
+        return jsonify({
+            'success': False,
+            'error': 'rate limit exceeded',
+            'retry_after_seconds': int(assistant_rate_limiter.time_window),
+        }), 429
+
+    payload = request.get_json(silent=True) or {}
+    user_id = _assistant_user_id(payload)
+    conversation = db_manager.get_assistant_conversation(conversation_id, user_id=user_id)
+    if not conversation:
+        return jsonify({
+            'success': False,
+            'error': 'conversation not found',
+        }), 404
+
+    raw_message = str(payload.get('message', '') or '')
+    raw_system_prompt = str(payload.get('system_prompt', '') or '')
+    raw_temperature = payload.get('temperature', 0.25)
+    raw_max_tokens = payload.get('max_tokens')
+
+    try:
+        message = validate_string(
+            raw_message,
+            'message',
+            min_length=1,
+            max_length=4000,
+            allow_empty=False,
+        ).strip()
+
+        system_prompt = ''
+        if raw_system_prompt.strip():
+            system_prompt = validate_string(
+                raw_system_prompt,
+                'system_prompt',
+                min_length=0,
+                max_length=4000,
+                allow_empty=True,
+            ).strip()
+
+        try:
+            temperature = float(raw_temperature)
+        except Exception:
+            temperature = 0.25
+        temperature = max(0.0, min(1.2, temperature))
+
+        max_tokens = _assistant_parse_max_tokens(raw_max_tokens)
+
+        existing_messages = db_manager.get_assistant_messages(conversation_id, user_id=user_id, limit=20)
+        history_messages = _assistant_model_history(existing_messages, limit=ASSISTANT_MODEL_HISTORY_LIMIT)
+
+        user_message_row = db_manager.append_assistant_message(
+            conversation_id,
+            role='user',
+            content=message,
+            retrieval_meta={'source': 'user_input'},
+        )
+        if not user_message_row:
+            return jsonify({
+                'success': False,
+                'error': 'failed to persist user message',
+            }), 500
+
+        if int(conversation.get('message_count') or 0) == 0:
+            db_manager.update_assistant_conversation(
+                conversation_id,
+                title=_assistant_build_title(message),
+            )
+
+        if ASSISTANT_ASYNC_ENABLED:
+            task = _assistant_create_task(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                message=message,
+                history_messages=history_messages,
+                system_prompt=system_prompt,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            try:
+                _assistant_task_executor.submit(
+                    _assistant_run_task,
+                    task['task_id'],
+                    user_id=user_id,
+                )
+            except Exception as schedule_exc:
+                logger.error(f"[assistant] failed to schedule async task: {schedule_exc}", exc_info=True)
+                _assistant_update_task(
+                    task['task_id'],
+                    status='failed',
+                    finished_at=datetime.now().isoformat(timespec='seconds'),
+                    error={
+                        'code': 'SCHEDULE_ERROR',
+                        'message': str(schedule_exc),
+                    },
+                )
+                return jsonify({
+                    'success': False,
+                    'error': 'failed to schedule assistant task',
+                    'details': str(schedule_exc),
+                }), 500
+
+            latest_conversation = db_manager.get_assistant_conversation(conversation_id, user_id=user_id)
+            return jsonify({
+                'success': True,
+                'async': True,
+                'conversation': latest_conversation,
+                'user_message': user_message_row,
+                'task': _assistant_task_response(task),
+                'placeholder': {
+                    'content': ASSISTANT_FAST_ACK_TEXT,
+                },
+            }), 202
+
+        result = _assistant_generate_reply(
+            user_message=message,
+            history_messages=history_messages,
+            system_prompt=system_prompt,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        if not result.get('success'):
+            error_code = str(result.get('error', 'assistant error') or 'assistant error')
+            error_message = str(result.get('message', '') or '')
+            status_code = 502
+            lowered_message = error_message.lower()
+            if error_code == 'ASSISTANT_EXCEPTION' and ('timed out' in lowered_message or 'timeout' in lowered_message):
+                status_code = 504
+            elif error_code == 'ASSISTANT_NOT_READY':
+                status_code = 503
+            return jsonify({
+                'success': False,
+                'error': error_code,
+                'message': error_message,
+                'latency_ms': result.get('latency_ms', 0.0),
+                'citations': result.get('citations', []),
+                'retrieval_meta': result.get('retrieval_meta', {}),
+                'answer_mode': result.get('answer_mode', 'model_fallback'),
+            }), status_code
+
+        assistant_message_row = db_manager.append_assistant_message(
+            conversation_id,
+            role='assistant',
+            content=str(result.get('reply', '') or ''),
+            citations=result.get('citations', []),
+            answer_mode=result.get('answer_mode'),
+            retrieval_meta=result.get('retrieval_meta', {}),
+        )
+        if not assistant_message_row:
+            return jsonify({
+                'success': False,
+                'error': 'failed to persist assistant message',
+            }), 500
+
+        latest_conversation = db_manager.get_assistant_conversation(conversation_id, user_id=user_id)
+        return jsonify({
+            'success': True,
+            'async': False,
+            'conversation': latest_conversation,
+            'user_message': user_message_row,
+            'assistant_message': assistant_message_row,
+            'reply': assistant_message_row.get('content', ''),
+            'citations': assistant_message_row.get('citations', []),
+            'retrieval_meta': assistant_message_row.get('retrieval_meta', {}),
+            'answer_mode': assistant_message_row.get('answer_mode', 'model_fallback'),
+            'provider': result.get('provider', ''),
+            'model': result.get('model', ''),
+            'latency_ms': result.get('latency_ms', 0.0),
+            'done_reason': result.get('done_reason', ''),
+            'usage': {
+                'prompt_eval_count': int(result.get('prompt_eval_count') or 0),
+                'eval_count': int(result.get('eval_count') or 0),
+            },
+        })
+    except ValidationError as exc:
+        return jsonify({
+            'success': False,
+            'error': str(exc),
+        }), 400
+    except Exception as exc:
+        logger.error(f"assistant message error: {exc}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': 'internal server error',
+            'details': str(exc),
+        }), 500
+
+
+@app.route('/api/assistant/tasks/<task_id>', methods=['GET'])
+def api_get_assistant_task(task_id):
+    user_id = _assistant_user_id()
+    task = _assistant_get_task(task_id, user_id=user_id)
+    if not task:
+        return jsonify({
+            'success': False,
+            'error': 'task not found',
+        }), 404
+
+    response_payload = {
+        'success': True,
+        'task': _assistant_task_response(task),
+        'assistant_message': task.get('assistant_message') if task.get('status') == 'completed' else None,
+        'async': True,
+    }
+    if task.get('status') == 'completed':
+        conversation = db_manager.get_assistant_conversation(task.get('conversation_id'), user_id=user_id)
+        response_payload['conversation'] = conversation
+    return jsonify(response_payload)
+
+
+@app.route('/api/assistant/tasks/<task_id>/stream', methods=['GET'])
+def api_stream_assistant_task(task_id):
+    user_id = _assistant_user_id()
+
+    def _event_stream():
+        last_version = -1
+        idle_rounds = 0
+        max_idle_rounds = 240  # ~120s with 0.5s cadence
+        while idle_rounds < max_idle_rounds:
+            task = _assistant_get_task(task_id, user_id=user_id)
+            if not task:
+                yield _assistant_sse_pack('error', {
+                    'success': False,
+                    'error': 'task not found',
+                })
+                return
+
+            stream_version = int(task.get('stream_version') or 0)
+            status = str(task.get('status') or '').lower()
+            done = status in {'completed', 'failed'}
+
+            if stream_version != last_version:
+                payload = {
+                    'success': True,
+                    'task': _assistant_task_response(task),
+                    'assistant_message': task.get('assistant_message') if status == 'completed' else None,
+                    'async': True,
+                    'done': done,
+                }
+                if status == 'completed':
+                    payload['conversation'] = db_manager.get_assistant_conversation(
+                        task.get('conversation_id'),
+                        user_id=user_id,
+                    )
+                yield _assistant_sse_pack('assistant_stream', payload)
+                last_version = stream_version
+                idle_rounds = 0
+            else:
+                idle_rounds += 1
+
+            if done:
+                yield _assistant_sse_pack('done', {'success': True, 'task_id': task_id})
+                return
+
+            time.sleep(0.5)
+
+        yield _assistant_sse_pack('timeout', {
+            'success': False,
+            'error': 'stream timeout',
+            'task_id': task_id,
+        })
+
+    response = Response(stream_with_context(_event_stream()), mimetype='text/event-stream')
+    response.headers['Cache-Control'] = 'no-cache'
+    response.headers['Connection'] = 'keep-alive'
+    response.headers['X-Accel-Buffering'] = 'no'
+    return response
 
 
 @app.route('/api/assistant/chat', methods=['POST'])
@@ -2796,10 +5278,7 @@ def api_assistant_chat():
     raw_messages = payload.get('messages', [])
     raw_system_prompt = str(payload.get('system_prompt', '') or '')
     raw_temperature = payload.get('temperature', 0.3)
-    raw_max_tokens = payload.get(
-        'max_tokens',
-        int(getattr(assistant_service, 'default_max_tokens', 320) or 320),
-    )
+    raw_max_tokens = payload.get('max_tokens')
 
     try:
         message = validate_string(
@@ -2844,15 +5323,11 @@ def api_assistant_chat():
             temperature = 0.3
         temperature = max(0.0, min(1.2, temperature))
 
-        try:
-            max_tokens = int(raw_max_tokens)
-        except Exception:
-            max_tokens = 640
-        max_tokens = max(64, min(2048, max_tokens))
+        max_tokens = _assistant_parse_max_tokens(raw_max_tokens)
 
-        result = assistant_service.chat(
+        result = _assistant_generate_reply(
             user_message=message,
-            messages=messages,
+            history_messages=messages,
             system_prompt=system_prompt,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -2889,6 +5364,9 @@ def api_assistant_chat():
         return jsonify({
             'success': True,
             'reply': result.get('reply', ''),
+            'citations': result.get('citations', []),
+            'retrieval_meta': result.get('retrieval_meta', {}),
+            'answer_mode': result.get('answer_mode', 'model_fallback'),
             'provider': result.get('provider', ''),
             'model': result.get('model', ''),
             'latency_ms': result.get('latency_ms', 0.0),
@@ -3042,10 +5520,21 @@ def handle_session_start(data=None):
             if asr_manager and existing.active_asr_stream_id:
                 asr_manager.stop_session(existing.active_asr_stream_id)
 
+        selected_question = _parse_selected_question_payload((data or {}).get('selected_question'))
+
         round_type = data.get('round_type', data.get('round', 'technical')) if data else 'technical'
         position = data.get('position', 'java_backend') if data else 'java_backend'
         difficulty = data.get('difficulty', 'medium') if data else 'medium'
+
+        if selected_question:
+            if selected_question.get('round_type'):
+                round_type = selected_question.get('round_type')
+            if selected_question.get('position'):
+                position = selected_question.get('position')
+            if selected_question.get('difficulty'):
+                difficulty = selected_question.get('difficulty')
         user_id = data.get('user_id', 'default') if data else 'default'
+        training_mode = str(data.get('training_mode', '')).strip() if data else ''
         session_id = str(data.get('session_id', '')).strip() if data else ''
         if not session_id:
             session_id = uuid.uuid4().hex
@@ -3057,6 +5546,7 @@ def handle_session_start(data=None):
             round_type=round_type,
             position=position,
             difficulty=difficulty,
+            training_mode=training_mode,
         )
         target_session_id = runtime.session_id
 
@@ -3072,6 +5562,26 @@ def handle_session_start(data=None):
         runtime.active_asr_stream_id = f"asr_{session_id}"
         runtime.short_pause_threshold_seconds = SHORT_PAUSE_SECONDS
         runtime.long_pause_threshold_seconds = LONG_PAUSE_SECONDS
+        runtime.auto_end_min_questions = _parse_auto_end_question_limit(
+            (data or {}).get('auto_end_min_questions', AUTO_END_MIN_QUESTIONS),
+            AUTO_END_MIN_QUESTIONS,
+        )
+        runtime.auto_end_max_questions = _parse_auto_end_question_limit(
+            (data or {}).get('auto_end_max_questions', AUTO_END_MAX_QUESTIONS),
+            AUTO_END_MAX_QUESTIONS,
+        )
+        if runtime.auto_end_max_questions < runtime.auto_end_min_questions:
+            runtime.auto_end_max_questions = runtime.auto_end_min_questions
+        runtime.forced_question_id = ''
+        runtime.forced_question_text = ''
+        runtime.forced_question_meta = {}
+        if selected_question:
+            runtime.forced_question_id = str(selected_question.get('id') or '').strip()
+            runtime.forced_question_text = str(selected_question.get('question') or '').strip()
+            runtime.forced_question_meta = {
+                'category': str(selected_question.get('category') or '').strip(),
+                'source': 'manual_selected_question',
+            }
         # 先创建会话主记录，确保后续结构化评估入库不会触发外键失败
         try:
             db_manager.save_interview({
@@ -3093,6 +5603,10 @@ def handle_session_start(data=None):
             requested_round_type=round_type,
             requested_position=position,
             requested_difficulty=difficulty,
+            training_mode=training_mode,
+            forced_question_mode=bool(runtime.forced_question_text),
+            forced_question_id=runtime.forced_question_id,
+            forced_question_preview=(runtime.forced_question_text or '')[:120],
         )
 
         if runtime.data_manager:
@@ -3128,27 +5642,48 @@ def handle_session_start(data=None):
 
         _emit_orchestrator_state(runtime)
 
-        initial_question = ""
+        initial_question = runtime.forced_question_text or ""
+        initial_question_context = _build_initial_interview_context(
+            round_type=round_type,
+            position=position,
+            difficulty=difficulty,
+            training_mode=runtime.training_mode,
+        )
         if llm_manager:
-            rag_context, question_plan = _build_question_rag_context(
-                position=position,
-                difficulty=difficulty,
-                round_type=round_type,
-                interview_state=runtime.interview_state
-            )
-            runtime.last_question_plan = question_plan
-            initial_question = llm_manager.generate_round_question(
-                round_type=round_type,
-                position=position,
-                difficulty=difficulty,
-                rag_context=rag_context
-            )
-            if question_plan and rag_service is not None and getattr(rag_service, 'enabled', False):
-                runtime.interview_state = rag_service.mark_question_asked(
-                    runtime.interview_state,
-                    question_plan
+            if runtime.forced_question_text:
+                runtime.last_question_plan = _build_forced_question_plan(
+                    question_id=runtime.forced_question_id,
+                    question_text=runtime.forced_question_text,
+                    round_type=round_type,
+                    position=position,
+                    difficulty=difficulty,
+                    category=(runtime.forced_question_meta or {}).get('category', ''),
                 )
                 runtime.last_answer_analysis = None
+            else:
+                rag_context, question_plan = _build_question_rag_context(
+                    position=position,
+                    difficulty=difficulty,
+                    round_type=round_type,
+                    context=initial_question_context,
+                    interview_state=runtime.interview_state
+                )
+                runtime.last_question_plan = question_plan
+                reference_question = _extract_question_text_from_plan(question_plan)
+                initial_question = llm_manager.generate_round_question(
+                    round_type=round_type,
+                    position=position,
+                    difficulty=difficulty,
+                    context=initial_question_context,
+                    rag_context=rag_context,
+                    reference_question=reference_question,
+                )
+                if question_plan and rag_service is not None and getattr(rag_service, 'enabled', False):
+                    runtime.interview_state = rag_service.mark_question_asked(
+                        runtime.interview_state,
+                        question_plan
+                    )
+                    runtime.last_answer_analysis = None
 
         if runtime_stale():
             _log_runtime_event(
@@ -3160,11 +5695,40 @@ def handle_session_start(data=None):
             return
 
         runtime = session_registry.get(client_id) or runtime
+        should_use_intro_turn = (
+            str(runtime.training_mode or '').strip().lower() == 'realistic_mock'
+            and not str(runtime.forced_question_text or '').strip()
+        )
+        queued_formal_question = str(initial_question or '').strip()
+        if should_use_intro_turn and not queued_formal_question:
+            queued_formal_question = _build_fallback_first_formal_question(
+                round_type=round_type,
+                position=position,
+            )
+        if should_use_intro_turn:
+            runtime.pending_formal_question = queued_formal_question
+            runtime.pending_formal_question_plan = runtime.last_question_plan
+            initial_question = _build_intro_only_interviewer_message(
+                round_type=round_type,
+                position=position,
+            )
+        elif not queued_formal_question:
+            initial_question = "请先做一个简短自我介绍，然后我们进入正式提问。"
+        else:
+            initial_question = _compose_initial_interviewer_message(
+                question_text=queued_formal_question,
+                round_type=round_type,
+                position=position,
+                training_mode=runtime.training_mode,
+            )
 
         normalized_question = speech_normalizer.normalize(initial_question)
         runtime.next_turn()
         _set_runtime_asr_lock(runtime, False)
+        runtime.current_question_kind = 'intro' if should_use_intro_turn else 'formal'
         runtime.current_question = normalized_question['display_text']
+        if runtime.current_question_kind == 'formal':
+            runtime.formal_question_count += 1
         _track_question_timeline(runtime, runtime.turn_id, normalized_question['spoken_text'] or normalized_question['display_text'])
         runtime.chat_history.append({
             'role': 'interviewer',
@@ -3613,6 +6177,8 @@ def handle_detection_state(data=None):
             'flags': payload.get('flags', []),
             # 兼容前端毫秒时间戳，缺失时回退服务端时间（秒）。
             'timestamp': payload.get('ts') or time.time(),
+            'hr': payload.get('hr'),
+            'rppg_reliable': bool(payload.get('rppg_reliable', False)),
             # 关键镜头指标：用于报告端聚合 3D 关键点/表情系数/头姿/虹膜追踪。
             'camera_insights': camera_insights,
             'landmark_count': payload.get('landmark_count', 0),
@@ -3664,6 +6230,7 @@ def handle_llm_generate_question(data):
             interview_state=runtime.interview_state
         )
         runtime.last_question_plan = question_plan
+        reference_question = _extract_question_text_from_plan(question_plan)
 
         _log_runtime_event(runtime, 'llm_generate_question', position=position, difficulty=difficulty)
 
@@ -3676,7 +6243,8 @@ def handle_llm_generate_question(data):
             position=position,
             difficulty=difficulty,
             context=context,
-            rag_context=rag_context
+            rag_context=rag_context,
+            reference_question=reference_question,
         )
 
         if question:
@@ -3931,6 +6499,26 @@ def _dimension_label_map():
     }
 
 
+def _filter_content_dimensions_by_round(round_type, dimension_map):
+    normalized_round = str(round_type or '').strip().lower()
+    if not isinstance(dimension_map, dict):
+        return {}
+
+    filtered = {}
+    for dim_key, dim_payload in dimension_map.items():
+        if not isinstance(dim_payload, dict):
+            continue
+
+        normalized_key = str(dim_key or '').strip().lower()
+        if normalized_round == 'system_design' and normalized_key == 'clarity':
+            # 系统设计轮次不再将 clarity 归入内容轴，避免和表达轴重复并造成结构性偏低。
+            continue
+
+        filtered[dim_key] = dim_payload
+
+    return filtered
+
+
 def _compact_text(value, limit=120):
     text = re.sub(r'\s+', ' ', str(value or '')).strip()
     if len(text) <= limit:
@@ -4036,6 +6624,7 @@ def _build_camera_insights_snapshot_from_timeline(timeline):
             'blendshapes': {},
             'head_pose': {},
             'iris_tracking': {},
+            'physiology': {},
         }
 
     landmark_counts = []
@@ -4069,6 +6658,10 @@ def _build_camera_insights_snapshot_from_timeline(timeline):
 
     close_frames = 0
     far_frames = 0
+    hr_values = []
+    hr_out_of_range_frames = 0
+    rppg_frames = 0
+    rppg_reliable_frames = 0
 
     for item in rows:
         camera_insights = item.get('camera_insights') if isinstance(item.get('camera_insights'), dict) else {}
@@ -4076,6 +6669,12 @@ def _build_camera_insights_snapshot_from_timeline(timeline):
         blendshapes = camera_insights.get('blendshapes') if isinstance(camera_insights.get('blendshapes'), dict) else {}
         head_pose = camera_insights.get('head_pose') if isinstance(camera_insights.get('head_pose'), dict) else {}
         iris = camera_insights.get('iris_tracking') if isinstance(camera_insights.get('iris_tracking'), dict) else {}
+        hr_raw = item.get('hr')
+        try:
+            hr_value = float(hr_raw) if hr_raw is not None else None
+        except Exception:
+            hr_value = None
+        rppg_reliable = bool(item.get('rppg_reliable', False))
 
         landmark_count = int(_safe_float(landmarks.get('landmark_count'), _safe_float(item.get('landmark_count'), 0)))
         if landmark_count > 0:
@@ -4161,6 +6760,14 @@ def _build_camera_insights_snapshot_from_timeline(timeline):
             gaze_offset_mag = item.get('gaze_offset_magnitude')
         if isinstance(gaze_offset_mag, (int, float)):
             gaze_offsets.append(float(gaze_offset_mag))
+
+        if isinstance(hr_value, (int, float)):
+            hr_values.append(float(hr_value))
+            rppg_frames += 1
+            if rppg_reliable:
+                rppg_reliable_frames += 1
+            if hr_value < 50 or hr_value > 120:
+                hr_out_of_range_frames += 1
 
         gaze_focus = iris.get('gaze_focus_score')
         if not isinstance(gaze_focus, (int, float)):
@@ -4259,6 +6866,14 @@ def _build_camera_insights_snapshot_from_timeline(timeline):
         'low_focus_ratio': round((low_focus_frames / sample_count) * 100.0, 2) if sample_count else 0.0,
         'min_focus_score': round(min_focus_score if gaze_focus_trend_full else 0.0, 2),
     }
+    physiology_summary = {
+        'avg_heart_rate': round(_safe_avg(hr_values), 2) if hr_values else None,
+        'min_heart_rate': round(min(hr_values), 2) if hr_values else None,
+        'max_heart_rate': round(max(hr_values), 2) if hr_values else None,
+        'heart_rate_samples': int(len(hr_values)),
+        'rppg_reliable_ratio': round((rppg_reliable_frames / rppg_frames) * 100.0, 2) if rppg_frames else None,
+        'hr_out_of_range_ratio': round((hr_out_of_range_frames / len(hr_values)) * 100.0, 2) if hr_values else None,
+    }
 
     return {
         'sample_count': sample_count,
@@ -4266,6 +6881,7 @@ def _build_camera_insights_snapshot_from_timeline(timeline):
         'blendshapes': blendshape_snapshot,
         'head_pose': head_pose_snapshot,
         'iris_tracking': iris_snapshot,
+        'physiology': physiology_summary,
         'gaze_focus_summary': gaze_focus_summary,
         'gaze_focus_trend': gaze_focus_trend,
     }
@@ -4351,13 +6967,18 @@ def _build_content_performance_snapshot(interview_id: str, dialogues=None):
             or 0.0
         )
 
-        final_dims = layer2.get('final_dimension_scores') or layer2.get('dimension_scores') or {}
+        final_dims = _filter_content_dimensions_by_round(
+            round_type,
+            layer2.get('final_dimension_scores') or layer2.get('dimension_scores') or {},
+        )
         weak_dims = []
+        content_dimension_scores = []
         for dim_key, dim_payload in (final_dims or {}).items():
             score = float((dim_payload or {}).get('score') or 0.0)
             reason = str((dim_payload or {}).get('reason') or '').strip()
             reason_tags = _classify_reason_tags(dim_key, reason)
             dim_scores.setdefault(dim_key, []).append(score)
+            content_dimension_scores.append(score)
             if reason:
                 dim_reasons.setdefault(dim_key, []).append(reason)
             weak_dims.append({
@@ -4367,6 +6988,8 @@ def _build_content_performance_snapshot(interview_id: str, dialogues=None):
                 'reason': reason,
                 'reason_tags': reason_tags,
             })
+
+        effective_overall_score = _safe_avg(content_dimension_scores) if content_dimension_scores else float(overall_score or 0.0)
 
         weak_dims_sorted = sorted(weak_dims, key=lambda item: float(item.get('score') or 0.0))[:2]
         key_points = layer1.get('key_points') or {}
@@ -4388,7 +7011,7 @@ def _build_content_performance_snapshot(interview_id: str, dialogues=None):
             'round_type': round_type,
             'question_excerpt': _compact_text(question, limit=100),
             'answer_excerpt': _compact_text(answer, limit=180),
-            'overall_score': round(float(overall_score or 0.0), 1),
+            'overall_score': round(float(effective_overall_score or 0.0), 1),
             'weak_dimensions': weak_dims_sorted,
             'reason_tags': sorted({
                 tag
@@ -4554,11 +7177,16 @@ def _build_camera_performance_snapshot(statistics, event_type_counter, top_event
     iris_tracking = deep.get('iris_tracking') if isinstance(deep.get('iris_tracking'), dict) else {}
     blendshapes = deep.get('blendshapes') if isinstance(deep.get('blendshapes'), dict) else {}
     landmarks = deep.get('landmarks_3d') if isinstance(deep.get('landmarks_3d'), dict) else {}
+    physiology = deep.get('physiology') if isinstance(deep.get('physiology'), dict) else {}
 
     avg_gaze_focus = _safe_float(iris_tracking.get('avg_gaze_focus_score'), 0.0)
     high_pose_ratio = _safe_float(head_pose.get('high_pose_ratio'), 0.0)
     avg_blink_rate = _safe_float(blendshapes.get('avg_blink_rate_per_min'), 0.0)
     avg_jaw_open = _safe_float(blendshapes.get('avg_jaw_open'), 0.0)
+    avg_heart_rate = _safe_float(physiology.get('avg_heart_rate'), 0.0)
+    rppg_reliable_ratio = _safe_float(physiology.get('rppg_reliable_ratio'), 0.0)
+    hr_out_of_range_ratio = _safe_float(physiology.get('hr_out_of_range_ratio'), 0.0)
+    heart_rate_samples = int(_safe_float(physiology.get('heart_rate_samples'), 0.0))
 
     focus_score = max(0.0, min(100.0, 100.0 - off_screen_ratio * 2.6 - max(0, total_deviations - 2) * 1.4))
     if avg_gaze_focus > 0:
@@ -4594,6 +7222,15 @@ def _build_camera_performance_snapshot(statistics, event_type_counter, top_event
     drift_jumps = int(_safe_float(iris_tracking.get('drift_jumps'), 0.0))
     if drift_jumps >= 8:
         notes.append(f'虹膜漂移累计 {drift_jumps} 次，核心题回答时眼神稳定性不足。')
+    if heart_rate_samples > 0:
+        if rppg_reliable_ratio >= 60:
+            notes.append(f'平均心率约 {avg_heart_rate:.1f} bpm，生理信号可用率 {rppg_reliable_ratio:.1f}%。')
+        else:
+            notes.append(f'平均心率约 {avg_heart_rate:.1f} bpm，但生理信号可用率仅 {rppg_reliable_ratio:.1f}%，建议保证光线与正脸稳定。')
+        if hr_out_of_range_ratio >= 40:
+            notes.append(f'心率偏离常见区间帧占比 {hr_out_of_range_ratio:.1f}%，可结合呼吸节奏与表达节奏做稳定训练。')
+    else:
+        notes.append('当前会话未采集到稳定心率信号，建议保持正脸、光线均匀并减少快速位移。')
     avg_landmark_count = _safe_float(landmarks.get('avg_landmark_count'), 0.0)
     tracked_count_max = int(_safe_float(blendshapes.get('tracked_count_max'), 0.0))
     if avg_landmark_count < 468 or tracked_count_max < 40:
@@ -4613,6 +7250,9 @@ def _build_camera_performance_snapshot(statistics, event_type_counter, top_event
             'total_mouth_open': total_mouth_open,
             'total_multi_person': total_multi_person,
             'off_screen_ratio': round(off_screen_ratio, 2),
+            'avg_heart_rate': round(avg_heart_rate, 2) if heart_rate_samples > 0 else None,
+            'rppg_reliable_ratio': round(rppg_reliable_ratio, 2) if heart_rate_samples > 0 else None,
+            'heart_rate_samples': heart_rate_samples,
         },
         'camera_insights': deep,
         'event_type_breakdown': [
@@ -4624,8 +7264,12 @@ def _build_camera_performance_snapshot(statistics, event_type_counter, top_event
     }
 
 
-def _build_legacy_score_breakdown_from_dimensions(dimension_items):
+def _build_legacy_score_breakdown_from_dimensions(dimension_items, speech_dimensions=None):
     score_map = {item.get('key'): float(item.get('score', 0.0) or 0.0) for item in (dimension_items or [])}
+    speech_map = {
+        str(key or '').strip(): _safe_float(value)
+        for key, value in ((speech_dimensions or {}) if isinstance(speech_dimensions, dict) else {}).items()
+    }
 
     def _pick_score(*keys):
         for key in keys:
@@ -4633,11 +7277,21 @@ def _build_legacy_score_breakdown_from_dimensions(dimension_items):
                 return round(float(score_map.get(key, 0.0) or 0.0), 1)
         return 0.0
 
+    expression_clarity = _pick_score('clarity', 'communication', 'expression_clarity')
+    if expression_clarity <= 0.0 and speech_map:
+        speech_fallback = (
+            speech_map.get('clarity_score')
+            if isinstance(speech_map.get('clarity_score'), (int, float))
+            else speech_map.get('fluency_score')
+        )
+        if isinstance(speech_fallback, (int, float)):
+            expression_clarity = round(max(0.0, min(100.0, float(speech_fallback))), 1)
+
     return {
         'technical_correctness': _pick_score('technical_accuracy', 'technical_correctness'),
         'knowledge_depth': _pick_score('knowledge_depth'),
         'logical_rigor': _pick_score('logic', 'logical_rigor'),
-        'expression_clarity': _pick_score('clarity', 'communication', 'expression_clarity'),
+        'expression_clarity': expression_clarity,
         'job_match': _pick_score('job_match'),
         'adaptability': _pick_score('reflection', 'tradeoff_awareness', 'adaptability'),
     }
@@ -4693,10 +7347,13 @@ def _build_growth_report_v2(dialogues, evaluation_rows=None, speech_rows=None):
             layer1 = row.get('layer1') or {}
             layer2 = row.get('layer2') or {}
             text_base_dim_scores = (layer2.get('text_base_dimension_scores') or {})
-            dim_scores = (layer2.get('final_dimension_scores') or layer2.get('dimension_scores') or {})
+            round_type = str(row.get('round_type') or 'technical')
+            dim_scores = _filter_content_dimensions_by_round(
+                round_type,
+                layer2.get('final_dimension_scores') or layer2.get('dimension_scores') or {},
+            )
             speech_adjustments = (layer2.get('speech_adjustments') or {})
             summary = (layer2.get('summary') or {})
-            round_type = str(row.get('round_type') or 'technical')
             turn_id = str(row.get('turn_id') or '').strip()
             overall_score = float(
                 layer2.get('overall_score_final')
@@ -4871,7 +7528,10 @@ def _build_growth_report_v2(dialogues, evaluation_rows=None, speech_rows=None):
                 ],
             })
 
-        score_breakdown = _build_legacy_score_breakdown_from_dimensions(dimension_items)
+        score_breakdown = _build_legacy_score_breakdown_from_dimensions(
+            dimension_items,
+            speech_dimensions=speech_summary.get('dimensions') if isinstance(speech_summary, dict) else {},
+        )
 
         round_breakdown = [
             {
@@ -5136,6 +7796,7 @@ def _build_structured_snapshot(interview_id: str, dialogues=None):
         status = str(row.get('status') or 'unknown').strip().lower() or 'unknown'
         status_counts[status] += 1
         turn_id = str(row.get('turn_id') or '').strip()
+        round_type = str(row.get('round_type') or 'technical').strip() or 'technical'
 
         layer2 = row.get('layer2') or {}
         score_value = (
@@ -5147,12 +7808,14 @@ def _build_structured_snapshot(interview_id: str, dialogues=None):
         if status in valid_score_status and isinstance(score_value, (int, float)):
             score = _clamp_score(score_value)
             all_scores.append(score)
-            round_type = str(row.get('round_type') or 'technical').strip() or 'technical'
             round_scores.setdefault(round_type, []).append(score)
             if turn_id:
                 scored_turns.add(turn_id)
 
-        dim_map = layer2.get('final_dimension_scores') or layer2.get('dimension_scores') or {}
+        dim_map = _filter_content_dimensions_by_round(
+            round_type,
+            layer2.get('final_dimension_scores') or layer2.get('dimension_scores') or {},
+        )
         for dim_key, dim_payload in (dim_map or {}).items():
             dim_score = (dim_payload or {}).get('score')
             if isinstance(dim_score, (int, float)):
@@ -5532,6 +8195,8 @@ def _build_immediate_report_payload(interview_id: str):
                 'total_multi_person': int((statistics or {}).get('total_multi_person') or 0),
                 'off_screen_ratio': float((statistics or {}).get('off_screen_ratio') or 0.0),
                 'frames_processed': int((statistics or {}).get('frames_processed') or 0),
+                'avg_heart_rate': float((statistics or {}).get('avg_heart_rate')) if isinstance((statistics or {}).get('avg_heart_rate'), (int, float)) else None,
+                'rppg_reliable_ratio': float((statistics or {}).get('rppg_reliable_ratio')) if isinstance((statistics or {}).get('rppg_reliable_ratio'), (int, float)) else None,
             },
         },
         'structured_evaluation': structured_snapshot,
@@ -5565,10 +8230,102 @@ def _round_label_for_insights(round_type):
     return '未标记'
 
 
+def _canonical_training_position(position):
+    raw = str(position or '').strip()
+    normalized = raw.lower()
+    if not normalized:
+        return 'java_backend'
+
+    if normalized in {'java_backend', 'frontend', 'test_engineer', 'agent_developer', 'product_manager', 'algorithm', 'devops'}:
+        return normalized
+
+    if (
+        normalized in {'backend', 'backend_engineer', 'java', 'java后端', '后端开发工程师', 'java后端工程师'}
+        or ('backend' in normalized and 'front' not in normalized)
+        or ('后端' in raw)
+    ):
+        return 'java_backend'
+
+    if normalized in {'frontend_engineer', 'web_frontend', 'web_frontend_engineer', 'qianduan'} or ('frontend' in normalized) or ('前端' in raw):
+        return 'frontend'
+
+    if normalized in {'software_test', 'software_test_engineer', 'qa', 'qa_engineer', 'test_engineer'} or ('测试' in raw):
+        return 'test_engineer'
+
+    if normalized in {'agent开发', 'agent开发工程师', 'data_engineer'} or ('agent' in normalized) or ('智能体' in raw) or ('数据工程' in raw):
+        return 'agent_developer'
+
+    if normalized in {'product_manager', 'pm'} or ('product' in normalized and 'manager' in normalized) or ('产品' in raw):
+        return 'product_manager'
+
+    if normalized in {'algorithm_engineer', 'algorithm'} or ('algorithm' in normalized) or ('算法' in raw):
+        return 'algorithm'
+
+    return normalized
+
+
+def _build_training_task_id(plan_id: str, round_type: str, priority: int, from_task_id: str = '') -> str:
+    seed = f"{str(plan_id or '').strip()}|{str(round_type or '').strip().lower()}|{int(priority or 0)}|{str(from_task_id or '').strip()}"
+    digest = hashlib.md5(seed.encode('utf-8')).hexdigest()[:24]
+    return f"task_{digest}"
+
+
+def _training_status_rank(status: str) -> int:
+    mapping = {
+        'completed': 7,
+        'validation': 6,
+        'training': 5,
+        'reflow': 4,
+        'planned': 3,
+        'rolled_over': 2,
+    }
+    return mapping.get(str(status or '').strip().lower(), 1)
+
+
+def _dedupe_training_tasks(task_rows):
+    deduped = {}
+    for item in (task_rows or []):
+        task = dict(item or {})
+        round_type = _normalize_round_type(task.get('round_type')) or str(task.get('round_type') or '').strip().lower()
+        priority = int(task.get('priority') or 0)
+        from_task_id = str(task.get('from_task_id') or '').strip()
+        key = (round_type, priority, from_task_id)
+
+        current = deduped.get(key)
+        if not current:
+            deduped[key] = task
+            continue
+
+        current_status_rank = _training_status_rank(current.get('status'))
+        next_status_rank = _training_status_rank(task.get('status'))
+        if next_status_rank > current_status_rank:
+            deduped[key] = task
+            continue
+
+        if next_status_rank == current_status_rank:
+            current_updated = _parse_db_datetime(current.get('updated_at') or current.get('created_at')) or datetime.min
+            next_updated = _parse_db_datetime(task.get('updated_at') or task.get('created_at')) or datetime.min
+            if next_updated > current_updated:
+                deduped[key] = task
+
+    return sorted(
+        list(deduped.values()),
+        key=lambda row: (
+            int((row or {}).get('priority') or 0),
+            _parse_db_datetime((row or {}).get('created_at') or '') or datetime.min,
+            str((row or {}).get('task_id') or ''),
+        ),
+    )
+
+
 def _position_label_for_insights(position):
     normalized = str(position or '').strip().lower()
     if not normalized:
         return '当前目标岗位'
+    if normalized in {'test_engineer', 'software_test', 'software_test_engineer', 'qa', 'qa_engineer', '测试工程师', '软件测试工程师'}:
+        return '软件测试工程师'
+    if normalized in {'agent_developer', 'agent开发', 'agent开发工程师', 'data_engineer', '数据工程师'}:
+        return 'Agent开发工程师'
     if normalized in {'frontend', 'frontend_engineer', 'web_frontend', 'web_frontend_engineer'}:
         return '前端开发工程师'
     if normalized in {'product_manager', 'pm'}:
@@ -5578,6 +8335,135 @@ def _position_label_for_insights(position):
     if normalized in {'backend', 'backend_engineer', 'java_backend'}:
         return '后端开发工程师'
     return str(position).strip()
+
+
+def _parse_week_anchor(raw_value):
+    text = str(raw_value or '').strip()
+    if not text:
+        return datetime.now()
+    try:
+        return datetime.strptime(text, '%Y-%m-%d')
+    except Exception:
+        return datetime.now()
+
+
+def _build_week_range(anchor: datetime):
+    safe_anchor = anchor or datetime.now()
+    week_start = (safe_anchor - timedelta(days=safe_anchor.weekday())).date()
+    week_end = (week_start + timedelta(days=6))
+    return week_start, week_end
+
+
+def _training_status_label(status: str) -> str:
+    normalized = str(status or '').strip().lower()
+    return TRAINING_STATUS_LABELS.get(normalized, '未知状态')
+
+
+def _normalize_training_task_row(row):
+    task = dict(row or {})
+    task_status = str(task.get('status') or 'planned').strip().lower() or 'planned'
+    task_round = _normalize_round_type(task.get('round_type'))
+    task_position = _canonical_training_position(task.get('position'))
+    task_payload = {
+        **task,
+        'task_id': str(task.get('task_id') or '').strip(),
+        'round_type': task_round,
+        'round_label': _round_label_for_insights(task_round),
+        'position': task_position,
+        'position_label': _position_label_for_insights(task_position),
+        'difficulty': _normalize_interview_difficulty(task.get('difficulty')) or 'medium',
+        'status': task_status,
+        'status_label': _training_status_label(task_status),
+        'goal_score': float(task.get('goal_score') or 75),
+        'last_score': float(task.get('last_score')) if isinstance(task.get('last_score'), (int, float)) else None,
+    }
+    return task_payload
+
+
+def _build_training_stage_summary(tasks):
+    counters = {
+        'planned': 0,
+        'training': 0,
+        'validation': 0,
+        'reflow': 0,
+        'completed': 0,
+    }
+    for item in tasks or []:
+        status = str((item or {}).get('status') or '').strip().lower()
+        if status in counters:
+            counters[status] += 1
+    counters['total'] = len(tasks or [])
+    return counters
+
+
+def _pick_training_round_sequence(insights_payload):
+    default_rounds = list(INSIGHTS_TRACKED_ROUNDS)
+    profile = (insights_payload or {}).get('cross_round_profile') if isinstance((insights_payload or {}).get('cross_round_profile'), dict) else {}
+    coverage = profile.get('round_coverage') if isinstance(profile.get('round_coverage'), list) else []
+    if not coverage:
+        return default_rounds
+
+    sortable = []
+    for item in coverage:
+        round_type = _normalize_round_type(item.get('round_type'))
+        if not round_type:
+            continue
+        count = int(item.get('count') or 0)
+        status = str(item.get('status') or '').strip().lower()
+        sortable.append((0 if status == 'insufficient' else 1, count, round_type))
+
+    sortable.sort(key=lambda x: (x[0], x[1]))
+    ordered = [item[2] for item in sortable]
+    for round_type in default_rounds:
+        if round_type not in ordered:
+            ordered.append(round_type)
+    return ordered[:len(default_rounds)]
+
+
+def _build_training_seed_tasks(plan_id: str, user_id: str, target_position: str, insights_payload):
+    round_sequence = _pick_training_round_sequence(insights_payload)
+    ai_summary = (insights_payload or {}).get('ai_summary') if isinstance((insights_payload or {}).get('ai_summary'), dict) else {}
+    primary_gap = ai_summary.get('primary_gap') if isinstance(ai_summary.get('primary_gap'), dict) else {}
+    focus_label = str(primary_gap.get('title') or '').strip() or '核心短板修正'
+    normalized_position = _canonical_training_position(target_position)
+    tasks = []
+    for index, round_type in enumerate(round_sequence):
+        round_label = _round_label_for_insights(round_type)
+        priority = index + 1
+        tasks.append({
+            'task_id': _build_training_task_id(plan_id=plan_id, round_type=round_type, priority=priority),
+            'plan_id': plan_id,
+            'user_id': user_id,
+            'title': f"{round_label}专项训练",
+            'round_type': round_type,
+            'position': normalized_position,
+            'difficulty': 'medium',
+            'focus_key': str(round_type or ''),
+            'focus_label': focus_label,
+            'goal_score': 75,
+            'status': 'planned',
+            'priority': priority,
+            'from_task_id': '',
+            'due_at': '',
+        })
+    return tasks
+
+
+def _serialize_training_plan_payload(plan_row, task_rows):
+    normalized_plan = dict(plan_row or {})
+    target_position = _canonical_training_position(normalized_plan.get('target_position'))
+    deduped_tasks = _dedupe_training_tasks(task_rows)
+    normalized_tasks = [_normalize_training_task_row(item) for item in deduped_tasks]
+    return {
+        'plan': {
+            **normalized_plan,
+            'target_position': target_position,
+            'target_position_label': _position_label_for_insights(target_position),
+            'status_label': _training_status_label(str(normalized_plan.get('status') or '').strip().lower() or 'active'),
+        },
+        'tasks': normalized_tasks,
+        'stage_summary': _build_training_stage_summary(normalized_tasks),
+    }
 
 
 def _extract_dimension_score_for_insights(dimension_items, target_key):
@@ -5668,14 +8554,25 @@ def _build_insight_item_from_payload(interview_row, report_payload=None):
         score = fusion.get('overall_score')
     if not isinstance(score, (int, float)):
         score = structured.get('overall_score')
+    if not isinstance(score, (int, float)):
+        row_score = (interview_row or {}).get('overall_score')
+        if isinstance(row_score, (int, float)):
+            score = row_score
     score = float(score) if isinstance(score, (int, float)) else None
 
     risk_probability = (((report_payload.get('anti_cheat') or {}) if isinstance(report_payload, dict) else {}).get('max_probability'))
     risk_score = None
     if isinstance(risk_probability, (int, float)):
         risk_score = max(0.0, min(100.0, float(risk_probability) * 100.0))
+    if not isinstance(risk_score, (int, float)):
+        row_risk_probability = (interview_row or {}).get('max_probability')
+        if isinstance(row_risk_probability, (int, float)):
+            row_risk = float(row_risk_probability)
+            risk_score = max(0.0, min(100.0, row_risk if row_risk > 1.0 else row_risk * 100.0))
 
     stability_score = interview_stability.get('avg_consistency_score')
+    if not isinstance(stability_score, (int, float)):
+        stability_score = (profile or {}).get('round_consistency_score')
     stability_score = float(stability_score) if isinstance(stability_score, (int, float)) else None
 
     content_score = (profile or {}).get('round_content_score')
@@ -5762,14 +8659,69 @@ def _build_insights_signature(interviews):
     return hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode('utf-8')).hexdigest()
 
 
+def _insights_avg_or_none(values):
+    valid = [float(value) for value in (values or []) if isinstance(value, (int, float))]
+    if not valid:
+        return None
+    return round(sum(valid) / len(valid), 1)
+
+
+def _insights_has_metric_signal(item):
+    return any(
+        isinstance((item or {}).get(key), (int, float))
+        for key in ('score', 'stability_score', 'risk_score')
+    )
+
+
+def _select_recent_metric_items(items, limit=INSIGHTS_RECENT_LIMIT):
+    ordered_desc = sorted(
+        [item for item in (items or []) if str((item or {}).get('interview_id') or '').strip()],
+        key=lambda item: _parse_db_datetime((item or {}).get('created_at')) or datetime.min,
+        reverse=True,
+    )
+    if not ordered_desc:
+        return []
+
+    selected = []
+    seen_ids = set()
+
+    def append_item(candidate):
+        interview_id = str((candidate or {}).get('interview_id') or '').strip()
+        if not interview_id or interview_id in seen_ids:
+            return
+        seen_ids.add(interview_id)
+        selected.append(candidate)
+
+    for candidate in ordered_desc:
+        if isinstance((candidate or {}).get('score'), (int, float)):
+            append_item(candidate)
+        if len(selected) >= int(limit):
+            break
+
+    if len(selected) < int(limit):
+        for candidate in ordered_desc:
+            if _insights_has_metric_signal(candidate):
+                append_item(candidate)
+            if len(selected) >= int(limit):
+                break
+
+    if not selected:
+        selected = ordered_desc[: int(limit)]
+
+    return sorted(
+        selected[: int(limit)],
+        key=lambda item: _parse_db_datetime((item or {}).get('created_at')) or datetime.min,
+    )
+
+
 def _build_insights_recent_metrics(items):
     ordered = sorted(
         [item for item in (items or []) if str(item.get('interview_id') or '').strip()],
         key=lambda item: _parse_db_datetime(item.get('created_at')) or datetime.min
     )
-    average_score = round(_safe_avg([item.get('score') for item in ordered]), 1) if ordered else None
-    average_stability = round(_safe_avg([item.get('stability_score') for item in ordered]), 1) if ordered else None
-    average_risk = round(_safe_avg([item.get('risk_score') for item in ordered]), 1) if ordered else None
+    average_score = _insights_avg_or_none([item.get('score') for item in ordered]) if ordered else None
+    average_stability = _insights_avg_or_none([item.get('stability_score') for item in ordered]) if ordered else None
+    average_risk = _insights_avg_or_none([item.get('risk_score') for item in ordered]) if ordered else None
     delta_from_previous = None
     if len(ordered) >= 2:
         latest = ordered[-1].get('score')
@@ -5785,9 +8737,9 @@ def _build_insights_recent_metrics(items):
             'risk': average_risk,
         },
         'axis_averages': {
-            'content': round(_safe_avg([item.get('content_score') for item in ordered]), 1) if ordered else None,
-            'delivery': round(_safe_avg([item.get('delivery_score') for item in ordered]), 1) if ordered else None,
-            'presence': round(_safe_avg([item.get('presence_score') for item in ordered]), 1) if ordered else None,
+            'content': _insights_avg_or_none([item.get('content_score') for item in ordered]) if ordered else None,
+            'delivery': _insights_avg_or_none([item.get('delivery_score') for item in ordered]) if ordered else None,
+            'presence': _insights_avg_or_none([item.get('presence_score') for item in ordered]) if ordered else None,
         },
         'delta_from_previous': delta_from_previous,
     }
@@ -6222,9 +9174,9 @@ def _build_insights_summary_payload():
         if time.time() - cached_at <= INSIGHTS_CACHE_TTL_SECONDS:
             return cached.get('payload')
 
-    recent_rows = interviews[:INSIGHTS_RECENT_LIMIT]
+    recent_scan_rows = interviews[:max(INSIGHTS_RECENT_LIMIT, INSIGHTS_RECENT_SCAN_LIMIT)]
     sample_candidates_by_round = _build_cross_round_sample_candidates(interviews)
-    selected_rows = {str((item or {}).get('interview_id') or '').strip(): item for item in recent_rows}
+    selected_rows = {str((item or {}).get('interview_id') or '').strip(): item for item in recent_scan_rows}
     for round_items in sample_candidates_by_round.values():
         for item in round_items:
             selected_rows[str((item or {}).get('interview_id') or '').strip()] = item
@@ -6236,10 +9188,11 @@ def _build_insights_summary_payload():
         report_payloads[interview_id] = payload or {}
         enriched_items[interview_id] = _build_insight_item_from_payload(interview_row, payload)
 
-    recent_items = [
+    recent_scan_items = [
         enriched_items.get(str((item or {}).get('interview_id') or '').strip()) or _build_insight_item_from_payload(item, None)
-        for item in recent_rows
+        for item in recent_scan_rows
     ]
+    recent_items = _select_recent_metric_items(recent_scan_items, INSIGHTS_RECENT_LIMIT)
     weekly_distribution = _build_insights_weekly_distribution(interviews)
 
     sample_items = []
@@ -7062,6 +10015,439 @@ def get_insights_summary():
         }), 500
 
 
+@app.route('/api/training/weekly-plan')
+def get_training_weekly_plan():
+    """获取或自动生成本周训练计划。"""
+    try:
+        if not hasattr(db_manager, 'get_training_plan_bundle'):
+            return jsonify({'success': False, 'error': 'training api unavailable'}), 503
+
+        user_id = str(request.args.get('user_id', 'default') or 'default').strip() or 'default'
+        anchor = _parse_week_anchor(request.args.get('week_start_date', ''))
+        week_start, week_end = _build_week_range(anchor)
+        week_start_text = week_start.strftime('%Y-%m-%d')
+        week_end_text = week_end.strftime('%Y-%m-%d')
+
+        bundle = db_manager.get_training_plan_bundle(user_id=user_id, week_start_date=week_start_text)
+        plan = (bundle or {}).get('plan')
+        tasks = (bundle or {}).get('tasks') or []
+
+        insights_payload = {}
+        if not plan or not tasks:
+            try:
+                insights_payload = _build_insights_summary_payload() or {}
+            except Exception:
+                insights_payload = {}
+
+        if not plan:
+            profile = insights_payload.get('cross_round_profile') if isinstance(insights_payload.get('cross_round_profile'), dict) else {}
+            target_position = _canonical_training_position(profile.get('target_position'))
+            plan_result = db_manager.upsert_training_week_plan({
+                'plan_id': f"plan_{uuid.uuid4().hex}",
+                'user_id': user_id,
+                'week_start_date': week_start_text,
+                'week_end_date': week_end_text,
+                'target_position': target_position,
+                'status': 'active',
+                'source_summary_json': json.dumps({
+                    'target_position': target_position,
+                    'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                }, ensure_ascii=False),
+            })
+            if not plan_result.get('success'):
+                return jsonify({'success': False, 'error': plan_result.get('error') or 'create weekly plan failed'}), 500
+            plan = plan_result.get('plan') or {}
+
+        if not tasks:
+            target_position = _canonical_training_position((plan or {}).get('target_position'))
+            generated_tasks = _build_training_seed_tasks(
+                plan_id=str((plan or {}).get('plan_id') or '').strip(),
+                user_id=user_id,
+                target_position=target_position,
+                insights_payload=insights_payload,
+            )
+            insert_result = db_manager.insert_training_tasks(generated_tasks)
+            if not insert_result.get('success'):
+                return jsonify({'success': False, 'error': insert_result.get('error') or 'create training tasks failed'}), 500
+            bundle = db_manager.get_training_plan_bundle(user_id=user_id, week_start_date=week_start_text)
+            plan = (bundle or {}).get('plan') or plan
+            tasks = (bundle or {}).get('tasks') or []
+
+        payload = _serialize_training_plan_payload(plan, tasks)
+        return jsonify({
+            'success': True,
+            'week_start_date': week_start_text,
+            'week_end_date': week_end_text,
+            **payload,
+        })
+    except Exception as e:
+        logger.error(f"获取训练周计划失败：{e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/training/tasks/<task_id>/start-training', methods=['POST'])
+def start_training_task(task_id):
+    """将任务置为训练中，并返回题库过滤参数。"""
+    try:
+        if not hasattr(db_manager, 'get_training_task'):
+            return jsonify({'success': False, 'error': 'training api unavailable'}), 503
+
+        normalized_task_id = str(task_id or '').strip()
+        task = db_manager.get_training_task(normalized_task_id)
+        if not task:
+            return jsonify({'success': False, 'error': 'task not found'}), 404
+
+        update_result = db_manager.update_training_task_status(
+            normalized_task_id,
+            status='training',
+            set_training_started=True,
+        )
+        if not update_result.get('success'):
+            return jsonify({'success': False, 'error': update_result.get('error') or 'update task failed'}), 500
+
+        refreshed = db_manager.get_training_task(normalized_task_id) or task
+        normalized_task = _normalize_training_task_row(refreshed)
+        db_manager.create_training_task_attempt({
+            'attempt_id': f"attempt_{uuid.uuid4().hex}",
+            'task_id': normalized_task_id,
+            'user_id': str(normalized_task.get('user_id') or 'default').strip() or 'default',
+            'attempt_type': 'training_start',
+            'interview_id': '',
+            'score': None,
+            'passed': None,
+            'notes': 'start training',
+        })
+
+        round_type = str(normalized_task.get('round_type') or 'technical').strip()
+        position = _canonical_training_position(normalized_task.get('position'))
+        difficulty = str(normalized_task.get('difficulty') or 'medium').strip()
+        strict_bank = db_manager.get_question_bank(
+            round_type=round_type or None,
+            position=position or None,
+            difficulty=difficulty or None,
+        )
+        has_strict_questions = bool(strict_bank)
+        fallback_filter = None
+        if not has_strict_questions:
+            fallback_bank = db_manager.get_question_bank(
+                round_type=None,
+                position=position or None,
+                difficulty=difficulty or None,
+            )
+            if fallback_bank:
+                fallback_filter = {
+                    'round_type': '',
+                    'position': position,
+                    'difficulty': difficulty,
+                }
+
+        navigate_url = (
+            f"/dashboard/questions?round_type={round_type}&position={position}"
+            f"&difficulty={difficulty}&training_task_id={normalized_task_id}"
+        )
+        if fallback_filter:
+            navigate_url = (
+                f"/dashboard/questions?position={position}&difficulty={difficulty}"
+                f"&training_task_id={normalized_task_id}"
+            )
+
+        return jsonify({
+            'success': True,
+            'task': normalized_task,
+            'question_filter': {
+                'round_type': round_type,
+                'position': position,
+                'difficulty': difficulty,
+                'focus_label': str(normalized_task.get('focus_label') or '').strip(),
+            },
+            'fallback_filter': fallback_filter,
+            'navigate_url': navigate_url,
+        })
+    except Exception as e:
+        logger.error(f"开启训练任务失败：{e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/training/tasks/<task_id>/start-validation', methods=['POST'])
+def start_validation_task(task_id):
+    """将任务置为待验收，并返回 3 题短测配置。"""
+    try:
+        if not hasattr(db_manager, 'get_training_task'):
+            return jsonify({'success': False, 'error': 'training api unavailable'}), 503
+
+        normalized_task_id = str(task_id or '').strip()
+        task = db_manager.get_training_task(normalized_task_id)
+        if not task:
+            return jsonify({'success': False, 'error': 'task not found'}), 404
+
+        update_result = db_manager.update_training_task_status(
+            normalized_task_id,
+            status='validation',
+            set_validation_started=True,
+        )
+        if not update_result.get('success'):
+            return jsonify({'success': False, 'error': update_result.get('error') or 'update task failed'}), 500
+
+        refreshed = db_manager.get_training_task(normalized_task_id) or task
+        normalized_task = _normalize_training_task_row(refreshed)
+
+        question_bank = db_manager.get_question_bank(
+            round_type=normalized_task.get('round_type') or None,
+            position=normalized_task.get('position') or None,
+            difficulty=normalized_task.get('difficulty') or None,
+        )
+        fallback_applied = False
+        if not question_bank:
+            question_bank = db_manager.get_question_bank(
+                round_type=None,
+                position=normalized_task.get('position') or None,
+                difficulty=normalized_task.get('difficulty') or None,
+            )
+            fallback_applied = bool(question_bank)
+        preview_questions = [
+            {
+                'id': str(item.get('id') or '').strip(),
+                'question': str(item.get('question') or '').strip(),
+                'category': str(item.get('category') or '').strip(),
+            }
+            for item in (question_bank or [])[:TRAINING_VALIDATION_QUESTION_COUNT]
+            if str(item.get('question') or '').strip()
+        ]
+
+        db_manager.create_training_task_attempt({
+            'attempt_id': f"attempt_{uuid.uuid4().hex}",
+            'task_id': normalized_task_id,
+            'user_id': str(normalized_task.get('user_id') or 'default').strip() or 'default',
+            'attempt_type': 'validation_start',
+            'interview_id': '',
+            'score': None,
+            'passed': None,
+            'notes': 'start validation',
+        })
+
+        return jsonify({
+            'success': True,
+            'task': normalized_task,
+            'fallback_applied': fallback_applied,
+            'validation_questions_preview': preview_questions,
+            'interview_config': {
+                'round': str(normalized_task.get('round_type') or 'technical').strip() or 'technical',
+                'position': _canonical_training_position(normalized_task.get('position')),
+                'difficulty': str(normalized_task.get('difficulty') or 'medium').strip() or 'medium',
+                'trainingTaskId': normalized_task_id,
+                'trainingMode': 'coach_drill',
+                'auto_end_min_questions': TRAINING_VALIDATION_QUESTION_COUNT,
+                'auto_end_max_questions': TRAINING_VALIDATION_QUESTION_COUNT,
+            },
+            'navigate_url': '/interview',
+        })
+    except Exception as e:
+        logger.error(f"开启验收任务失败：{e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/training/tasks/<task_id>/mark-result', methods=['POST'])
+def mark_training_task_result(task_id):
+    """记录任务验收结果（达标/未达标）。"""
+    try:
+        if not hasattr(db_manager, 'get_training_task'):
+            return jsonify({'success': False, 'error': 'training api unavailable'}), 503
+
+        payload = request.get_json(silent=True) or {}
+        normalized_task_id = str(task_id or '').strip()
+        task = db_manager.get_training_task(normalized_task_id)
+        if not task:
+            return jsonify({'success': False, 'error': 'task not found'}), 404
+
+        raw_passed = payload.get('passed')
+        if isinstance(raw_passed, bool):
+            passed = raw_passed
+        else:
+            passed = str(raw_passed or '').strip().lower() in {'1', 'true', 'yes', 'pass', 'passed'}
+
+        score_value = payload.get('score')
+        score = None
+        if isinstance(score_value, (int, float)):
+            score = float(score_value)
+        else:
+            try:
+                if str(score_value or '').strip() != '':
+                    score = float(score_value)
+            except Exception:
+                score = None
+
+        interview_id = str(payload.get('interview_id') or '').strip()
+        notes = str(payload.get('notes') or '').strip()
+        status = 'completed' if passed else 'reflow'
+
+        update_result = db_manager.update_training_task_status(
+            normalized_task_id,
+            status=status,
+            last_score=score,
+            last_interview_id=interview_id,
+        )
+        if not update_result.get('success'):
+            return jsonify({'success': False, 'error': update_result.get('error') or 'update task failed'}), 500
+
+        user_id = str(task.get('user_id') or 'default').strip() or 'default'
+        db_manager.create_training_task_attempt({
+            'attempt_id': f"attempt_{uuid.uuid4().hex}",
+            'task_id': normalized_task_id,
+            'user_id': user_id,
+            'attempt_type': 'validation_result',
+            'interview_id': interview_id,
+            'score': score,
+            'passed': 1 if passed else 0,
+            'notes': notes,
+        })
+        db_manager.create_training_task_validation({
+            'validation_id': f"validation_{uuid.uuid4().hex}",
+            'task_id': normalized_task_id,
+            'user_id': user_id,
+            'validation_interview_id': interview_id,
+            'score': score,
+            'passed': 1 if passed else 0,
+            'decision': 'pass' if passed else 'reflow',
+        })
+
+        refreshed = db_manager.get_training_task(normalized_task_id) or task
+        return jsonify({
+            'success': True,
+            'task': _normalize_training_task_row(refreshed),
+        })
+    except Exception as e:
+        logger.error(f"记录训练任务结果失败：{e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/training/tasks/reflow', methods=['POST'])
+def reflow_training_tasks():
+    """将未达标任务回流到下周计划。"""
+    try:
+        if not hasattr(db_manager, 'get_training_plan_bundle'):
+            return jsonify({'success': False, 'error': 'training api unavailable'}), 503
+
+        payload = request.get_json(silent=True) or {}
+        user_id = str(payload.get('user_id') or 'default').strip() or 'default'
+        source_anchor = _parse_week_anchor(payload.get('week_start_date', ''))
+        source_week_start, source_week_end = _build_week_range(source_anchor)
+        source_start_text = source_week_start.strftime('%Y-%m-%d')
+
+        source_bundle = db_manager.get_training_plan_bundle(user_id=user_id, week_start_date=source_start_text)
+        source_plan = (source_bundle or {}).get('plan')
+        source_tasks = (source_bundle or {}).get('tasks') or []
+        if not source_plan:
+            return jsonify({'success': False, 'error': 'source weekly plan not found'}), 404
+
+        reflow_candidates = [
+            item for item in source_tasks
+            if str((item or {}).get('status') or '').strip().lower() == 'reflow'
+        ]
+        if not reflow_candidates:
+            return jsonify({
+                'success': True,
+                'created_count': 0,
+                'message': '当前周无待回流任务',
+            })
+
+        next_week_anchor = datetime.combine(source_week_start, datetime.min.time()) + timedelta(days=7)
+        next_week_start, next_week_end = _build_week_range(next_week_anchor)
+        next_start_text = next_week_start.strftime('%Y-%m-%d')
+        next_end_text = next_week_end.strftime('%Y-%m-%d')
+
+        next_bundle = db_manager.get_training_plan_bundle(user_id=user_id, week_start_date=next_start_text)
+        next_plan = (next_bundle or {}).get('plan')
+        next_tasks = (next_bundle or {}).get('tasks') or []
+
+        if not next_plan:
+            target_position = _canonical_training_position((source_plan or {}).get('target_position'))
+            create_next_plan_result = db_manager.upsert_training_week_plan({
+                'plan_id': f"plan_{uuid.uuid4().hex}",
+                'user_id': user_id,
+                'week_start_date': next_start_text,
+                'week_end_date': next_end_text,
+                'target_position': target_position,
+                'status': 'active',
+                'source_summary_json': json.dumps({
+                    'generated_by': 'reflow',
+                    'from_week': source_start_text,
+                }, ensure_ascii=False),
+            })
+            if not create_next_plan_result.get('success'):
+                return jsonify({'success': False, 'error': create_next_plan_result.get('error') or 'create next weekly plan failed'}), 500
+            next_plan = create_next_plan_result.get('plan') or {}
+            next_tasks = []
+
+        existing_from_task_ids = {
+            str(item.get('from_task_id') or '').strip()
+            for item in next_tasks
+            if str(item.get('from_task_id') or '').strip()
+        }
+
+        prepared_tasks = []
+        for index, item in enumerate(reflow_candidates, start=1):
+            source_task_id = str(item.get('task_id') or '').strip()
+            if source_task_id in existing_from_task_ids:
+                continue
+            round_type = _normalize_round_type(item.get('round_type')) or 'technical'
+            priority = int(item.get('priority') or index)
+            prepared_tasks.append({
+                'task_id': _build_training_task_id(
+                    plan_id=str((next_plan or {}).get('plan_id') or '').strip(),
+                    round_type=round_type,
+                    priority=priority,
+                    from_task_id=source_task_id,
+                ),
+                'plan_id': str((next_plan or {}).get('plan_id') or '').strip(),
+                'user_id': user_id,
+                'title': f"{str(item.get('title') or '回流任务').strip()}（回流）",
+                'round_type': round_type,
+                'position': _canonical_training_position(item.get('position') or (next_plan or {}).get('target_position')),
+                'difficulty': _normalize_interview_difficulty(item.get('difficulty')) or 'medium',
+                'focus_key': str(item.get('focus_key') or '').strip(),
+                'focus_label': str(item.get('focus_label') or '').strip() or '回流复训',
+                'goal_score': float(item.get('goal_score') or 75),
+                'status': 'planned',
+                'priority': priority,
+                'from_task_id': source_task_id,
+                'due_at': '',
+            })
+
+        insert_result = db_manager.insert_training_tasks(prepared_tasks)
+        if not insert_result.get('success'):
+            return jsonify({'success': False, 'error': insert_result.get('error') or 'insert reflow tasks failed'}), 500
+
+        for item in reflow_candidates:
+            source_task_id = str(item.get('task_id') or '').strip()
+            if not source_task_id:
+                continue
+            if any(str(task.get('from_task_id') or '').strip() == source_task_id for task in prepared_tasks):
+                db_manager.update_training_task_status(source_task_id, status='rolled_over')
+
+        refreshed_next_bundle = db_manager.get_training_plan_bundle(user_id=user_id, week_start_date=next_start_text)
+        payload_result = _serialize_training_plan_payload(
+            (refreshed_next_bundle or {}).get('plan'),
+            (refreshed_next_bundle or {}).get('tasks') or [],
+        )
+
+        return jsonify({
+            'success': True,
+            'created_count': int(insert_result.get('count') or 0),
+            'source_week': {
+                'week_start_date': source_start_text,
+                'week_end_date': source_week_end.strftime('%Y-%m-%d'),
+            },
+            'next_week': {
+                'week_start_date': next_start_text,
+                'week_end_date': next_end_text,
+            },
+            **payload_result,
+        })
+    except Exception as e:
+        logger.error(f"执行训练任务回流失败：{e}", exc_info=True)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @app.route('/api/interviews')
 def get_interviews_from_db():
     """从数据库获取面试记录列表"""
@@ -7479,6 +10865,95 @@ def reparse_resume():
 
     except Exception as e:
         logger.error(f"重新解析简历失败：{e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/resume/optimize', methods=['POST'])
+def optimize_resume():
+    """基于目标岗位/JD 对当前简历做轻量优化，并返回前后对比。"""
+    try:
+        if resume_optimizer_service is None:
+            return jsonify({
+                'success': False,
+                'error': resume_optimizer_import_error or '简历优化服务未初始化'
+            }), 500
+
+        data = request.get_json(silent=True) or {}
+        user_id = str(data.get('user_id') or 'default').strip() or 'default'
+        job_description = str(data.get('job_description') or '').strip()
+        strategy = str(data.get('strategy') or 'keywords').strip().lower()
+        profile_form = data.get('profile_form') if isinstance(data.get('profile_form'), dict) else {}
+
+        if strategy not in {'nudge', 'keywords', 'full'}:
+            strategy = 'keywords'
+
+        if not job_description:
+            return jsonify({
+                'success': False,
+                'error': '请先填写目标岗位描述（JD）后再开始优化。'
+            }), 400
+
+        latest_resume = db_manager.get_latest_resume(user_id=user_id)
+        result = resume_optimizer_service.optimize(
+            user_id=user_id,
+            latest_resume=latest_resume,
+            profile_form=profile_form,
+            job_description=job_description,
+            strategy=strategy,
+        )
+        return jsonify({
+            'success': True,
+            'result': result,
+        })
+    except Exception as e:
+        logger.error(f"简历优化失败：{e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/resume/optimizations', methods=['GET'])
+def list_resume_optimizations():
+    """获取简历优化历史。"""
+    try:
+        user_id = request.args.get('user_id', 'default')
+        limit = request.args.get('limit', 10, type=int)
+        offset = request.args.get('offset', 0, type=int)
+        history = db_manager.get_resume_optimizations(user_id=user_id, limit=limit, offset=offset)
+        return jsonify({
+            'success': True,
+            'count': len(history),
+            'optimizations': history,
+        })
+    except Exception as e:
+        logger.error(f"获取简历优化历史失败：{e}", exc_info=True)
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/resume/optimizations/<optimization_id>', methods=['GET'])
+def get_resume_optimization(optimization_id):
+    """获取单条简历优化详情。"""
+    try:
+        user_id = request.args.get('user_id', 'default')
+        item = db_manager.get_resume_optimization(optimization_id, user_id=user_id)
+        if not item:
+            return jsonify({
+                'success': False,
+                'error': '简历优化记录不存在'
+            }), 404
+        return jsonify({
+            'success': True,
+            'optimization': item,
+        })
+    except Exception as e:
+        logger.error(f"获取简历优化详情失败：{e}", exc_info=True)
         return jsonify({
             'success': False,
             'error': str(e)

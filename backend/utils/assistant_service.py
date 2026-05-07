@@ -178,6 +178,44 @@ def _to_plain_natural_text(text: str) -> str:
     return "\n".join(compact_lines).strip()
 
 
+def _sanitize_user_visible_reply(text: str) -> str:
+    content = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not content:
+        return ""
+    content = re.sub(r"(?i)<br\s*/?>", "\n", content)
+    content = re.sub(r"[（(]\s*(?:见|参见|详见)\s*[^()（）\n]{0,140}[)）]", "", content)
+    content = re.sub(
+        r"(?:见|参见|详见)\s*knowledge\/[^\s，。；;、)]{1,80}",
+        "",
+        content,
+        flags=re.IGNORECASE,
+    )
+    content = re.sub(r"\n{3,}", "\n\n", content)
+    return content.strip()
+
+
+def _sanitize_user_visible_reply_v2(text: str) -> str:
+    content = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not content:
+        return ""
+    # Keep markdown table cells stable: avoid inserting hard newlines inside cells.
+    content = re.sub(r"(?i)<br\s*/?>", "；", content)
+    content = re.sub(
+        r"[\uFF08(]\s*(?:\u89c1|\u53c2\u89c1|\u8be6\u89c1)\s*[^()\uFF08\uFF09\n]{0,140}[)\uFF09]",
+        "",
+        content,
+    )
+    content = re.sub(
+        r"(?:\u89c1|\u53c2\u89c1|\u8be6\u89c1)\s*knowledge\/[^\s\uFF0C\u3002\uFF1B;\u3001)]{1,80}",
+        "",
+        content,
+        flags=re.IGNORECASE,
+    )
+    content = re.sub(r"\s*；\s*；+", "；", content)
+    content = re.sub(r"\n{3,}", "\n\n", content)
+    return content.strip()
+
+
 class AssistantService:
     """面向业务页面的通用助手服务，不参与面试实时问答链路。"""
 
@@ -706,6 +744,7 @@ class AssistantService:
         user_message: str,
         messages: Optional[List[Dict[str, Any]]] = None,
         system_prompt: str = "",
+        rag_context: str = "",
         temperature: float = 0.3,
         max_tokens: int = 640,
     ) -> Dict[str, Any]:
@@ -731,6 +770,21 @@ class AssistantService:
             }
 
         final_system_prompt = str(system_prompt or "").strip() or self.default_system_prompt
+        final_rag_context = str(rag_context or "").strip()
+        if final_rag_context:
+            final_system_prompt = "\n\n".join(
+                part for part in [
+                    final_system_prompt,
+                    (
+                        "回答要求：\n"
+                        "1. 优先依据下方“知识库检索证据”回答，并尽量引用其中的事实与表述。\n"
+                        "2. 如果知识库证据不足，可以补充通用经验，但必须明确说明“以下为一般经验补充”。\n"
+                        "3. 不要把未命中的事实伪装成知识库结论。\n"
+                        "4. 输出中文，尽量简洁、可执行、适合求职准备场景。"
+                    ),
+                    f"知识库检索证据：\n{final_rag_context}",
+                ] if part
+            )
         history = self._sanitize_messages(messages)
         composed: List[Dict[str, str]] = []
         if final_system_prompt:
@@ -774,6 +828,9 @@ class AssistantService:
                     f"code={result.get('error', '')}, msg={str(result.get('message', ''))[:180]}"
                 )
             )
+            return result
+
+        result["reply"] = _sanitize_user_visible_reply_v2(str(result.get("reply", "") or ""))
         return result
 
 

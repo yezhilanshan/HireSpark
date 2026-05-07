@@ -33,6 +33,67 @@ class BaseKnowledgeRetriever:
         return re.sub(r"\s+", "", (text or "").lower())
 
     @staticmethod
+    def _split_for_overlap(text: str) -> List[str]:
+        """Build lightweight overlap terms for mixed Chinese/English queries."""
+        raw = str(text or "").strip().lower()
+        if not raw:
+            return []
+
+        cleaned = re.sub(r"[^\w\u4e00-\u9fff]+", " ", raw)
+        stop_phrases = (
+            "是什么意思",
+            "什么是",
+            "什么",
+            "为什么",
+            "怎么样",
+            "怎么",
+            "如何",
+            "一下",
+            "一些",
+            "一个",
+            "这个",
+            "那个",
+            "哪些",
+            "请问",
+            "请你",
+            "请帮我",
+            "之间",
+            "关系",
+            "原理",
+            "机制",
+            "流程",
+            "场景",
+            "问题",
+            "回答",
+            "解释",
+            "说明",
+            "区别",
+            "理解",
+            "介绍",
+            "以及",
+            "还有",
+        )
+
+        parts: List[str] = []
+        for chunk in cleaned.split():
+            chunk = chunk.strip("_")
+            if not chunk:
+                continue
+            if re.search(r"[a-zA-Z]", chunk):
+                if len(chunk) >= 2:
+                    parts.append(chunk)
+                continue
+
+            reduced = chunk
+            for phrase in stop_phrases:
+                reduced = reduced.replace(phrase, " ")
+            for token in re.split(r"[的是了和与及或在把对跟中里呢吗嘛啊呀吧]", reduced):
+                token = token.strip()
+                if len(token) >= 2:
+                    parts.append(token)
+        return list(dict.fromkeys(parts))
+
+    @staticmethod
     def _extract_ascii_terms(text: str) -> List[str]:
         """提取英文/符号术语，用于降低语义召回的噪声。"""
         terms = []
@@ -66,6 +127,7 @@ class BaseKnowledgeRetriever:
         score = 0.0
         keyword_hits = []
         ascii_hits = []
+        overlap_hits = []
 
         if normalized_query and normalized_query in normalized_question:
             score += 0.40
@@ -111,17 +173,23 @@ class BaseKnowledgeRetriever:
         if normalized_subcategory and normalized_subcategory in normalized_query:
             score += 0.08
 
-        query_words = set(normalized_query.split()) if normalized_query else set()
-        question_words = set(normalized_question.split()) if normalized_question else set()
-        common_words = query_words & question_words
-        if query_words and len(common_words) > 0:
-            score += min(0.05 * len(common_words), 0.15)
+        query_terms = set(self._split_for_overlap(query))
+        candidate_terms = set(
+            self._split_for_overlap(question)
+            + self._split_for_overlap(retrieval_text)
+            + self._split_for_overlap(category)
+            + self._split_for_overlap(subcategory)
+        )
+        overlap_hits = sorted(query_terms & candidate_terms)
+        if overlap_hits:
+            score += min(0.18 * len(overlap_hits), 0.42)
 
         return {
             "lexical_score": min(score, 1.0),
             "keyword_hits": keyword_hits,
             "ascii_hits": ascii_hits,
             "tag_hits": tag_hits,
+            "overlap_hits": overlap_hits,
         }
 
     @staticmethod
@@ -135,17 +203,25 @@ class BaseKnowledgeRetriever:
         similarity = float(item.get("similarity", 0))
         lexical_score = float(item.get("lexical_score", 0))
         rerank_score = float(item.get("rerank_score", 0))
+        keyword_hits = item.get("keyword_hits", []) or []
+        overlap_hits = item.get("overlap_hits", []) or []
 
-        if lexical_score >= 0.35:
+        if lexical_score >= 0.60:
             return True
 
-        if rerank_score >= top_similarity * 0.85:
+        if keyword_hits and lexical_score >= 0.35:
             return True
 
-        if similarity >= max(top_similarity - max_similarity_gap / 2, top_similarity * 0.90):
+        if overlap_hits and rerank_score >= max(0.55, top_similarity * 0.80):
             return True
 
-        return (top_similarity - similarity) <= max_similarity_gap and lexical_score >= min_lexical_score
+        if similarity >= max(top_similarity - max_similarity_gap / 3, top_similarity * 0.95) and lexical_score >= 0.20:
+            return True
+
+        return (
+            (top_similarity - similarity) <= max_similarity_gap
+            and lexical_score >= max(min_lexical_score, 0.18)
+        )
 
     def retrieve(
         self,
@@ -161,7 +237,7 @@ class BaseKnowledgeRetriever:
     ) -> List[Dict[str, Any]]:
         results = self.store.search(
             query,
-            top_k=max(top_k * 2, top_k),
+            top_k=max(top_k * 6, 12),
             metadata_filters=self._merge_metadata_filters(metadata_filters)
         )
 
@@ -180,7 +256,7 @@ class BaseKnowledgeRetriever:
 
             lexical_info = self._compute_lexical_score(query, item)
             item.update(lexical_info)
-            item["rerank_score"] = round(sim * 0.60 + item["lexical_score"] * 0.40, 4)
+            item["rerank_score"] = round(sim * 0.45 + item["lexical_score"] * 0.55, 4)
             filtered.append(item)
 
         filtered.sort(
@@ -207,8 +283,7 @@ class BaseKnowledgeRetriever:
                 strong_results.append(item)
 
         if not strong_results:
-            strong_results = filtered[:1]
-            strong_results[0]["is_strong_match"] = True
+            return []
 
         return strong_results[:top_k]
 

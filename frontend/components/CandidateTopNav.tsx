@@ -3,7 +3,7 @@
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { BarChart3, History, LayoutDashboard, PlayCircle, UserCircle2 } from 'lucide-react'
-import ThemeToggle from './ThemeToggle'
+import NotificationCenter from './NotificationCenter'
 
 const NAV_ITEMS = [
     { href: '/', label: '概览', icon: LayoutDashboard },
@@ -60,7 +60,7 @@ export default function CandidateTopNav() {
                 </nav>
 
                 <div className="shrink-0">
-                    <ThemeToggle />
+                    <NotificationCenter mode="inline" />
                 </div>
             </div>
         </header>

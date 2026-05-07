@@ -37,12 +37,20 @@ class SessionRuntime:
     interview_state: Optional[Dict[str, Any]] = None
     last_question_plan: Optional[Dict[str, Any]] = None
     last_answer_analysis: Optional[Dict[str, Any]] = None
+    forced_question_id: str = ""
+    forced_question_text: str = ""
+    forced_question_meta: Dict[str, Any] = field(default_factory=dict)
+    training_mode: str = ""
     last_committed_hash: str = ""
     last_committed_at: float = 0.0
+    formal_question_count: int = 0
     current_question: str = ""
+    current_question_kind: str = "formal"
     current_question_started_at: Optional[float] = None
     current_question_estimated_end_at: Optional[float] = None
     current_answer_started_at: Optional[float] = None
+    pending_formal_question: str = ""
+    pending_formal_question_plan: Optional[Dict[str, Any]] = None
     data_manager: Optional[DataManager] = None
     pending_asr_partials: List[str] = field(default_factory=list)
     pending_asr_finals: List[str] = field(default_factory=list)
@@ -96,6 +104,7 @@ class SessionRegistry:
         round_type: str,
         position: str,
         difficulty: str,
+        training_mode: str = "",
     ) -> SessionRuntime:
         runtime = SessionRuntime(
             client_id=client_id,
@@ -105,6 +114,7 @@ class SessionRegistry:
             round_type=round_type,
             position=position,
             difficulty=difficulty,
+            training_mode=str(training_mode or "").strip(),
             mode="idle",
             data_manager=DataManager() if DataManager is not None else None,
         )
