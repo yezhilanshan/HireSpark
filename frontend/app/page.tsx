@@ -135,6 +135,12 @@ function LoginPageContent() {
                             <p className="text-sm leading-6 text-[var(--ink-muted)]">
                                 {mode === 'register' ? '注册后可直接进入你的工作台与面试训练空间。' : '登录后继续进入你的工作台与面试训练空间。'}
                             </p>
+                            {mode === 'login' ? (
+                                <div className="rounded-xl border border-[var(--accent)]/30 bg-[var(--accent)]/5 px-4 py-3 text-xs text-[var(--ink-muted)]">
+                                    <span className="font-medium text-[var(--ink)]">演示账号：</span>
+                                    <span className="tabular-nums">admin@panelmind.cn / PanelMind123</span>
+                                </div>
+                            ) : null}
                         </div>
                     </div>
 
