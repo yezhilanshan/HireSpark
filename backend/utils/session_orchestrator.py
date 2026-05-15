@@ -44,7 +44,9 @@ class SessionRuntime:
     last_committed_hash: str = ""
     last_committed_at: float = 0.0
     formal_question_count: int = 0
+    topic_question_count: int = 0
     current_question: str = ""
+    current_question_core: str = ""
     current_question_kind: str = "formal"
     current_question_started_at: Optional[float] = None
     current_question_estimated_end_at: Optional[float] = None
@@ -152,6 +154,8 @@ class StateOrchestrator:
             "asr_locked": runtime.asr_locked,
             "asr_lock_reason": runtime.asr_lock_reason,
             "detection_state": runtime.pending_detection_state,
+            "formal_question_count": runtime.formal_question_count,
+            "topic_question_count": runtime.topic_question_count,
             "answer_session_id": getattr(answer_session, "answer_session_id", ""),
             "answer_session_status": getattr(answer_session, "status", "idle"),
         }

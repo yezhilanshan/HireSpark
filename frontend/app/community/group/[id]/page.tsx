@@ -34,7 +34,7 @@ export default function GroupDetailPage() {
     const [version, setVersion] = useState(0)
 
     useEffect(() => {
-        const stored = localStorage.getItem('hirespark.sidebar.profile')
+        const stored = localStorage.getItem('zhiyuexingchen.sidebar.profile')
         if (stored) {
             try {
                 const parsed = JSON.parse(stored)

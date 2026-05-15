@@ -40,7 +40,7 @@ import { readPageCache, writePageCache } from '@/lib/page-cache'
 const BACKEND_API_BASE = getBackendBaseUrl()
 const ROUND_COLORS = ['#111111', '#4C6A8A', '#B67A2D', '#7A8E63']
 const FIT_GAUGE_COLORS = ['#111111', '#E8E2D7']
-const INSIGHTS_CACHE_KEY = 'hirespark.page.insights.v1'
+const INSIGHTS_CACHE_KEY = 'zhiyuexingchen.page.insights.v1'
 const INSIGHTS_CACHE_TTL_MS = 1000 * 60 * 15
 
 type RecentMetricItem = {

@@ -5,7 +5,7 @@ import { getBackendBaseUrl } from '@/lib/backend'
 import type { GraphEdge, GraphNode, GraphPayload, GraphSummary } from './types'
 
 const BACKEND_API_BASE = getBackendBaseUrl()
-const KNOWLEDGE_GRAPH_REFRESH_KEY = 'hirespark:knowledge-graph:refresh'
+const KNOWLEDGE_GRAPH_REFRESH_KEY = 'zhiyuexingchen:knowledge-graph:refresh'
 
 export function useKnowledgeGraphData() {
     const [loading, setLoading] = useState(true)

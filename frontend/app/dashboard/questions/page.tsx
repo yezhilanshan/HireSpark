@@ -15,7 +15,7 @@ import { isBookmarked, type BookMarkType } from '@/lib/question-book'
 
 const BACKEND_API_BASE = getBackendBaseUrl()
 const QUESTION_PAGE_SIZE = 10
-const QUESTION_CACHE_KEY = 'hirespark.page.questions.v1'
+const QUESTION_CACHE_KEY = 'zhiyuexingchen.page.questions.v1'
 const QUESTION_CACHE_TTL_MS = 1000 * 60 * 20
 
 type QuestionItem = {

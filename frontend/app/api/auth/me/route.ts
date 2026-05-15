@@ -7,7 +7,7 @@ export async function GET(request: NextRequest) {
     if (!isSessionValid(session)) {
         return NextResponse.json(
             { success: false, authenticated: false, error: '未登录' },
-            { status: 401 }
+            { status: 200 }
         )
     }
 

@@ -22,8 +22,8 @@ import { buildPageCacheKey, readPageCache, removePageCache, writePageCache } fro
 const BACKEND_API_BASE = getBackendBaseUrl()
 const ASSISTANT_TASK_POLL_INTERVAL_MS = 1200
 const ASSISTANT_TASK_POLL_MAX_ATTEMPTS = 75
-const ASSISTANT_SHELL_CACHE_KEY = 'hirespark.page.assistant.shell.v1'
-const ASSISTANT_MESSAGE_CACHE_PREFIX = 'hirespark.page.assistant.messages.v1'
+const ASSISTANT_SHELL_CACHE_KEY = 'zhiyuexingchen.page.assistant.shell.v1'
+const ASSISTANT_MESSAGE_CACHE_PREFIX = 'zhiyuexingchen.page.assistant.messages.v1'
 const ASSISTANT_CACHE_TTL_MS = 1000 * 60 * 15
 
 type AssistantTask = {
@@ -148,7 +148,7 @@ export default function AssistantPage() {
         const response = await fetch('/api/auth/me', { cache: 'no-store' })
         const data = await response.json().catch(() => ({}))
         const nextUserId = String(data?.user?.email || 'default').trim().toLowerCase() || 'default'
-        const nextUserName = String(data?.user?.name || 'HireSpark 用户').trim() || 'HireSpark 用户'
+        const nextUserName = String(data?.user?.name || '职跃星辰 用户').trim() || '职跃星辰 用户'
         setUserId(nextUserId)
         setUserName(nextUserName)
         return nextUserId

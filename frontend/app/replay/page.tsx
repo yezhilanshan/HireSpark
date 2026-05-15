@@ -11,9 +11,9 @@ import { buildPageCacheKey, readPageCache, writePageCache } from '@/lib/page-cac
 
 const BACKEND_API_BASE = getBackendBaseUrl()
 const DEFAULT_RECORD_LIMIT = 10
-const REPLAY_LIST_CACHE_KEY = 'hirespark.page.replay.list.v1'
+const REPLAY_LIST_CACHE_KEY = 'zhiyuexingchen.page.replay.list.v1'
 const REPLAY_LIST_CACHE_TTL_MS = 1000 * 60 * 20
-const REPLAY_DETAIL_CACHE_PREFIX = 'hirespark.page.replay.detail.v1'
+const REPLAY_DETAIL_CACHE_PREFIX = 'zhiyuexingchen.page.replay.detail.v1'
 const REPLAY_DETAIL_CACHE_TTL_MS = 1000 * 60 * 20
 
 function formatMs(ms?: number) {

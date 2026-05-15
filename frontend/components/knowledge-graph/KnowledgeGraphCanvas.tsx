@@ -85,7 +85,7 @@ function buildGraphController(params: {
     svg
         .append('defs')
         .append('filter')
-        .attr('id', 'hirespark-node-glow')
+        .attr('id', 'zhiyuexingchen-node-glow')
         .attr('x', '-50%')
         .attr('y', '-50%')
         .attr('width', '200%')
@@ -187,7 +187,7 @@ function buildGraphController(params: {
         .append('circle')
         .attr('class', 'node-halo')
         .attr('r', (node) => nodeRadius(node) * 1.3)
-        .attr('filter', 'url(#hirespark-node-glow)')
+        .attr('filter', 'url(#zhiyuexingchen-node-glow)')
 
     nodeInner
         .append('circle')

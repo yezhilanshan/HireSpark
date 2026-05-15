@@ -33,33 +33,6 @@ const nextConfig = {
             },
         ]
     },
-    webpack(config, { isServer }) {
-        if (!isServer) {
-            config.optimization.splitChunks = {
-                chunks: 'all',
-                cacheGroups: {
-                    vendor: {
-                        test: /[\\/]node_modules[\\/]/,
-                        name: 'vendors',
-                        chunks: 'all',
-                    },
-                    motion: {
-                        test: /[\\/]node_modules[\\/]motion[\\/]/,
-                        name: 'motion',
-                        chunks: 'all',
-                        priority: 10,
-                    },
-                    recharts: {
-                        test: /[\\/]node_modules[\\/]recharts[\\/]/,
-                        name: 'recharts',
-                        chunks: 'all',
-                        priority: 10,
-                    },
-                },
-            }
-        }
-        return config
-    },
 }
 
 module.exports = withBundleAnalyzer(nextConfig)

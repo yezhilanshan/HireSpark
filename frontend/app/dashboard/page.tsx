@@ -116,7 +116,7 @@ const INITIAL_STATE: DashboardState = {
     recentSessions: [],
 }
 
-const DASHBOARD_CACHE_KEY = 'hirespark.dashboard.cache.v1'
+const DASHBOARD_CACHE_KEY = 'zhiyuexingchen.dashboard.cache.v1'
 const DASHBOARD_CACHE_TTL_MS = 1000 * 60 * 10
 
 let dashboardMemoryCache: DashboardCachePayload | null = null
@@ -385,10 +385,8 @@ const itemVariants: Variants = {
 
 export default function HomePage() {
     const router = useRouter()
-    const [state, setState] = useState<DashboardState>(() => {
-        if (typeof window === 'undefined') return INITIAL_STATE
-        return readDashboardCache() || INITIAL_STATE
-    })
+    const [state, setState] = useState<DashboardState>(INITIAL_STATE)
+    const [greeting, setGreeting] = useState('你好')
     const reminders: Array<{
         id: string
         tone?: string
@@ -401,6 +399,7 @@ export default function HomePage() {
 
     useEffect(() => {
         let cancelled = false
+        setGreeting(greetingText())
         const cachedState = readDashboardCache()
 
         if (cachedState) {
@@ -529,7 +528,6 @@ export default function HomePage() {
         }
     }, [])
 
-    const greeting = useMemo(() => greetingText(), [])
     const avatarInitial = useMemo(() => getAvatarInitial(state.candidateName), [state.candidateName])
 
     return (

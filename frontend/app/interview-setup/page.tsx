@@ -66,6 +66,11 @@ export default function InterviewSetupPage() {
     const [serviceWarmupStatus, setServiceWarmupStatus] = useState<'idle' | 'warming' | 'ready' | 'error'>('idle')
     const [serviceWarmupText, setServiceWarmupText] = useState('正在预热服务...')
 
+    useEffect(() => {
+        void router.prefetch('/interview')
+        void router.prefetch('/dashboard')
+    }, [router])
+
     const bindCameraPreview = useCallback(async () => {
         const videoEl = videoRef.current
         const stream = streamRef.current
@@ -251,9 +256,7 @@ export default function InterviewSetupPage() {
             difficulty: selectedDifficulty,
             trainingMode: selectedInterviewMode,
         }))
-        setTimeout(() => {
-            router.push('/interview')
-        }, 350)
+        router.push('/interview')
     }
 
     return (

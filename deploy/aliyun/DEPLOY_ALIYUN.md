@@ -1,9 +1,9 @@
-# HireSpark 阿里云 ECS 部署说明
+# 职跃星辰 阿里云 ECS 部署说明
 
 这套说明默认按下面前提编写：
 
 - 服务器系统：Ubuntu 22.04
-- 部署目录：`/opt/hirespark`
+- 部署目录：`/opt/zhiyuexingchen`
 - 前端对外端口：`80`
 - 后端对外端口：`5000`
 - 前端域名或公网地址：`http://你的公网 IP`
@@ -47,20 +47,20 @@ chmod +x deploy/aliyun/install_ubuntu_2204.sh
 推荐两种方式任选一种：
 
 ```bash
-sudo mkdir -p /opt/hirespark
-sudo chown -R $USER:$USER /opt/hirespark
+sudo mkdir -p /opt/zhiyuexingchen
+sudo chown -R $USER:$USER /opt/zhiyuexingchen
 cd /opt
-git clone <你的仓库地址> hirespark
+git clone <你的仓库地址> zhiyuexingchen
 ```
 
-或者直接把你本地项目打包上传到 `/opt/hirespark`。
+或者直接把你本地项目打包上传到 `/opt/zhiyuexingchen`。
 
 ## 三、准备生产环境变量
 
 复制模板：
 
 ```bash
-cd /opt/hirespark
+cd /opt/zhiyuexingchen
 cp deploy/aliyun/.env.production.example .env.production
 ```
 
@@ -94,7 +94,7 @@ SOCKETIO_CORS_ALLOWED_ORIGINS=http://47.x.x.x
 ### 1. Python 虚拟环境
 
 ```bash
-cd /opt/hirespark
+cd /opt/zhiyuexingchen
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
@@ -104,7 +104,7 @@ pip install -r requirements.txt
 ### 2. 前端依赖
 
 ```bash
-cd /opt/hirespark/frontend
+cd /opt/zhiyuexingchen/frontend
 npm install
 ```
 
@@ -113,7 +113,7 @@ npm install
 ### 1. 启动后端
 
 ```bash
-cd /opt/hirespark
+cd /opt/zhiyuexingchen
 set -a
 source .env.production
 set +a
@@ -130,7 +130,7 @@ curl http://127.0.0.1:5000/health
 ### 2. 构建并启动前端
 
 ```bash
-cd /opt/hirespark/frontend
+cd /opt/zhiyuexingchen/frontend
 set -a
 source ../.env.production
 set +a
@@ -149,32 +149,32 @@ curl http://127.0.0.1:3000
 复制服务文件：
 
 ```bash
-sudo cp /opt/hirespark/deploy/aliyun/hirespark-backend.service /etc/systemd/system/
-sudo cp /opt/hirespark/deploy/aliyun/hirespark-frontend.service /etc/systemd/system/
+sudo cp /opt/zhiyuexingchen/deploy/aliyun/zhiyuexingchen-backend.service /etc/systemd/system/
+sudo cp /opt/zhiyuexingchen/deploy/aliyun/zhiyuexingchen-frontend.service /etc/systemd/system/
 ```
 
 重载并启动：
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable hirespark-backend
-sudo systemctl enable hirespark-frontend
-sudo systemctl start hirespark-backend
-sudo systemctl start hirespark-frontend
+sudo systemctl enable zhiyuexingchen-backend
+sudo systemctl enable zhiyuexingchen-frontend
+sudo systemctl start zhiyuexingchen-backend
+sudo systemctl start zhiyuexingchen-frontend
 ```
 
 查看状态：
 
 ```bash
-sudo systemctl status hirespark-backend
-sudo systemctl status hirespark-frontend
+sudo systemctl status zhiyuexingchen-backend
+sudo systemctl status zhiyuexingchen-frontend
 ```
 
 查看日志：
 
 ```bash
-journalctl -u hirespark-backend -f
-journalctl -u hirespark-frontend -f
+journalctl -u zhiyuexingchen-backend -f
+journalctl -u zhiyuexingchen-frontend -f
 ```
 
 ## 七、配置 Nginx
@@ -182,8 +182,8 @@ journalctl -u hirespark-frontend -f
 复制站点配置：
 
 ```bash
-sudo cp /opt/hirespark/deploy/aliyun/nginx.hirespark.conf /etc/nginx/sites-available/hirespark
-sudo ln -sf /etc/nginx/sites-available/hirespark /etc/nginx/sites-enabled/hirespark
+sudo cp /opt/zhiyuexingchen/deploy/aliyun/nginx.zhiyuexingchen.conf /etc/nginx/sites-available/zhiyuexingchen
+sudo ln -sf /etc/nginx/sites-available/zhiyuexingchen /etc/nginx/sites-enabled/zhiyuexingchen
 sudo rm -f /etc/nginx/sites-enabled/default
 sudo nginx -t
 sudo systemctl restart nginx
@@ -225,7 +225,7 @@ sudo systemctl restart nginx
 
 我可以下一步继续帮你补：
 
-- `hirespark.conf` 的 HTTPS 版本
+- `zhiyuexingchen.conf` 的 HTTPS 版本
 - `api.xxx.com` 的后端子域名方案
 - 阿里云证书与备案的配置步骤
 

@@ -74,7 +74,7 @@ export default function QuestionDetailModal({ question, onClose, onPractice }: P
     const scrollRef = useRef<HTMLDivElement>(null)
 
     useEffect(() => {
-        const stored = localStorage.getItem('hirespark.sidebar.profile')
+        const stored = localStorage.getItem('zhiyuexingchen.sidebar.profile')
         if (stored) {
             try {
                 const parsed = JSON.parse(stored)

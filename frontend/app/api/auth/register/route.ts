@@ -1,6 +1,30 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { AUTH_COOKIE_NAME, buildSessionCookieValue, getAuthBackendBaseUrl, shouldUseSecureCookies } from '@/lib/auth'
 
+function createRegisterResponse(email: string, name: string) {
+    const userEmail = String(email || '').trim().toLowerCase()
+    const userName = String(name || '').trim() || '职跃星辰 用户'
+
+    const response = NextResponse.json({
+        success: true,
+        user: {
+            email: userEmail,
+            name: userName,
+        },
+    })
+
+    response.cookies.set({
+        name: AUTH_COOKIE_NAME,
+        value: buildSessionCookieValue(userEmail, userName),
+        httpOnly: true,
+        sameSite: 'lax',
+        secure: shouldUseSecureCookies(),
+        path: '/',
+    })
+
+    return response
+}
+
 export async function POST(request: NextRequest) {
     try {
         const body = await request.json().catch(() => ({}))
@@ -15,6 +39,13 @@ export async function POST(request: NextRequest) {
             )
         }
 
+        if (password.length < 8) {
+            return NextResponse.json(
+                { success: false, error: '密码长度至少为 8 位。' },
+                { status: 400 },
+            )
+        }
+
         const upstream = await fetch(`${getAuthBackendBaseUrl()}/api/auth/register`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -23,34 +54,17 @@ export async function POST(request: NextRequest) {
         })
 
         const upstreamData = await upstream.json().catch(() => ({}))
-        if (!upstream.ok || !upstreamData?.success) {
-            return NextResponse.json(
-                { success: false, error: upstreamData?.error || '注册失败，请稍后重试。' },
-                { status: upstream.status || 400 },
+        if (upstream.ok && upstreamData?.success) {
+            return createRegisterResponse(
+                String(upstreamData?.user?.email || email),
+                String(upstreamData?.user?.name || name),
             )
         }
 
-        const userEmail = String(upstreamData?.user?.email || email).trim().toLowerCase()
-        const userName = String(upstreamData?.user?.name || name).trim() || name
-
-        const response = NextResponse.json({
-            success: true,
-            user: {
-                email: userEmail,
-                name: userName,
-            },
-        })
-
-        response.cookies.set({
-            name: AUTH_COOKIE_NAME,
-            value: buildSessionCookieValue(userEmail, userName),
-            httpOnly: true,
-            sameSite: 'lax',
-            secure: shouldUseSecureCookies(),
-            path: '/',
-        })
-
-        return response
+        return NextResponse.json(
+            { success: false, error: upstreamData?.error || '注册失败，请稍后重试。' },
+            { status: upstream.status || 400 },
+        )
     } catch {
         return NextResponse.json(
             { success: false, error: '注册失败，请稍后重试。' },

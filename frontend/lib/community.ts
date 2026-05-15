@@ -35,10 +35,10 @@ export type StudyGroup = {
     members: string[]
 }
 
-const POSTS_KEY = 'hirespark.community.posts.v1'
-const COMMENTS_KEY = 'hirespark.community.comments.v1'
-const GROUPS_KEY = 'hirespark.community.groups.v1'
-const LIKED_POSTS_KEY = 'hirespark.community.likedPosts.v1'
+const POSTS_KEY = 'zhiyuexingchen.community.posts.v1'
+const COMMENTS_KEY = 'zhiyuexingchen.community.comments.v1'
+const GROUPS_KEY = 'zhiyuexingchen.community.groups.v1'
+const LIKED_POSTS_KEY = 'zhiyuexingchen.community.likedPosts.v1'
 
 function read<T>(key: string, fallback: T): T {
     try {

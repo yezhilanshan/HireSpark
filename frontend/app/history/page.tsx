@@ -10,7 +10,7 @@ import { readPageCache, writePageCache } from '@/lib/page-cache'
 
 const BACKEND_API_BASE = getBackendBaseUrl()
 const DEFAULT_HISTORY_LIMIT = 10
-const HISTORY_CACHE_KEY = 'hirespark.page.history.v1'
+const HISTORY_CACHE_KEY = 'zhiyuexingchen.page.history.v1'
 const HISTORY_CACHE_TTL_MS = 1000 * 60 * 20
 
 type InterviewRecord = {

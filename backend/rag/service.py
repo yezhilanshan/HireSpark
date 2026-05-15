@@ -2132,8 +2132,15 @@ class RAGService:
         depth = float(analysis_result.get("depth", 0.0) or 0.0)
         correctness = float(analysis_result.get("correctness", 0.0) or 0.0)
         coverage = analysis_result.get("coverage", {}) or {}
-        partial_coverage = float(coverage.get("partial", 0.0) or 0.0)
-        poor_coverage = float(coverage.get("poor", 0.0) or 0.0)
+        basic_coverage = float(coverage.get("basic", 0.0) or 0.0)
+        good_coverage = float(coverage.get("good", 0.0) or 0.0)
+        excellent_coverage = float(coverage.get("excellent", 0.0) or 0.0)
+        weighted_coverage = (
+            basic_coverage * 0.5
+            + good_coverage * 0.35
+            + excellent_coverage * 0.15
+        )
+        coverage_gap = max(0.0, 1.0 - weighted_coverage)
         style_hint = str(analysis_result.get("suggested_followup_type", "") or "").strip().lower()
 
         if any(token in style_hint for token in ["tradeoff", "权衡", "取舍"]):
@@ -2142,13 +2149,23 @@ class RAGService:
             return "scale_probe"
 
         if normalized_round in {"project", "system_design"}:
-            if depth < 0.58 or partial_coverage + poor_coverage >= 0.55:
+            if (
+                depth < 0.58
+                or basic_coverage < 0.45
+                or good_coverage < 0.35
+                or coverage_gap >= 0.5
+            ):
                 return "detail_probe"
             if normalized_round == "system_design" and correctness >= 0.55:
                 return "tradeoff_probe"
             return "scale_probe"
 
-        if depth < 0.55 or partial_coverage >= 0.35:
+        if (
+            depth < 0.55
+            or basic_coverage < 0.45
+            or good_coverage < 0.35
+            or coverage_gap >= 0.5
+        ):
             return "detail_probe"
         if correctness >= 0.7 and followup_question:
             return "tradeoff_probe"

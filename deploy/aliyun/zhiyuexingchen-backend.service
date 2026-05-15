@@ -1,0 +1,15 @@
+[Unit]
+Description=职跃星辰 Backend
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/zhiyuexingchen
+EnvironmentFile=/opt/zhiyuexingchen/.env.production
+ExecStart=/opt/zhiyuexingchen/.venv/bin/python backend/app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -108,6 +108,7 @@ backend/rag_data/
 *.bat
 *.ps1
 *.cmd
+!start_all.ps1
 
 # Backend generated outputs
 backend/logs/
@@ -137,9 +138,9 @@ Qwen3-ForcedAligner-0.6B/
 %SystemDrive%/
 
 # competition submission zip
-HireSpark_submit_*.zip
+职跃星辰_submit_*.zip
 
-# external reference projects (not part of HireSpark source)
+# external reference projects (not part of 职跃星辰 source)
 Resume-Matcher-main/
 llm-graph-builder-main/
 llm-wiki-skill-main/

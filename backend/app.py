@@ -87,6 +87,7 @@ from utils.speech_metrics import compute_final_speech_metrics, aggregate_express
 from utils.replay_service import ReplayService, ReplayTaskManager
 from utils.behavior_analysis_service import BehaviorAnalysisService, BehaviorAnalysisTaskManager
 from utils.video_upload_service import VideoUploadService
+from utils.report_generator import ReportGenerator
 from utils.round_aggregation import build_round_aggregation
 from utils.security import (
     RateLimiter,
@@ -154,9 +155,9 @@ ASSISTANT_POSITION_HINTS = {
 }
 
 
-AUTH_DEFAULT_EMAIL = str(os.environ.get('AUTH_LOGIN_EMAIL', 'admin@hirespark.cn') or '').strip().lower() or 'admin@hirespark.cn'
-AUTH_DEFAULT_PASSWORD = str(os.environ.get('AUTH_LOGIN_PASSWORD', 'HireSpark123') or '').strip() or 'HireSpark123'
-AUTH_DEFAULT_NAME = str(os.environ.get('AUTH_LOGIN_NAME', 'HireSpark 管理员') or '').strip() or 'HireSpark 管理员'
+AUTH_DEFAULT_EMAIL = str(os.environ.get('AUTH_LOGIN_EMAIL', 'admin@zhiyuexingchen.cn') or '').strip().lower() or 'admin@zhiyuexingchen.cn'
+AUTH_DEFAULT_PASSWORD = str(os.environ.get('AUTH_LOGIN_PASSWORD', '职跃星辰123') or '').strip() or '职跃星辰123'
+AUTH_DEFAULT_NAME = str(os.environ.get('AUTH_LOGIN_NAME', '职跃星辰 管理员') or '').strip() or '职跃星辰 管理员'
 AUTH_EMAIL_PATTERN = re.compile(r'^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$')
 
 
@@ -470,6 +471,7 @@ elif evaluation_service is not None:
     logger.info("三层评价服务初始化成功")
 
 video_upload_service = VideoUploadService(logger=logger)
+report_generator = ReportGenerator()
 replay_service = ReplayService(
     db_manager=db_manager,
     llm_manager=llm_manager,
@@ -704,6 +706,67 @@ def _extract_question_text_from_plan(question_plan: dict | None) -> str:
         return ""
     question_text = str(candidates[0].get('question', '')).strip()
     return question_text
+
+
+def _extract_runtime_question_core(reply_text: str, fallback: str = "") -> str:
+    """从面试官回复中提取用于后续分析/追问的纯题干。"""
+    source = str(reply_text or "").strip()
+    if not source:
+        return str(fallback or "").strip()
+
+    if llm_manager is not None:
+        parser = getattr(llm_manager, "_extract_primary_question", None)
+        if callable(parser):
+            try:
+                parsed = str(parser(source) or "").strip()
+                if parsed:
+                    return parsed
+            except Exception:
+                pass
+
+    lines = [line.strip() for line in source.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if len(line) >= 6 and line.endswith(("？", "?")):
+            return line
+
+    for part in re.split(r"(?<=[？?])\s*", source):
+        candidate = str(part or "").strip()
+        if len(candidate) >= 6 and ("？" in candidate or "?" in candidate):
+            return candidate
+
+    normalized_fallback = str(fallback or "").strip()
+    return normalized_fallback or source
+
+
+def _with_runtime_question(
+    decision: dict | None,
+    *,
+    reply_text: str = "",
+    fallback_question: str = "",
+) -> dict:
+    payload = dict(decision or {})
+    runtime_question = str(
+        payload.get("runtime_question")
+        or payload.get("coach_next_question")
+        or ""
+    ).strip()
+    if not runtime_question:
+        runtime_question = _extract_runtime_question_core(reply_text, fallback=fallback_question)
+    if runtime_question:
+        payload["runtime_question"] = runtime_question
+    return payload
+
+
+def _downgrade_switch_decision(
+    decision: dict | None,
+    *,
+    reason: str,
+) -> dict:
+    payload = dict(decision or {})
+    payload["next_action"] = "ask_followup"
+    payload["switch_fallback"] = True
+    payload["switch_fallback_reason"] = str(reason or "switch_generation_failed")
+    return payload
 
 
 def _build_initial_interview_context(
@@ -1286,13 +1349,18 @@ def _rewrite_answer_text(runtime, answer_session: AnswerSession, audio_path: str
 
     prompt_parts = []
     if ASR_FINAL_USE_HINT_PROMPT:
+        runtime_question = str(
+            getattr(runtime, 'current_question_core', '')
+            or getattr(runtime, 'current_question', '')
+            or ''
+        ).strip()
         prompt_parts = [
             "这是一次中文技术面试回答的音频转写，请尽量准确保留技术术语、英文缩写、数字和项目名称。",
             "只输出转写后的正文，不要补充解释，不要改写成总结。",
         ]
-        if runtime.current_question:
-            prompt_parts.append(f"当前题目：{runtime.current_question}")
-        technical_terms = _extract_technical_terms(runtime.current_question, answer_session.merged_text_draft)
+        if runtime_question:
+            prompt_parts.append(f"当前题目：{runtime_question}")
+        technical_terms = _extract_technical_terms(runtime_question, answer_session.merged_text_draft)
         if technical_terms:
             prompt_parts.append(
                 "术语词表（若音频中出现，请优先按下列写法输出，保持大小写）："
@@ -1643,7 +1711,8 @@ def _generate_policy_response(
         coach_state = next_state
         next_question_plan = question_plan
         coach_reference_question = fixed_question or current_question
-        coach_question_context_parts = [rag_context, decision_context]
+        coach_decision_context = decision_context
+        coach_question_context_parts = [rag_context, coach_decision_context]
         next_question_text = ""
 
         if fixed_question:
@@ -1668,17 +1737,29 @@ def _generate_policy_response(
                 top_k=getattr(rag_service, 'max_context_results', 2)
             )
             next_question_context = rag_service.format_question_plan(next_question_plan)
-            coach_reference_question = _extract_question_text_from_plan(next_question_plan) or current_question
-            next_question_text = llm_manager.generate_round_question(
-                round_type=round_type,
-                position=position,
-                difficulty=target_difficulty,
-                rag_context=_merge_text_blocks(decision_context, next_question_context),
-                reference_question=coach_reference_question,
-            )
-            if next_question_text:
-                coach_state = rag_service.mark_question_asked(planning_state, next_question_plan) if next_question_plan else planning_state
-            coach_question_context_parts.append(next_question_context)
+            coach_reference_question = _extract_question_text_from_plan(next_question_plan)
+            if coach_reference_question:
+                next_question_text = llm_manager.generate_round_question(
+                    round_type=round_type,
+                    position=position,
+                    difficulty=target_difficulty,
+                    rag_context=_merge_text_blocks(coach_decision_context, next_question_context),
+                    reference_question=coach_reference_question,
+                )
+            if next_question_text and next_question_plan:
+                coach_state = rag_service.mark_question_asked(planning_state, next_question_plan)
+                coach_question_context_parts.append(next_question_context)
+            else:
+                coach_decision = _downgrade_switch_decision(
+                    coach_decision,
+                    reason='coach_switch_generation_failed',
+                )
+                next_question_plan = question_plan
+                coach_state = next_state
+                coach_reference_question = current_question
+                if rag_service is not None and getattr(rag_service, 'enabled', False):
+                    coach_decision_context = rag_service.format_followup_decision(coach_decision)
+                coach_question_context_parts = [rag_context, coach_decision_context]
 
         if not next_question_text:
             next_question_text = llm_manager.generate_round_question(
@@ -1716,6 +1797,11 @@ def _generate_policy_response(
             'coach_reference_outline': coach_payload.get('reference_outline') or [],
             'coach_improvement_tip': coach_payload.get('improvement_tip') or '',
         })
+        coach_decision = _with_runtime_question(
+            coach_decision,
+            reply_text=coach_next_question or coach_display_text,
+            fallback_question=coach_reference_question or current_question,
+        )
         return coach_display_text or coach_next_question, analysis_result, coach_decision, coach_state, next_question_plan
 
     if fixed_question:
@@ -1735,6 +1821,11 @@ def _generate_policy_response(
             round_type=round_type,
             chat_history=chat_history,
             rag_context=_merge_text_blocks(rag_context, decision_context, fixed_context)
+        )
+        fixed_decision = _with_runtime_question(
+            fixed_decision,
+            reply_text=feedback,
+            fallback_question=fixed_question,
         )
         return feedback, analysis_result, fixed_decision, next_state, question_plan
 
@@ -1756,25 +1847,38 @@ def _generate_policy_response(
         )
         next_question_context = rag_service.format_question_plan(next_question_plan)
         reference_question = _extract_question_text_from_plan(next_question_plan)
-        next_question = llm_manager.generate_round_question(
-            round_type=round_type,
-            position=position,
-            difficulty=target_difficulty,
-            rag_context=_merge_text_blocks(decision_context, next_question_context),
-            reference_question=reference_question,
-        )
-        if next_question:
+        next_question = ""
+        if reference_question:
+            next_question = llm_manager.generate_round_question(
+                round_type=round_type,
+                position=position,
+                difficulty=target_difficulty,
+                rag_context=_merge_text_blocks(decision_context, next_question_context),
+                reference_question=reference_question,
+            )
+        if next_question and next_question_plan:
             intro = "这个点先到这里，我们换一个方向。" if next_action == 'switch_question' else "这部分回答得比较扎实，我们提升一点难度。"
             final_state = planning_state
-            if next_question_plan:
-                final_state = rag_service.mark_question_asked(planning_state, next_question_plan)
+            final_state = rag_service.mark_question_asked(planning_state, next_question_plan)
+            switched_decision = _with_runtime_question(
+                followup_decision,
+                reply_text=next_question,
+                fallback_question=next_question,
+            )
             return (
                 f"{intro}\n\n{next_question}",
                 analysis_result,
-                followup_decision,
+                switched_decision,
                 final_state,
                 next_question_plan,
             )
+        followup_decision = _downgrade_switch_decision(
+            followup_decision,
+            reason='switch_generation_failed',
+        )
+        if rag_service is not None and getattr(rag_service, 'enabled', False):
+            decision_context = rag_service.format_followup_decision(followup_decision)
+        next_action = str((followup_decision or {}).get('next_action', 'ask_followup')).strip()
 
     if next_action == 'ask_followup' and followup_decision:
         targeted_followup_question = str(followup_decision.get('followup_question') or '').strip()
@@ -1789,6 +1893,11 @@ def _generate_policy_response(
                 followup_hint=targeted_followup_question,
                 rag_context=_merge_text_blocks(rag_context, decision_context),
             )
+            followup_decision = _with_runtime_question(
+                followup_decision,
+                reply_text=followup_text,
+                fallback_question=targeted_followup_question or current_question,
+            )
             return followup_text, analysis_result, followup_decision, next_state, question_plan
 
     feedback = llm_manager.process_answer_with_round(
@@ -1798,6 +1907,11 @@ def _generate_policy_response(
         round_type=round_type,
         chat_history=chat_history,
         rag_context=_merge_text_blocks(rag_context, decision_context)
+    )
+    followup_decision = _with_runtime_question(
+        followup_decision,
+        reply_text=feedback,
+        fallback_question=current_question,
     )
     return feedback, analysis_result, followup_decision, next_state, question_plan
 
@@ -2186,6 +2300,7 @@ def _derive_detection_events_and_stats(report_data: dict) -> tuple[list[dict], d
         'frames_processed': int((report_data or {}).get('summary', {}).get('frames_processed', 0) or len(timeline)),
         'avg_heart_rate': round(avg_heart_rate, 2) if isinstance(avg_heart_rate, (int, float)) else None,
         'rppg_reliable_ratio': round(rppg_reliable_ratio, 2) if isinstance(rppg_reliable_ratio, (int, float)) else None,
+        'heart_rate_samples': int(len(hr_values)),
     }
     return events, stats
 
@@ -2432,7 +2547,11 @@ def _wait_for_turn_fusion_score(
 
 
 def _should_auto_end_interview(runtime, current_turn_id: str):
-    question_count = int(getattr(runtime, 'formal_question_count', 0) or 0)
+    interaction_question_count = int(getattr(runtime, 'formal_question_count', 0) or 0)
+    topic_question_count = int(getattr(runtime, 'topic_question_count', 0) or 0)
+    if topic_question_count <= 0:
+        topic_question_count = interaction_question_count
+    question_count = topic_question_count
     current_turn_sequence = _extract_turn_sequence(current_turn_id)
     min_questions = _parse_auto_end_question_limit(
         getattr(runtime, 'auto_end_min_questions', AUTO_END_MIN_QUESTIONS),
@@ -2447,6 +2566,8 @@ def _should_auto_end_interview(runtime, current_turn_id: str):
 
     decision = {
         'question_count': question_count,
+        'topic_question_count': topic_question_count,
+        'interaction_question_count': interaction_question_count,
         'recent_scores': [],
         'recent_average': None,
         'reason': '',
@@ -3024,7 +3145,11 @@ def _process_runtime_commit(runtime, answer_text: str, turn_id: str, source: str
         _log_runtime_event(runtime, 'commit_dropped', source=source, dropped_turn_id=turn_id, answer_preview=normalized_answer[:160])
         return
 
-    current_question = runtime.current_question or _get_last_interviewer_question(runtime.chat_history)
+    current_question = (
+        str(getattr(runtime, 'current_question_core', '') or '').strip()
+        or str(runtime.current_question or '').strip()
+        or _get_last_interviewer_question(runtime.chat_history)
+    )
     if not current_question:
         _emit_pipeline_error(runtime.client_id, runtime.session_id, 'QUESTION_MISSING', 'Current question is missing')
         return
@@ -3075,8 +3200,13 @@ def _process_runtime_commit(runtime, answer_text: str, turn_id: str, source: str
                 next_turn_id = current.next_turn()
                 _set_runtime_asr_lock(current, False)
                 current.current_question_kind = 'formal'
-                current.current_question = normalized_reply['display_text']
+                current.current_question_core = _extract_runtime_question_core(
+                    normalized_reply['display_text'],
+                    fallback=queued_formal_question,
+                )
+                current.current_question = current.current_question_core
                 current.formal_question_count += 1
+                current.topic_question_count += 1
                 current.last_question_plan = current.pending_formal_question_plan
                 current.pending_formal_question = ""
                 current.pending_formal_question_plan = None
@@ -3215,11 +3345,27 @@ def _process_runtime_commit(runtime, answer_text: str, turn_id: str, source: str
             }
             next_turn_id = current.next_turn()
             _set_runtime_asr_lock(current, False)
-            next_runtime_question = str((followup_decision or {}).get('coach_next_question') or normalized_reply['display_text']).strip()
+            next_runtime_question = str(
+                (followup_decision or {}).get('runtime_question')
+                or (followup_decision or {}).get('coach_next_question')
+                or ''
+            ).strip()
+            if not next_runtime_question:
+                next_runtime_question = _extract_runtime_question_core(
+                    normalized_reply['display_text'],
+                    fallback=current.current_question,
+                )
             current.current_question_kind = 'formal'
+            current.current_question_core = next_runtime_question
             current.current_question = next_runtime_question
             current.formal_question_count += 1
-            _track_question_timeline(current, next_turn_id, next_runtime_question)
+            if next_action in {'switch_question', 'raise_difficulty'} and next_question_plan:
+                current.topic_question_count += 1
+            _track_question_timeline(
+                current,
+                next_turn_id,
+                normalized_reply['spoken_text'] or normalized_reply['display_text'],
+            )
             current.chat_history.append({
                 'role': 'interviewer',
                 'content': normalized_reply['display_text']
@@ -3322,7 +3468,7 @@ def _assistant_client_key() -> str:
 def _assistant_user_id(payload: dict | None = None) -> str:
     payload = payload or {}
     candidates = [
-        request.headers.get('X-HireSpark-User', ''),
+        request.headers.get('X-职跃星辰-User', ''),
         request.args.get('user_id', ''),
         payload.get('user_id', ''),
         payload.get('email', ''),
@@ -4020,7 +4166,7 @@ def _assistant_collect_rag_context(user_message: str, history_messages: list[dic
 
 def _assistant_base_system_prompt(extra_prompt: str = '') -> str:
     base_prompt = (
-        "你是 HireSpark 的 AI 问答助手，主要帮助用户完成求职准备、项目表达梳理、岗位理解、"
+        "你是 职跃星辰 的 AI 问答助手，主要帮助用户完成求职准备、项目表达梳理、岗位理解、"
         "面试复盘、简历优化与训练建议总结。\n"
         "回答风格要求：中文优先，简洁清晰，尽量给出可执行建议。\n"
         "如果知识库证据充足，优先依据知识库回答；如果证据不足，要明确说明哪些内容属于一般经验补充。"
@@ -5728,11 +5874,20 @@ def handle_session_start(data=None):
         runtime.current_question_kind = 'intro' if should_use_intro_turn else 'formal'
         runtime.current_question = normalized_question['display_text']
         if runtime.current_question_kind == 'formal':
+            runtime.current_question_core = str(queued_formal_question or '').strip() or _extract_runtime_question_core(
+                normalized_question['display_text'],
+                fallback=normalized_question['display_text'],
+            )
+            runtime.current_question = runtime.current_question_core
+        else:
+            runtime.current_question_core = normalized_question['display_text']
+        if runtime.current_question_kind == 'formal':
             runtime.formal_question_count += 1
+            runtime.topic_question_count += 1
         _track_question_timeline(runtime, runtime.turn_id, normalized_question['spoken_text'] or normalized_question['display_text'])
         runtime.chat_history.append({
             'role': 'interviewer',
-            'content': runtime.current_question
+            'content': normalized_question['display_text']
         })
 
         _log_runtime_event(
@@ -5852,6 +6007,11 @@ def handle_session_end(data=None):
 
         report_path = ""
         if report_data:
+            try:
+                report_path = report_generator.generate_report(report_data)
+            except Exception as exc:
+                report_path = ""
+                logger.warning(f"检测报告落盘失败，报告页将只能展示摘要统计：{exc}")
             derived_events, derived_stats = _derive_detection_events_and_stats(report_data)
             risk_stats = report_data.get('statistics') if isinstance(report_data.get('statistics'), dict) else {}
             max_probability = _normalize_risk_probability(risk_stats.get('max_probability'))

@@ -24,8 +24,8 @@ export type DiscussionItem = {
     createdAt: number
 }
 
-const BOOKMARK_KEY = 'hirespark.question.bookmarks.v1'
-const DISCUSSION_KEY = 'hirespark.question.discussions.v1'
+const BOOKMARK_KEY = 'zhiyuexingchen.question.bookmarks.v1'
+const DISCUSSION_KEY = 'zhiyuexingchen.question.discussions.v1'
 
 function readBookmarks(): QuestionBookItem[] {
     try {

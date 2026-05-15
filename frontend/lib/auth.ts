@@ -1,8 +1,8 @@
-export const AUTH_COOKIE_NAME = 'hirespark_session'
+export const AUTH_COOKIE_NAME = 'zhiyuexingchen_session'
 
-export const DEFAULT_LOGIN_EMAIL = 'admin@hirespark.cn'
-export const DEFAULT_LOGIN_PASSWORD = 'HireSpark123'
-export const DEFAULT_LOGIN_NAME = 'HireSpark 管理员'
+export const DEFAULT_LOGIN_EMAIL = 'admin@zhiyuexingchen.cn'
+export const DEFAULT_LOGIN_PASSWORD = '职跃星辰123'
+export const DEFAULT_LOGIN_NAME = '职跃星辰 管理员'
 
 const DEFAULT_SESSION_TTL_SECONDS = 60 * 60 * 24 * 7
 

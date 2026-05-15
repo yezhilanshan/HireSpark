@@ -8,6 +8,8 @@ export default function LivenessPage() {
     const router = useRouter()
     const videoRef = useRef<HTMLVideoElement>(null)
     const canvasRef = useRef<HTMLCanvasElement>(null)
+    const socketRef = useRef<SocketClient | null>(null)
+    const verifiedRedirectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
     const [socket, setSocket] = useState<SocketClient | null>(null)
 
     const [cameraReady, setCameraReady] = useState(false)
@@ -18,14 +20,19 @@ export default function LivenessPage() {
     const [verified, setVerified] = useState(false)
 
     useEffect(() => {
+        void router.prefetch('/interview')
         initCamera()
-        initSocket()
+        void initSocket()
 
         return () => {
             stopCamera()
-            socket?.disconnect()
+            if (verifiedRedirectTimerRef.current) {
+                clearTimeout(verifiedRedirectTimerRef.current)
+                verifiedRedirectTimerRef.current = null
+            }
+            socketRef.current?.disconnect()
         }
-    }, [])
+    }, [router])
 
     const initCamera = async () => {
         try {
@@ -53,6 +60,7 @@ export default function LivenessPage() {
 
     const initSocket = async () => {
         const socketClient = SocketClient.getInstance()
+        socketRef.current = socketClient
 
         try {
             await socketClient.connect()
@@ -66,9 +74,12 @@ export default function LivenessPage() {
 
                 if (data.verified) {
                     setVerified(true)
-                    setTimeout(() => {
+                    if (verifiedRedirectTimerRef.current) {
+                        clearTimeout(verifiedRedirectTimerRef.current)
+                    }
+                    verifiedRedirectTimerRef.current = setTimeout(() => {
                         router.push('/interview')
-                    }, 1500)
+                    }, 120)
                 }
             })
 

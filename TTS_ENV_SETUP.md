@@ -10,11 +10,16 @@
 
 ## 推荐环境
 
+完整依赖清单见 `CONDA_ENV_DEPENDENCIES.md`。当前一键启动脚本默认使用：
+
+- 主后端环境：`interview`
+- TTS 专用环境：`interview-tts`
+
 ### 1. 主后端环境
 
 ```powershell
-conda create -n interview-anti-cheat python=3.9 -y
-conda activate interview-anti-cheat
+conda create -n interview python=3.10 -y
+conda activate interview
 pip install -r requirements.txt
 ```
 
@@ -25,7 +30,7 @@ pip install -r requirements.txt
 ```powershell
 conda create -n interview-tts python=3.10 -y
 conda activate interview-tts
-pip install -r requirements.txt
+pip install -r requirements.txt -r requirements-tts.txt
 ```
 
 使用 MeloTTS：
@@ -33,7 +38,7 @@ pip install -r requirements.txt
 ```powershell
 conda create -n interview-tts python=3.10 -y
 conda activate interview-tts
-pip install -r requirements.txt
+pip install -r requirements.txt -r requirements-tts.txt
 ```
 
 ## 为什么这样拆

@@ -732,6 +732,9 @@ class DatabaseManager:
             ''')
 
             # 兼容逻辑保留（幂等）
+            self._ensure_column_exists(conn, 'statistics', 'avg_heart_rate', 'REAL')
+            self._ensure_column_exists(conn, 'statistics', 'rppg_reliable_ratio', 'REAL')
+            self._ensure_column_exists(conn, 'statistics', 'heart_rate_samples', 'INTEGER DEFAULT 0')
             self._ensure_column_exists(
                 conn=conn,
                 table_name='interview_dialogues',
@@ -966,21 +969,28 @@ class DatabaseManager:
                     cursor.execute('''
                         INSERT INTO statistics
                         (interview_id, total_deviations, total_mouth_open,
-                         total_multi_person, off_screen_ratio, frames_processed)
-                        VALUES (?, ?, ?, ?, ?, ?)
+                         total_multi_person, off_screen_ratio, frames_processed,
+                         avg_heart_rate, rppg_reliable_ratio, heart_rate_samples)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(interview_id) DO UPDATE SET
                             total_deviations = excluded.total_deviations,
                             total_mouth_open = excluded.total_mouth_open,
                             total_multi_person = excluded.total_multi_person,
                             off_screen_ratio = excluded.off_screen_ratio,
-                            frames_processed = excluded.frames_processed
+                            frames_processed = excluded.frames_processed,
+                            avg_heart_rate = excluded.avg_heart_rate,
+                            rppg_reliable_ratio = excluded.rppg_reliable_ratio,
+                            heart_rate_samples = excluded.heart_rate_samples
                     ''', (
                         interview_id,
                         stats.get('total_deviations', 0),
                         stats.get('total_mouth_open', 0),
                         stats.get('total_multi_person', 0),
                         stats.get('off_screen_ratio', 0.0),
-                        stats.get('frames_processed', 0)
+                        stats.get('frames_processed', 0),
+                        stats.get('avg_heart_rate'),
+                        stats.get('rppg_reliable_ratio'),
+                        stats.get('heart_rate_samples', 0)
                     ))
                     conn.commit()
 

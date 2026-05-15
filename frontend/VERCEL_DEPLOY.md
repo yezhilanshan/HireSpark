@@ -19,9 +19,9 @@ Set these environment variables in Vercel:
 ```env
 NEXT_PUBLIC_BACKEND_URL=/backend-proxy
 PUBLIC_SITE_URL=https://<your-project>.vercel.app
-AUTH_LOGIN_EMAIL=admin@hirespark.cn
+AUTH_LOGIN_EMAIL=admin@zhiyuexingchen.cn
 AUTH_LOGIN_PASSWORD=your-password
-AUTH_LOGIN_NAME=HireSpark 管理员
+AUTH_LOGIN_NAME=职跃星辰 管理员
 VERCEL_BACKEND_ORIGIN=http://182.92.78.45:5000
 ```
 

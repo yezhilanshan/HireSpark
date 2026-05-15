@@ -6,7 +6,7 @@ import SocketClient from '@/lib/socket'
 import { useFacePhysRppg } from '@/lib/facephys/useFacePhysRppg'
 import { useFaceBehaviorMetrics } from '@/lib/facephys/useFaceBehaviorMetrics'
 import { getBackendBaseUrl } from '@/lib/backend'
-import { Mic, Loader2, ArrowRight, User, X, CheckCircle2, MessageSquare } from 'lucide-react'
+import { Mic, Loader2, ArrowRight, User, X, CheckCircle2, MessageSquare, Activity, Eye, HeartPulse, Gauge } from 'lucide-react'
 
 const parseBooleanEnv = (value: string | undefined, fallback: boolean) => {
     if (value == null) return fallback
@@ -30,7 +30,7 @@ const SERVER_ASR_RECHECK_DELAY_MS = 1100
 const ENABLE_BROWSER_ASR_STALL_FALLBACK = false
 const ASR_DEBUG_PANEL_ENABLED = false
 const ASR_DEBUG_MAX_ITEMS = 120
-const KNOWLEDGE_GRAPH_REFRESH_KEY = 'hirespark:knowledge-graph:refresh'
+const KNOWLEDGE_GRAPH_REFRESH_KEY = 'zhiyuexingchen:knowledge-graph:refresh'
 const BASE_SILENCE_MS = 1650
 const BROWSER_SILENCE_BONUS_MS = 220
 const NOISY_ENV_SILENCE_BONUS_MS = 320
@@ -352,6 +352,22 @@ export default function InterviewPage() {
         if (!Number.isFinite(parsed)) return fallback
         const factor = 10 ** digits
         return Math.round(parsed * factor) / factor
+    }
+
+    const formatDetectionMetric = (value: unknown, digits = 1, suffix = '', fallback = '--') => {
+        const parsed = Number(value)
+        if (!Number.isFinite(parsed)) return fallback
+        return `${parsed.toFixed(digits)}${suffix}`
+    }
+
+    const formatDetectionStatus = (status?: string) => {
+        const normalized = String(status || '').trim()
+        if (normalized === 'tracking') return '检测中'
+        if (normalized === 'loading') return '加载中'
+        if (normalized === 'unstable') return '信号弱'
+        if (normalized === 'no_face') return '未检测到人脸'
+        if (normalized === 'error') return '异常'
+        return '待启动'
     }
 
     const buildInterviewId = (sessionId: string) => {
@@ -2175,6 +2191,58 @@ export default function InterviewPage() {
         interviewStarted
     ])
 
+    const liveDetection = (() => {
+        const pulseMetrics = rppgMetrics
+        const behaviorMetrics = faceBehaviorMetrics
+        const hasFace = Boolean(behaviorMetrics.hasFace || pulseMetrics.hasFace)
+        const faceCount = hasFace ? Math.max(1, Math.floor(toFiniteNumber(behaviorMetrics.faceCount, 1))) : 0
+        const headPose = behaviorMetrics.headPose
+        const gazeMagnitude = clamp(toFiniteNumber(behaviorMetrics.irisTracking.gaze_offset_magnitude, 0), 0, 1)
+        const driftCount = Math.max(0, Math.floor(toFiniteNumber(behaviorMetrics.irisTracking.drift_count, 0)))
+        const blinkRate = Math.max(0, toFiniteNumber(behaviorMetrics.blendshapes.blink_rate_per_min, 0))
+        const jawOpenAvg = clamp(toFiniteNumber(behaviorMetrics.blendshapes.jaw_open_avg, 0), 0, 1)
+        const faceDistanceZ = roundMetric(behaviorMetrics.landmarks3d.face_distance_z, 6, null)
+        const offScreen = hasFace ? clamp(gazeMagnitude * 130, 0, 100) : 100
+        const hasLandmarks = toFiniteNumber(behaviorMetrics.landmarks3d.landmark_count, 0) >= 468
+        const absYaw = Math.abs(toFiniteNumber(headPose?.yaw, 0))
+        const absPitch = Math.abs(toFiniteNumber(headPose?.pitch, 0))
+        const absRoll = Math.abs(toFiniteNumber(headPose?.roll, 0))
+        const poseUnstable = absYaw >= 28 || absPitch >= 20 || absRoll >= 20
+        const gazeDriftHigh = driftCount >= 8 || offScreen >= 35
+        const blinkHigh = blinkRate >= 45
+        const distanceTooClose = faceDistanceZ !== null && faceDistanceZ < -0.12
+        const distanceTooFar = faceDistanceZ !== null && faceDistanceZ > -0.02
+        let riskScore = 18
+        if (!hasFace) {
+            riskScore = 35
+        } else {
+            if (poseUnstable) riskScore = Math.max(riskScore, 48)
+            if (gazeDriftHigh) riskScore = Math.max(riskScore, 58)
+            if (blinkHigh) riskScore = Math.max(riskScore, 32)
+            if (distanceTooClose || distanceTooFar) riskScore = Math.max(riskScore, 25)
+            if (faceCount > 1) riskScore = Math.max(riskScore, 85)
+            if (!hasLandmarks) riskScore = Math.max(riskScore, 30)
+            if (pulseMetrics.status === 'unstable') riskScore = Math.max(riskScore, 24)
+            if (pulseMetrics.status === 'error') riskScore = Math.max(riskScore, 28)
+            if (!pulseMetrics.isReliable) riskScore = Math.max(riskScore, 20)
+            if (pulseMetrics.hr !== null && (pulseMetrics.hr < 48 || pulseMetrics.hr > 125)) riskScore = Math.max(riskScore, 22)
+        }
+        riskScore = clamp(riskScore, 0, 100)
+        return {
+            hasFace,
+            faceCount,
+            riskScore,
+            riskLevel: riskScore >= 75 ? '高' : riskScore >= 40 ? '中' : '低',
+            offScreen,
+            gazeMagnitude,
+            driftCount,
+            blinkRate,
+            jawOpenAvg,
+            headPose,
+            faceDistanceZ,
+        }
+    })()
+
     const difficultyText = interviewConfig.difficulty === 'easy'
         ? '简单'
         : interviewConfig.difficulty === 'medium'
@@ -2348,6 +2416,66 @@ export default function InterviewPage() {
                     </div>
 
                     <aside className="flex min-h-[320px] w-full shrink-0 flex-col overflow-hidden rounded-2xl border border-[#E5E5E5] bg-white/95 shadow-sm md:min-h-0 md:w-[min(280px,28vw)] lg:w-[300px]">
+                        <div className="border-b border-[#E5E5E5] bg-white px-4 py-3">
+                            <div className="flex items-center justify-between gap-2">
+                                <div>
+                                    <h3 className="text-sm font-medium text-[#111111]">实时检测指标</h3>
+                                    <p className="mt-1 text-xs text-[#666666]">
+                                        视觉 {formatDetectionStatus(faceBehaviorMetrics.status)} · 生理 {formatDetectionStatus(rppgMetrics.status)}
+                                    </p>
+                                </div>
+                                <span className={`shrink-0 rounded-full px-2 py-1 text-[10px] font-semibold ${liveDetection.riskScore >= 75
+                                    ? 'bg-[#FDECEC] text-[#9D3A2E]'
+                                    : liveDetection.riskScore >= 40
+                                        ? 'bg-[#FFF4D8] text-[#8A5A00]'
+                                        : 'bg-[#EAF6EF] text-[#256A43]'
+                                    }`}>
+                                    风险{liveDetection.riskLevel}
+                                </span>
+                            </div>
+
+                            <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
+                                <div className="rounded-lg border border-[#EFEDE8] bg-[#FAFAFA] p-2">
+                                    <div className="flex items-center gap-1.5 text-[#777268]"><Eye size={13} />人脸</div>
+                                    <p className="mt-1 font-mono text-sm text-[#111111]">{liveDetection.hasFace ? `${liveDetection.faceCount} 张` : '未检测'}</p>
+                                    <p className="mt-0.5 text-[10px] text-[#8A8376]">关键点 {formatDetectionMetric(faceBehaviorMetrics.landmarks3d.landmark_count, 0)}</p>
+                                </div>
+                                <div className="rounded-lg border border-[#EFEDE8] bg-[#FAFAFA] p-2">
+                                    <div className="flex items-center gap-1.5 text-[#777268]"><HeartPulse size={13} />心率</div>
+                                    <p className="mt-1 font-mono text-sm text-[#111111]">{rppgMetrics.hr !== null ? formatDetectionMetric(rppgMetrics.hr, 1, ' bpm') : '--'}</p>
+                                    <p className="mt-0.5 text-[10px] text-[#8A8376]">SQI {formatDetectionMetric(rppgMetrics.sqi, 2)} · {rppgMetrics.isReliable ? '可靠' : '待稳定'}</p>
+                                </div>
+                                <div className="rounded-lg border border-[#EFEDE8] bg-[#FAFAFA] p-2">
+                                    <div className="flex items-center gap-1.5 text-[#777268]"><Activity size={13} />视线</div>
+                                    <p className="mt-1 font-mono text-sm text-[#111111]">{formatDetectionMetric(100 - liveDetection.offScreen, 1, '%')}</p>
+                                    <p className="mt-0.5 text-[10px] text-[#8A8376]">偏移 {formatDetectionMetric(liveDetection.gazeMagnitude, 4)} · 漂移 {liveDetection.driftCount}</p>
+                                </div>
+                                <div className="rounded-lg border border-[#EFEDE8] bg-[#FAFAFA] p-2">
+                                    <div className="flex items-center gap-1.5 text-[#777268]"><Gauge size={13} />风险</div>
+                                    <p className="mt-1 font-mono text-sm text-[#111111]">{formatDetectionMetric(liveDetection.riskScore, 0, '/100')}</p>
+                                    <p className="mt-0.5 text-[10px] text-[#8A8376]">样本 {formatDetectionMetric(faceBehaviorMetrics.sampleCount, 0)} · FPS {formatDetectionMetric(rppgMetrics.fps, 1)}</p>
+                                </div>
+                            </div>
+
+                            <div className="mt-2 rounded-lg border border-[#EFEDE8] bg-[#FCFCFB] p-2 text-[11px] text-[#666666]">
+                                <div className="grid grid-cols-3 gap-1 font-mono text-[#111111]">
+                                    <span>Pitch {formatDetectionMetric(liveDetection.headPose?.pitch, 1, '°')}</span>
+                                    <span>Yaw {formatDetectionMetric(liveDetection.headPose?.yaw, 1, '°')}</span>
+                                    <span>Roll {formatDetectionMetric(liveDetection.headPose?.roll, 1, '°')}</span>
+                                </div>
+                                <div className="mt-1 grid grid-cols-3 gap-1 font-mono text-[#111111]">
+                                    <span>眨眼 {formatDetectionMetric(liveDetection.blinkRate, 1)}</span>
+                                    <span>开口 {formatDetectionMetric(faceBehaviorMetrics.landmarks3d.mouth_open_ratio, 3)}</span>
+                                    <span>jaw {formatDetectionMetric(liveDetection.jawOpenAvg, 3)}</span>
+                                </div>
+                                <div className="mt-1 grid grid-cols-3 gap-1 font-mono text-[#111111]">
+                                    <span>smile {formatDetectionMetric(faceBehaviorMetrics.blendshapes.smile_avg, 3)}</span>
+                                    <span>brow {formatDetectionMetric(faceBehaviorMetrics.blendshapes.brow_inner_up_avg, 3)}</span>
+                                    <span>Z {formatDetectionMetric(liveDetection.faceDistanceZ, 4)}</span>
+                                </div>
+                            </div>
+                        </div>
+
                         <div className="border-b border-[#E5E5E5] bg-[#FAFAFA] px-4 py-3">
                             <h3 className="text-sm font-medium text-[#111111]">面试转写</h3>
                             <p className="mt-1 text-xs text-[#666666]">已记录 {chatMessages.length} 条对话</p>

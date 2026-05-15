@@ -22,8 +22,8 @@ import {
 } from 'lucide-react'
 import LogoutAction from '@/components/LogoutAction'
 
-const SIDEBAR_COLLAPSE_KEY = 'hirespark.sidebar.collapsed'
-const SIDEBAR_PROFILE_KEY = 'hirespark.sidebar.profile'
+const SIDEBAR_COLLAPSE_KEY = 'zhiyuexingchen.sidebar.collapsed'
+const SIDEBAR_PROFILE_KEY = 'zhiyuexingchen.sidebar.profile'
 
 const MAIN_NAV_ITEMS = [
     { href: '/dashboard', label: '主工作台', icon: LayoutDashboard },
