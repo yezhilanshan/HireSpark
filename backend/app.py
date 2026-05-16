@@ -2,6 +2,13 @@
 Flask 主服务 - Socket.IO 实时通信
 AI 模拟面试与能力提升平台【改造进行中】
 """
+import os
+
+SOCKETIO_ASYNC_MODE = os.environ.get('SOCKETIO_ASYNC_MODE', 'gevent').strip() or 'gevent'
+if SOCKETIO_ASYNC_MODE == 'gevent':
+    from gevent import monkey
+    monkey.patch_all()
+
 from flask import Flask, request, jsonify, send_file, Response, stream_with_context
 from flask_socketio import SocketIO, emit
 from flask_cors import CORS # 跨域资源共享中间件
@@ -9,7 +16,6 @@ import base64
 import hashlib
 import hmac
 import time
-import os
 import json
 import threading
 import uuid
@@ -384,11 +390,11 @@ logger.info(f"Flask 应用初始化完成 - Host: {FLASK_HOST}, Port: {FLASK_POR
 socketio = SocketIO(
     app,
     cors_allowed_origins=CORS_ORIGINS,
-    async_mode='threading', # 允许使用多线程模式，避免 eventlet/gevent 兼容问题
+    async_mode=SOCKETIO_ASYNC_MODE,
     max_http_buffer_size=config.get('server.max_buffer_size', 10485760)
 )
 
-logger.info("Socket.IO 初始化完成")
+logger.info(f"Socket.IO 初始化完成 - async_mode={socketio.async_mode}")
 
 if llm_manager is None:
     logger.error(f"LLM 初始化失败，相关功能不可用：{llm_import_error}")
@@ -11128,13 +11134,16 @@ if __name__ == '__main__':
         logger.info("启动 AI 模拟面试平台")
         logger.info("=" * 60)
 
-        socketio.run(
-            app,
-            host=FLASK_HOST,
-            port=FLASK_PORT,
-            debug=FLASK_DEBUG,
-            allow_unsafe_werkzeug=True
-        )
+        run_options = {
+            'host': FLASK_HOST,
+            'port': FLASK_PORT,
+            'debug': FLASK_DEBUG,
+            'use_reloader': False,
+        }
+        if socketio.async_mode == 'threading':
+            run_options['allow_unsafe_werkzeug'] = True
+
+        socketio.run(app, **run_options)
     except Exception as e:
         logger.error(f"应用启动失败：{e}", exc_info=True)
         raise

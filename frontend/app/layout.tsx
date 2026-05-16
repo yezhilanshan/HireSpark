@@ -1,21 +1,18 @@
 import type { Metadata, Viewport } from 'next'
-import { Inter, Newsreader } from 'next/font/google'
 import localFont from 'next/font/local'
 import './globals.css'
 import { ThemeProvider } from '@/components/ThemeProvider'
 import ClientLayout from '@/components/ClientLayout'
 import { PwaRegister } from '@/components/PwaRegister'
 
-const inter = Inter({ subsets: ['latin'], variable: '--font-sans' })
-const newsreader = Newsreader({ subsets: ['latin'], variable: '--font-serif', style: ['normal', 'italic'] })
-const sourceHanSans = localFont({
+const sansFont = localFont({
     src: [{ path: './fonts/NotoSansSC-VF.ttf', weight: '100 900', style: 'normal' }],
-    variable: '--font-zh-sans',
+    variable: '--font-sans',
     display: 'swap',
 })
-const sourceHanSerif = localFont({
+const serifFont = localFont({
     src: [{ path: './fonts/NotoSerifSC-VF.ttf', weight: '100 900', style: 'normal' }],
-    variable: '--font-zh-serif',
+    variable: '--font-serif',
     display: 'swap',
 })
 
@@ -57,7 +54,7 @@ export default function RootLayout({
     return (
         <html
             lang="zh-CN"
-            className={`${inter.variable} ${newsreader.variable} ${sourceHanSans.variable} ${sourceHanSerif.variable}`}
+            className={`${sansFont.variable} ${serifFont.variable}`}
             suppressHydrationWarning
         >
             <body className="font-sans bg-[var(--background)] text-[var(--ink)] antialiased selection:bg-[var(--accent)] selection:text-[var(--ink)] transition-colors duration-300">

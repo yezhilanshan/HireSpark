@@ -84,16 +84,19 @@ class SocketClient {
                     path: socketTarget.path,
                     transports,
                     upgrade: true,
-                    reconnection: true,
-                    reconnectionAttempts: Infinity,
-                    reconnectionDelay: 1000,
-                    reconnectionDelayMax: 5000,
-                    timeout: 8000,
+                    // Initial connection is controlled by this Promise. Let the page show a
+                    // clear backend-unavailable error instead of Socket.IO retrying forever.
+                    reconnection: false,
+                    timeout: 4000,
                 });
 
                 this.socket.once('connect', () => {
                     console.log(`Connected to server via ${transports.join(', ')}`);
                     resolve();
+                });
+
+                this.socket.io.engine.once('upgrade', (transport) => {
+                    console.log(`Socket transport upgraded to ${transport.name}`);
                 });
 
                 this.socket.once('connect_error', (error) => {
@@ -108,14 +111,8 @@ class SocketClient {
             });
         };
 
-        // 使用 polling 起连再升级到 websocket，避免在 Werkzeug 开发服务器上 websocket 强连导致 500。
+        // Start with polling and let Socket.IO upgrade to WebSocket when the backend supports it.
         this.connectPromise = connectWithTransports(['polling', 'websocket'])
-            .catch((mixedError) => {
-                console.warn('Mixed transport connection failed, retry with polling only.');
-                return connectWithTransports(['polling']).catch(() => {
-                    throw mixedError;
-                });
-            })
             .finally(() => {
                 this.connectPromise = null;
             });
