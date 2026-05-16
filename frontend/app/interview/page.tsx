@@ -31,6 +31,8 @@ const ENABLE_BROWSER_ASR_STALL_FALLBACK = false
 const ASR_DEBUG_PANEL_ENABLED = false
 const ASR_DEBUG_MAX_ITEMS = 120
 const KNOWLEDGE_GRAPH_REFRESH_KEY = 'zhiyuexingchen:knowledge-graph:refresh'
+const DEFAULT_SHORT_PAUSE_MS = 900
+const DEFAULT_LONG_PAUSE_MS = 4500
 const BASE_SILENCE_MS = 1650
 const BROWSER_SILENCE_BONUS_MS = 220
 const NOISY_ENV_SILENCE_BONUS_MS = 320
@@ -196,6 +198,10 @@ export default function InterviewPage() {
         rough_wpm: 0,
         silence_ms: 0,
         segment_index: 0,
+    })
+    const [speechPauseThresholdMs, setSpeechPauseThresholdMs] = useState({
+        short: DEFAULT_SHORT_PAUSE_MS,
+        long: DEFAULT_LONG_PAUSE_MS,
     })
     const [finalMetricsReady, setFinalMetricsReady] = useState(false)
     const [asrDebugEvents, setAsrDebugEvents] = useState<AsrDebugEvent[]>([])
@@ -648,6 +654,10 @@ export default function InterviewPage() {
             rough_wpm: 0,
             silence_ms: 0,
             segment_index: 0,
+        })
+        setSpeechPauseThresholdMs({
+            short: DEFAULT_SHORT_PAUSE_MS,
+            long: DEFAULT_LONG_PAUSE_MS,
         })
     }
 
@@ -1611,6 +1621,19 @@ export default function InterviewPage() {
                         segment_index: Number(data.speech_metrics_realtime.segment_index || 0),
                     })
                 }
+                const shortPauseMs = Number(data?.short_pause_ms)
+                const longPauseMs = Number(data?.long_pause_ms)
+                if (
+                    Number.isFinite(shortPauseMs)
+                    && Number.isFinite(longPauseMs)
+                    && shortPauseMs > 0
+                    && longPauseMs > shortPauseMs
+                ) {
+                    setSpeechPauseThresholdMs({
+                        short: Math.round(shortPauseMs),
+                        long: Math.round(longPauseMs),
+                    })
+                }
 
                 const displayText = data?.display_text || data?.final_text || data?.live_text || data?.merged_text_draft || ''
                 if (typeof displayText === 'string' && asrChannelRef.current !== 'browser') {
@@ -2037,6 +2060,32 @@ export default function InterviewPage() {
                         : (isRecording || isListening)
                             ? '录音自动进行中'
                             : '等待你开始回答，系统将自动录音'
+    const normalizedShortPauseMs = Math.max(
+        300,
+        Math.round(Number(speechPauseThresholdMs.short || DEFAULT_SHORT_PAUSE_MS)),
+    )
+    const normalizedLongPauseMs = Math.max(
+        normalizedShortPauseMs + 500,
+        Math.round(Number(speechPauseThresholdMs.long || DEFAULT_LONG_PAUSE_MS)),
+    )
+    const realtimeSpeechRate = Math.max(0, Math.round(Number(speechRealtimeMetrics.rough_wpm || 0)))
+    const realtimeSilenceMs = Math.max(0, Math.round(Number(speechRealtimeMetrics.silence_ms || 0)))
+    const realtimeSegmentIndex = Math.max(0, Math.round(Number(speechRealtimeMetrics.segment_index || 0)))
+    const realtimePauseStatus = speechRealtimeMetrics.is_speaking
+        ? '讲话中'
+        : realtimeSilenceMs >= normalizedLongPauseMs
+            ? '长停顿'
+            : realtimeSilenceMs >= normalizedShortPauseMs
+                ? '短停顿'
+                : '轻停顿'
+    const realtimePauseToneClass = speechRealtimeMetrics.is_speaking
+        ? 'bg-[#EAF6EF] text-[#256A43]'
+        : realtimeSilenceMs >= normalizedLongPauseMs
+            ? 'bg-[#FDECEC] text-[#9D3A2E]'
+            : realtimeSilenceMs >= normalizedShortPauseMs
+                ? 'bg-[#FFF4D8] text-[#8A5A00]'
+                : 'bg-[#F0EEEA] text-[#6B655A]'
+    const realtimeSilenceLabel = `${(realtimeSilenceMs / 1000).toFixed(1)}s`
 
     useEffect(() => {
         if (!cameraReady || !socket || !interviewStarted || !sessionIdRef.current) return
@@ -2399,7 +2448,30 @@ export default function InterviewPage() {
                                                 <span className="h-2 w-1 animate-pulse rounded-full bg-[#111111] [animation-delay:480ms]" />
                                             </div>
                                         )}
-                                        <p className="line-clamp-2 text-xs leading-5 text-[#777268]">{autoRecordStatus}</p>
+                                        <div className="min-w-0">
+                                            <p className="line-clamp-2 text-xs leading-5 text-[#777268]">{autoRecordStatus}</p>
+                                            {voiceInputEnabled && (
+                                                <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[10px] leading-4 text-[#6D685F]">
+                                                    <span className="rounded-full border border-[#E8E4DC] bg-[#FAFAFA] px-2 py-0.5">
+                                                        语速 {realtimeSpeechRate} 词/分
+                                                    </span>
+                                                    <span className="rounded-full border border-[#E8E4DC] bg-[#FAFAFA] px-2 py-0.5">
+                                                        静默 {realtimeSilenceLabel}
+                                                    </span>
+                                                    <span className={`rounded-full px-2 py-0.5 ${realtimePauseToneClass}`}>
+                                                        {realtimePauseStatus}
+                                                    </span>
+                                                    <span className="rounded-full border border-[#E8E4DC] bg-[#FAFAFA] px-2 py-0.5">
+                                                        段落 #{Math.max(1, realtimeSegmentIndex)}
+                                                    </span>
+                                                    {finalMetricsReady && (
+                                                        <span className="rounded-full bg-[#EAF3FF] px-2 py-0.5 text-[#2A5DA8]">
+                                                            终稿指标已生成
+                                                        </span>
+                                                    )}
+                                                </div>
+                                            )}
+                                        </div>
                                     </div>
 
                                     <button
