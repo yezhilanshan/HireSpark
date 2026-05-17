@@ -51,7 +51,7 @@ type GraphController = {
 
 function sanitizeGroup(group: string) {
     const value = String(group || '').trim().toLowerCase()
-    if (['knowledge', 'skill', 'concepts'].includes(value)) return 'knowledge'
+    if (['knowledge', 'skill', 'concepts', 'capability'].includes(value)) return 'knowledge'
     if (['project', 'entities'].includes(value)) return 'project'
     if (['weakness', 'risk'].includes(value)) return 'weakness'
     if (['training', 'task', 'summaries'].includes(value)) return 'training'
@@ -60,6 +60,7 @@ function sanitizeGroup(group: string) {
 
 function nodeRadius(node: ForceNode) {
     if (node.type === 'knowledge') return 10 + Math.sqrt(Math.max(node.degree, 1)) * 2.8
+    if (node.type === 'capability') return 12 + Math.sqrt(Math.max(node.degree, 1)) * 2.2
     if (node.type === 'weakness') return 13
     if (node.type === 'project') return 12
     if (node.type === 'training') return 11
@@ -417,7 +418,7 @@ export default function KnowledgeGraphCanvas({
 
                 <div className="pointer-events-none absolute left-5 top-5 flex items-center gap-2 rounded-full border border-[#E7DDC7] bg-[#FFFDF9] px-3 py-1.5 text-xs font-medium text-[#5A6471] shadow-sm dark:border-[#3B4658] dark:bg-[#161E2A] dark:text-[#C6D2E0]">
                     <Move className="h-3.5 w-3.5" />
-                    拖拽节点、滚轮缩放，点击知识点查看详情
+                    拖拽节点、滚轮缩放，点击节点查看详情
                 </div>
 
                 <button

@@ -2,12 +2,13 @@
 Embedding 模块 - 使用 text2vec 中文嵌入模型
 """
 
+import os
 import numpy as np
 
 class TextEmbedder:
     """文本向量化"""
 
-    def __init__(self, model_name='shibing624/text2vec-base-chinese'):
+    def __init__(self, model_name=None):
         """
         初始化 Embedding 模型
 
@@ -17,7 +18,11 @@ class TextEmbedder:
                 - shibing624/text2vec-large-chinese: 更大模型
                 - BAAI/bge-base-zh-v1.5: BGE 中文模型
         """
-        self.model_name = model_name
+        self.model_name = (
+            model_name
+            or str(os.environ.get('EMBEDDING_MODEL', '')).strip()
+            or 'shibing624/text2vec-base-chinese'
+        )
         self.model = None
         self._load_model()
 

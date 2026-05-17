@@ -79,6 +79,8 @@ class SessionRuntime:
     asr_locked: bool = False
     asr_lock_reason: str = ""
     ended: bool = False
+    disconnected_at: float = 0.0
+    disconnect_cleanup_timer: Any = None
     current_answer_session: Any = None
     short_pause_threshold_seconds: float = 0.9
     long_pause_threshold_seconds: float = 4.5
@@ -97,6 +99,7 @@ class SessionRegistry:
     def __init__(self):
         self._lock = threading.RLock()
         self._sessions: Dict[str, SessionRuntime] = {}
+        self._sessions_by_session_id: Dict[str, SessionRuntime] = {}
 
     def create(
         self,
@@ -121,16 +124,54 @@ class SessionRegistry:
             data_manager=DataManager() if DataManager is not None else None,
         )
         with self._lock:
+            existing_for_client = self._sessions.get(client_id)
+            if existing_for_client:
+                self._sessions_by_session_id.pop(existing_for_client.session_id, None)
+            existing_for_session = self._sessions_by_session_id.get(session_id)
+            if existing_for_session:
+                self._sessions.pop(existing_for_session.client_id, None)
             self._sessions[client_id] = runtime
+            self._sessions_by_session_id[session_id] = runtime
         return runtime
 
     def get(self, client_id: str) -> Optional[SessionRuntime]:
         with self._lock:
             return self._sessions.get(client_id)
 
+    def get_by_session_id(self, session_id: str) -> Optional[SessionRuntime]:
+        with self._lock:
+            return self._sessions_by_session_id.get(session_id)
+
+    def rebind_client(self, session_id: str, client_id: str) -> Optional[SessionRuntime]:
+        with self._lock:
+            runtime = self._sessions_by_session_id.get(session_id)
+            if not runtime:
+                return None
+
+            old_client_id = runtime.client_id
+            if old_client_id and old_client_id != client_id:
+                self._sessions.pop(old_client_id, None)
+
+            existing_for_client = self._sessions.get(client_id)
+            if existing_for_client and existing_for_client.session_id != session_id:
+                self._sessions_by_session_id.pop(existing_for_client.session_id, None)
+
+            timer = runtime.disconnect_cleanup_timer
+            if timer:
+                timer.cancel()
+                runtime.disconnect_cleanup_timer = None
+            runtime.client_id = client_id
+            runtime.disconnected_at = 0.0
+            self._sessions[client_id] = runtime
+            self._sessions_by_session_id[session_id] = runtime
+            return runtime
+
     def remove(self, client_id: str) -> Optional[SessionRuntime]:
         with self._lock:
-            return self._sessions.pop(client_id, None)
+            runtime = self._sessions.pop(client_id, None)
+            if runtime and self._sessions_by_session_id.get(runtime.session_id) is runtime:
+                self._sessions_by_session_id.pop(runtime.session_id, None)
+            return runtime
 
 
 class StateOrchestrator:

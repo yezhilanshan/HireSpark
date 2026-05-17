@@ -29,7 +29,10 @@ class ResumeParser:
     def __init__(self):
         """初始化简历解析器"""
         self.enabled = config.get('llm.enabled', False)
-        self.model = 'qwen3-vl-flash'
+        self.model = (
+            str(os.environ.get('RESUME_PARSER_MODEL', '')).strip()
+            or 'qwen3-vl-flash'
+        )
         self.api_key = self._resolve_api_key(config.get('llm.api_key'))
         self.timeout = config.get('llm.timeout', 60)  # 简历解析需要更长时间
 

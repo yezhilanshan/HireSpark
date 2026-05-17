@@ -106,6 +106,40 @@ def _parse_json(value: Any, default: Any) -> Any:
         return default
 
 
+def _extract_numeric_score(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        for key in ('score', 'value', 'overall_score'):
+            if value.get(key) is not None:
+                return _safe_float(value.get(key), 0.0)
+        return None
+    return _safe_float(value, 0.0)
+
+
+def _extract_capability_score(row: Dict[str, Any], capability_key: str, field_name: str) -> Optional[float]:
+    direct_score = _extract_numeric_score(row.get(field_name))
+    if direct_score is not None:
+        return direct_score
+
+    for source_key in ('fusion', 'layer2', 'text_layer', 'scoring_snapshot'):
+        source = row.get(source_key)
+        if not isinstance(source, dict):
+            continue
+        dimension_scores = (
+            source.get('final_dimension_scores')
+            or source.get('dimension_scores')
+            or {}
+        )
+        if not isinstance(dimension_scores, dict):
+            continue
+        nested_score = _extract_numeric_score(dimension_scores.get(capability_key))
+        if nested_score is not None:
+            return nested_score
+
+    return None
+
+
 def _parse_datetime(value: Any) -> Optional[datetime]:
     text = str(value or '').strip()
     if not text:
@@ -293,16 +327,10 @@ class KnowledgeGraphService:
                 round_counter[round_type] += 1
 
             for capability_key, field_name in CAPABILITY_FIELD_MAP.items():
-                score_value = row.get(field_name)
-                if score_value is None:
-                    fusion = row.get('fusion') or {}
-                    dimension_scores = fusion.get('dimension_scores') if isinstance(fusion, dict) else {}
-                    if isinstance(dimension_scores, dict):
-                        score_value = dimension_scores.get(capability_key)
-                if score_value is None:
+                score = _extract_capability_score(row, capability_key, field_name)
+                if score is None:
                     continue
 
-                score = _safe_float(score_value, 0.0)
                 bucket = capability_agg.setdefault(
                     capability_key,
                     {
@@ -483,6 +511,8 @@ class KnowledgeGraphService:
                 'label': '目标岗位',
                 'type': 'TARGETS',
             })
+        else:
+            position_node_id = ''
 
         top_projects = projects[:5]
         for project in top_projects:
@@ -530,6 +560,41 @@ class KnowledgeGraphService:
 
         capability_items.sort(key=lambda item: float(item.get('score') or 0.0), reverse=True)
         capability_map = {item['key']: item for item in capability_items}
+        capability_nodes: List[Dict[str, Any]] = []
+        for item in capability_items:
+            capability_node_id = f"capability:{item['key']}"
+            capability_node = {
+                'id': capability_node_id,
+                'label': item['label'],
+                'type': 'capability',
+                'group': 'capability',
+                'status': item['status'],
+                'score': item['score'],
+                'description': f"{item['label']} 是从近期结构化评估聚合出的能力维度，当前均值 {item['score']} 分，样本数 {item['count']}。",
+                'meta': {
+                    'capability_key': item['key'],
+                    'sample_count': item['count'],
+                    'rounds': item.get('rounds') or [],
+                    'positions': item.get('positions') or [],
+                },
+            }
+            capability_nodes.append(capability_node)
+            add_node(capability_node)
+            add_edge({
+                'id': f"edge:{user_node_id}:{capability_node_id}",
+                'source': user_node_id,
+                'target': capability_node_id,
+                'label': '能力维度',
+                'type': 'HAS_CAPABILITY',
+            })
+            if target_position and position_node_id:
+                add_edge({
+                    'id': f"edge:{position_node_id}:{capability_node_id}",
+                    'source': position_node_id,
+                    'target': capability_node_id,
+                    'label': '岗位要求',
+                    'type': 'REQUIRES_CAPABILITY',
+                })
 
         knowledge_points: List[Dict[str, Any]] = []
         for skill_name in resume_skills[:14]:
@@ -602,9 +667,10 @@ class KnowledgeGraphService:
             [item for item in capability_items if item['status'] == 'risk'],
             key=lambda item: float(item.get('score') or 0.0),
         )[:3]
+        weakness_nodes: List[Dict[str, Any]] = []
         for item in risk_capabilities:
             weakness_node_id = f"weakness:{item['key']}"
-            add_node({
+            weakness_node = {
                 'id': weakness_node_id,
                 'label': item['label'],
                 'type': 'weakness',
@@ -616,7 +682,9 @@ class KnowledgeGraphService:
                     'capability_key': item['key'],
                     'sample_count': item['count'],
                 },
-            })
+            }
+            weakness_nodes.append(weakness_node)
+            add_node(weakness_node)
             add_edge({
                 'id': f"edge:{user_node_id}:{weakness_node_id}",
                 'source': user_node_id,
@@ -624,6 +692,15 @@ class KnowledgeGraphService:
                 'label': '当前短板',
                 'type': 'HAS_WEAKNESS',
             })
+            capability_node_id = f"capability:{item['key']}"
+            if capability_node_id in node_ids:
+                add_edge({
+                    'id': f"edge:{capability_node_id}:{weakness_node_id}",
+                    'source': capability_node_id,
+                    'target': weakness_node_id,
+                    'label': '风险聚合',
+                    'type': 'HAS_RISK',
+                })
 
         today = datetime.now().date()
         monday = today.replace(day=today.day)  # placeholder to keep mypy calm
@@ -671,12 +748,13 @@ class KnowledgeGraphService:
                     })
 
         strengths = sorted(
-            [item for item in knowledge_points if item['status'] == 'mastered'],
+            [item for item in knowledge_points if item['status'] == 'mastered']
+            + [item for item in capability_nodes if item['status'] == 'strength'],
             key=lambda item: float(item.get('score') or 0.0),
             reverse=True,
         )[:5]
-        weak_knowledge_points = sorted(
-            [item for item in knowledge_points if item['status'] == 'weak'],
+        risk_nodes = sorted(
+            [item for item in knowledge_points if item['status'] == 'weak'] + weakness_nodes,
             key=lambda item: float(item.get('score') or 0.0),
         )[:5]
         warnings = risk_capabilities
@@ -709,13 +787,14 @@ class KnowledgeGraphService:
             'interviews_analyzed': len(interviews),
             'evaluations_analyzed': len(evaluation_rows),
             'capability_count': len(knowledge_points),
-            'strength_count': len([item for item in knowledge_points if item['status'] == 'mastered']),
-            'risk_count': len([item for item in knowledge_points if item['status'] == 'weak']),
+            'graph_node_count': len(nodes),
+            'strength_count': len(strengths),
+            'risk_count': len(risk_nodes),
             'active_task_count': len(active_tasks),
             'last_interview_at': scored_interview_evidence[0]['time'] if scored_interview_evidence else '',
             'dominant_rounds': dominant_rounds,
             'top_strengths': strengths,
-            'top_risks': weak_knowledge_points,
+            'top_risks': risk_nodes,
             'top_capability_risks': warnings,
             'recent_interviews': scored_interview_evidence[:6],
         }

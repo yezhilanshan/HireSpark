@@ -6,9 +6,13 @@ export function formatScore(value?: number | null) {
 
 export function getNodeTypeLabel(type: string) {
     if (type === 'knowledge') return '知识点'
+    if (type === 'capability') return '能力维度'
     if (type === 'project') return '项目经验'
     if (type === 'weakness') return '风险项'
     if (type === 'training') return '训练任务'
+    if (type === 'user') return '用户'
+    if (type === 'resume') return '简历'
+    if (type === 'position') return '目标岗位'
     return '其他'
 }
 
@@ -30,6 +34,8 @@ export function getSuggestedNodes(nodes: GraphNode[]) {
         .sort((left, right) => {
             if (left.type === 'knowledge' && right.type !== 'knowledge') return -1
             if (left.type !== 'knowledge' && right.type === 'knowledge') return 1
+            if (left.type === 'capability' && right.type !== 'capability') return -1
+            if (left.type !== 'capability' && right.type === 'capability') return 1
             return (right.score || 0) - (left.score || 0)
         })
         .slice(0, 8)

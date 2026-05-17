@@ -184,7 +184,7 @@ export function CommandPalette() {
                                         打开
                                     </span>
                                 </div>
-                                <div className="font-medium text-[#666666]">PanelMind</div>
+                                <div className="font-medium text-[#666666]">职跃星辰</div>
                             </div>
                         </motion.div>
                     </div>

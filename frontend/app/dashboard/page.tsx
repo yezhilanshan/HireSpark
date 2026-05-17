@@ -7,7 +7,7 @@ import { motion, type Variants } from 'motion/react'
 import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { getBackendBaseUrl } from '@/lib/backend'
+import { fetchWithTimeout, getBackendBaseUrl } from '@/lib/backend'
 
 const BACKEND_API_BASE = getBackendBaseUrl()
 
@@ -257,7 +257,7 @@ function deriveScore(record: InterviewRecord): number {
 }
 
 function getStructuredScore(record: InterviewRecord): number | null {
-    if (record.score_source !== 'structured_evaluation') return null
+    if (record.score_source === 'not_available' || record.score_source === 'pending') return null
     const score = deriveScore(record)
     return score > 0 ? score : null
 }
@@ -408,9 +408,9 @@ export default function HomePage() {
 
         const load = async () => {
             const [growthResult, interviewsResult, resumeResult] = await Promise.allSettled([
-                fetch(`${BACKEND_API_BASE}/api/growth-report/latest`, { cache: 'no-store' }),
-                fetch(`${BACKEND_API_BASE}/api/interviews?limit=80`, { cache: 'no-store' }),
-                fetch(`${BACKEND_API_BASE}/api/resume/latest`, { cache: 'no-store' }),
+                fetchWithTimeout(`${BACKEND_API_BASE}/api/growth-report/latest`, { cache: 'no-store' }, 10000),
+                fetchWithTimeout(`${BACKEND_API_BASE}/api/interviews?limit=80`, { cache: 'no-store' }, 10000),
+                fetchWithTimeout(`${BACKEND_API_BASE}/api/resume/latest`, { cache: 'no-store' }, 8000),
             ])
 
             let growth: GrowthApiResult | null = null

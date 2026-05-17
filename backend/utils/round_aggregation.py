@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import datetime
 from statistics import median
 from typing import Any
 
@@ -29,6 +30,49 @@ def _clamp_score(value: Any) -> float | None:
     if score is None:
         return None
     return round(max(0.0, min(100.0, score)), 2)
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _row_updated_epoch(row: dict[str, Any]) -> int:
+    value = str((row or {}).get("updated_at") or (row or {}).get("created_at") or "").strip()
+    if not value:
+        return 0
+    normalized = value.replace("T", " ").replace("Z", "").split(".")[0]
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return int(datetime.strptime(normalized[:19] if fmt.endswith("%S") else normalized[:10], fmt).timestamp())
+        except Exception:
+            continue
+    try:
+        return int(datetime.fromisoformat(normalized).timestamp())
+    except Exception:
+        return 0
+
+
+def _row_priority(row: dict[str, Any]) -> tuple[int, int, int, int]:
+    status_priority = {
+        "ok": 5,
+        "partial_ok": 4,
+        "running": 3,
+        "pending": 2,
+        "queued": 1,
+        "skipped": 0,
+        "failed": 0,
+        "unknown": 0,
+    }
+    status = str((row or {}).get("status") or "unknown").strip().lower() or "unknown"
+    return (
+        int(status_priority.get(status, 0)),
+        int(_extract_fusion_score(row) is not None),
+        _row_updated_epoch(row),
+        _safe_int((row or {}).get("id"), 0),
+    )
 
 
 def _weighted_mean(pairs: list[tuple[float, float]]) -> float | None:
@@ -100,16 +144,6 @@ def _normalize_turn_status(row: dict[str, Any]) -> tuple[str, str]:
 
 
 def _dedupe_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    status_priority = {
-        "ok": 5,
-        "partial_ok": 4,
-        "running": 3,
-        "pending": 2,
-        "queued": 1,
-        "skipped": 0,
-        "failed": 0,
-        "unknown": 0,
-    }
     deduped: dict[str, dict[str, Any]] = {}
     for index, row in enumerate(rows):
         interview_id = str(row.get("interview_id") or "").strip()
@@ -120,9 +154,7 @@ def _dedupe_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not existing:
             deduped[dedupe_key] = row
             continue
-        current_status = str(row.get("status") or "unknown").strip().lower() or "unknown"
-        existing_status = str(existing.get("status") or "unknown").strip().lower() or "unknown"
-        if status_priority.get(current_status, 0) >= status_priority.get(existing_status, 0):
+        if _row_priority(row) > _row_priority(existing):
             deduped[dedupe_key] = row
     return list(deduped.values())
 

@@ -26,7 +26,7 @@ export default function DetailPanel({
             <div className="flex items-center justify-between gap-3">
                 <div className="flex items-center gap-2">
                     <Sparkles className="h-5 w-5 text-[#8B6F3D] dark:text-[#D6C7A6]" />
-                    <h3 className="font-serif text-2xl text-[#171717] dark:text-white">知识点详情</h3>
+                    <h3 className="font-serif text-2xl text-[#171717] dark:text-white">节点详情</h3>
                 </div>
                 {selectedNode ? (
                     <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${getStatusTone(selectedNode.status)}`}>
@@ -127,7 +127,7 @@ export default function DetailPanel({
                                 </div>
                             ) : (
                                 <p className="mt-4 text-sm leading-7 text-[#686258] dark:text-[#B8C2D3]">
-                                    这个节点当前没有可展示的直接关联，你可以从优势或短板列表继续查看相邻知识点。
+                                    这个节点当前没有可展示的直接关联，你可以从优势或短板列表继续查看相邻节点。
                                 </p>
                             )}
                         </div>
@@ -137,7 +137,7 @@ export default function DetailPanel({
                 <div className="mt-5 grid gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
                     <div className="rounded-[24px] border border-dashed border-[#DDD2BE] bg-[#FBF8F2] p-6 dark:border-[#334155] dark:bg-[#111823]">
                         <p className="text-sm leading-7 text-[#756E64] dark:text-[#B8C2D3]">
-                            点击图谱中的任意节点，可以查看对应知识点说明、结构化信息和关联内容。右侧两个面板则会帮助你快速判断哪些能力已经稳定，哪些还需要重点补强。
+                            点击图谱中的任意节点，可以查看对应说明、结构化信息和关联内容。右侧两个面板则会帮助你快速判断哪些能力已经稳定，哪些还需要重点补强。
                         </p>
                     </div>
                     <div className="rounded-[24px] border border-[#EEE4D4] bg-[#FBF7F0] p-5 dark:border-[#334155] dark:bg-[#141B25]">

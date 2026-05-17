@@ -4199,17 +4199,29 @@ class DatabaseManager:
 
     def get_turn_scorecard(self, interview_id: str, turn_id: str):
         """聚合单题评分卡。"""
-        evaluation = None
-        evaluations = self.get_interview_evaluations(interview_id=interview_id)
-        for row in evaluations:
-            if str((row or {}).get('turn_id') or '').strip() != str(turn_id or '').strip():
-                continue
+        evaluations = [
+            row for row in (self.get_interview_evaluations(interview_id=interview_id) or [])
+            if str((row or {}).get('turn_id') or '').strip() == str(turn_id or '').strip()
+        ]
+
+        def _scorecard_row_priority(row):
             status = str((row or {}).get('status') or '').strip().lower()
-            if status in {'ok', 'partial_ok'}:
-                evaluation = row
-                break
-            if evaluation is None:
-                evaluation = row
+            status_rank = {
+                'ok': 5,
+                'partial_ok': 4,
+                'running': 3,
+                'pending': 2,
+                'queued': 1,
+            }.get(status, 0)
+            has_score = 1 if (row or {}).get('overall_score') is not None else 0
+            updated_at = str((row or {}).get('updated_at') or '').strip()
+            try:
+                row_id = int((row or {}).get('id') or 0)
+            except Exception:
+                row_id = 0
+            return (status_rank, has_score, updated_at, row_id)
+
+        evaluation = max(evaluations, key=_scorecard_row_priority) if evaluations else None
 
         speech = None
         for row in self.get_speech_evaluations(interview_id=interview_id) or []:
@@ -4255,7 +4267,18 @@ class DatabaseManager:
                     status,
                     ROW_NUMBER() OVER (
                         PARTITION BY interview_id, turn_id
-                        ORDER BY datetime(updated_at) DESC, id DESC
+                        ORDER BY
+                            CASE status
+                                WHEN 'ok' THEN 5
+                                WHEN 'partial_ok' THEN 4
+                                WHEN 'running' THEN 3
+                                WHEN 'pending' THEN 2
+                                WHEN 'queued' THEN 1
+                                ELSE 0
+                            END DESC,
+                            CASE WHEN overall_score IS NOT NULL THEN 1 ELSE 0 END DESC,
+                            datetime(updated_at) DESC,
+                            id DESC
                     ) AS rn
                 FROM interview_evaluations
                 WHERE interview_id IN ({placeholders})
@@ -4268,7 +4291,7 @@ class DatabaseManager:
                 status
             FROM ranked
             WHERE rn = 1
-              AND status IN ('ok', 'partial_ok', 'skipped')
+              AND status IN ('ok', 'partial_ok')
         '''
 
         try:

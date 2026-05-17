@@ -1,13 +1,27 @@
 'use client'
 
-import { Suspense, useEffect, useMemo, useRef, useState } from 'react'
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import { useSearchParams } from 'next/navigation'
 import { ArrowRight, CalendarDays, Clock3, Film, Tag, Timer } from 'lucide-react'
-import type { ReplayPayload } from '@/types/replay'
+import type { DeepAuditItem, ReplayPayload } from '@/types/replay'
 import PersistentSidebar from '@/components/PersistentSidebar'
-import { getBackendBaseUrl } from '@/lib/backend'
+import { fetchWithTimeout, getBackendBaseUrl } from '@/lib/backend'
 import { buildPageCacheKey, readPageCache, writePageCache } from '@/lib/page-cache'
+import {
+    safeNumber,
+    clampNumber,
+    formatMs,
+    anchorLabel,
+    isAnchorActive,
+    normalizeCompareText,
+    dimensionLabel,
+    toTime,
+    formatDate,
+    formatDuration,
+    roundLabel,
+    isTypingTarget,
+} from '@/lib/replay-utils'
 
 const BACKEND_API_BASE = getBackendBaseUrl()
 const DEFAULT_RECORD_LIMIT = 10
@@ -16,29 +30,8 @@ const REPLAY_LIST_CACHE_TTL_MS = 1000 * 60 * 20
 const REPLAY_DETAIL_CACHE_PREFIX = 'zhiyuexingchen.page.replay.detail.v1'
 const REPLAY_DETAIL_CACHE_TTL_MS = 1000 * 60 * 20
 
-function formatMs(ms?: number) {
-    const safe = Math.max(0, Number(ms || 0))
-    const totalSec = Math.floor(safe / 1000)
-    const min = Math.floor(totalSec / 60)
-    const sec = totalSec % 60
-    return `${String(min).padStart(2, '0')}:${String(sec).padStart(2, '0')}`
-}
-
-function anchorLabel(index: number): string {
-    return `第 ${index + 1} 题`
-}
-
-function isAnchorActive(currentMs: number, startMs: number, endMs: number) {
-    if (currentMs <= 0) return false
-    return currentMs >= Math.max(0, startMs - 500) && currentMs <= endMs + 1000
-}
-
 function getAnchorStartMs(anchor: ReplayPayload['transcript_anchor_list'][number]): number {
-    return Number(anchor.question_start_ms || anchor.answer_start_ms || 0)
-}
-
-function normalizeCompareText(value?: string): string {
-    return String(value || '').replace(/\s+/g, '').trim().toLowerCase()
+    return safeNumber(anchor.question_start_ms ?? anchor.answer_start_ms ?? 0)
 }
 
 function matchesCurrentAnchor(
@@ -54,14 +47,6 @@ function matchesCurrentAnchor(
     const itemQuestion = normalizeCompareText(item.question)
     const anchorQuestion = normalizeCompareText(anchor.question)
     return Boolean(itemQuestion && anchorQuestion && itemQuestion === anchorQuestion)
-}
-
-function dimensionLabel(value?: string): string {
-    const normalized = String(value || '').trim().toLowerCase()
-    if (normalized === 'content') return '内容维度'
-    if (normalized === 'delivery') return '表达维度'
-    if (normalized === 'presence') return '镜头维度'
-    return String(value || '待补充维度')
 }
 
 type InterviewRecord = {
@@ -86,49 +71,93 @@ type ReplayDetailCacheData = {
     payload: ReplayPayload
 }
 
-function toTime(value?: string): number {
-    if (!value) return 0
-    const time = new Date(value).getTime()
-    return Number.isNaN(time) ? 0 : time
+type ReplayCacheState = 'none' | 'updating' | 'cached' | 'fresh'
+
+function CacheStateBadge({ state }: { state: ReplayCacheState }) {
+    // P1-1 优化: 缓存状态指示改进 - 增加视觉反馈
+    if (state === 'updating') {
+        return (
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-3 py-1 text-xs font-medium text-amber-700 border border-amber-200">
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse" />
+                正在更新数据...
+            </span>
+        )
+    }
+    if (state === 'cached') {
+        return (
+            <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-3 py-1 text-xs font-medium text-amber-700 border border-amber-200" title="当前展示缓存数据，已请求最新数据">
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
+                展示缓存数据
+            </span>
+        )
+    }
+    return null
 }
 
-function formatDate(value?: string): string {
-    if (!value) return '未知时间'
-    const date = new Date(value)
-    if (Number.isNaN(date.getTime())) return value
-    return date.toLocaleString('zh-CN')
-}
+function DiagnosisTags({
+    factChecks,
+    dimensionGaps,
+    coverageRatio,
+    latencyMs,
+}: {
+    factChecks: DeepAuditItem[]
+    dimensionGaps: DeepAuditItem[]
+    coverageRatio: number
+    latencyMs: number
+}) {
+    // P1-1 优化: 诊断标签可视化 - 优先级排序 + 增强样式
+    const tags: Array<{ tone: 'error' | 'warning' | 'info'; text: string; priority: number }> = []
+    if ((factChecks || []).length > 0) tags.push({ tone: 'error', text: '事实性错误', priority: 1 })
+    if ((dimensionGaps || []).length > 0) tags.push({ tone: 'warning', text: `${dimensionLabel(dimensionGaps?.[0]?.dimension)}薄弱`, priority: 2 })
+    if (coverageRatio < 0.45) tags.push({ tone: 'warning', text: '关键词覆盖率低', priority: 3 })
+    if (latencyMs > 2500) tags.push({ tone: 'info', text: '响应偏慢', priority: 4 })
 
-function formatDuration(seconds?: number): string {
-    const safe = Math.max(0, Math.round(Number(seconds || 0)))
-    if (!safe) return '未记录'
-    const min = Math.floor(safe / 60)
-    const sec = safe % 60
-    if (min <= 0) return `${sec}秒`
-    return `${min}分${sec}秒`
-}
+    if (tags.length === 0) return null
 
-function roundLabel(roundType?: string): string {
-    const normalized = String(roundType || '').trim().toLowerCase()
-    if (normalized === 'technical') return '技术基础面'
-    if (normalized === 'project') return '项目深度面'
-    if (normalized === 'system_design') return '系统设计面'
-    if (normalized === 'hr') return 'HR 综合面'
-    return ''
+    // 按优先级排序
+    const sortedTags = tags.sort((a, b) => a.priority - b.priority)
+
+    return (
+        <div className="mt-4 flex flex-wrap gap-2">
+            {sortedTags.map((tag) => (
+                <span
+                    key={tag.text}
+                    className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium transition ${
+                        tag.tone === 'error'
+                            ? 'bg-red-100 text-red-700 border border-red-200'
+                            : tag.tone === 'warning'
+                                ? 'bg-amber-100 text-amber-700 border border-amber-200'
+                                : 'bg-blue-100 text-blue-700 border border-blue-200'
+                    }`}
+                    title={`优先级 ${tag.priority}`}
+                >
+                    {tag.tone === 'error' && <span className="inline-block h-1.5 w-1.5 rounded-full bg-current" />}
+                    {tag.text}
+                </span>
+            ))}
+        </div>
+    )
 }
 
 function ReplayPageContent() {
     const searchParams = useSearchParams()
     const interviewId = (searchParams.get('interviewId') || '').trim()
+    // P0-2 优化: 支持从报告页流转时自动定位题目
+    const turnIdParam = (searchParams.get('turnId') || '').trim()
+    const questionIdParam = (searchParams.get('questionId') || '').trim()
     const [loading, setLoading] = useState(true)
     const [error, setError] = useState('')
     const [payload, setPayload] = useState<ReplayPayload | null>(null)
     const [records, setRecords] = useState<InterviewRecord[]>([])
     const [showAllRecords, setShowAllRecords] = useState(false)
+    const [compareMode, setCompareMode] = useState(false)
+    const [cacheState, setCacheState] = useState<ReplayCacheState>('none')
     const [videoDurationMs, setVideoDurationMs] = useState(0)
     const [videoCurrentMs, setVideoCurrentMs] = useState(0)
     const [selectedAnchorIndex, setSelectedAnchorIndex] = useState(-1)
+    const [hasAutoLocated, setHasAutoLocated] = useState(false)
     const videoRef = useRef<HTMLVideoElement | null>(null)
+    const anchorListRef = useRef<HTMLDivElement | null>(null)
 
     useEffect(() => {
         const load = async () => {
@@ -145,21 +174,24 @@ function ReplayPageContent() {
             try {
                 setError('')
                 setShowAllRecords(false)
+                setCompareMode(false)
                 setVideoCurrentMs(0)
                 setVideoDurationMs(0)
                 setSelectedAnchorIndex(-1)
+                setCacheState('none')
 
                 if (!interviewId) {
                     setPayload(null)
                     if (hasCachedList) {
                         setRecords(cachedList?.records || [])
                         setLoading(false)
+                        setCacheState('updating')
                     } else {
                         setRecords([])
                         setLoading(true)
                     }
 
-                    const res = await fetch(`${BACKEND_API_BASE}/api/interviews?limit=80`, { cache: 'no-store' })
+                    const res = await fetchWithTimeout(`${BACKEND_API_BASE}/api/interviews?limit=80`, { cache: 'no-store' }, 10000)
                     const data: InterviewApiResult = await res.json()
                     if (!res.ok || !data.success) {
                         throw new Error(data.error || '加载复盘列表失败')
@@ -167,6 +199,7 @@ function ReplayPageContent() {
                     const nextRecords = Array.isArray(data.interviews) ? data.interviews : []
                     setRecords(nextRecords)
                     writePageCache<ReplayListCacheData>(REPLAY_LIST_CACHE_KEY, { records: nextRecords })
+                    setCacheState('fresh')
                     return
                 }
 
@@ -174,29 +207,33 @@ function ReplayPageContent() {
                 if (hasCachedDetail) {
                     setPayload(cachedDetail?.payload || null)
                     setLoading(false)
+                    setCacheState('updating')
                 } else {
                     setPayload(null)
                     setLoading(true)
                 }
 
-                await fetch(`${BACKEND_API_BASE}/api/review/generate/${encodeURIComponent(interviewId)}`, {
+                await fetchWithTimeout(`${BACKEND_API_BASE}/api/review/generate/${encodeURIComponent(interviewId)}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ force: false }),
-                }).catch(() => null)
+                }, 5000).catch(() => null)
 
-                const res = await fetch(`${BACKEND_API_BASE}/api/replay/${encodeURIComponent(interviewId)}`, { cache: 'no-store' })
+                const res = await fetchWithTimeout(`${BACKEND_API_BASE}/api/replay/${encodeURIComponent(interviewId)}`, { cache: 'no-store' }, 12000)
                 const data: ReplayPayload = await res.json()
                 if (!res.ok || !data.success) {
                     throw new Error(data.error || '加载复盘失败')
                 }
                 setPayload(data)
                 writePageCache<ReplayDetailCacheData>(detailCacheKey, { payload: data })
+                setCacheState('fresh')
             } catch (e) {
                 if ((!interviewId && hasCachedList) || (interviewId && hasCachedDetail)) {
                     setError(interviewId ? '复盘更新失败，已展示缓存数据。' : '复盘列表更新失败，已展示缓存数据。')
+                    setCacheState('cached')
                 } else {
                     setError(e instanceof Error ? e.message : '加载复盘失败')
+                    setCacheState('none')
                 }
             } finally {
                 setLoading(false)
@@ -232,15 +269,15 @@ function ReplayPageContent() {
     }, [payload])
 
     const timelineDurationMs = useMemo(() => {
-        const fromPayload = Number(payload?.video?.duration_ms || 0)
+        const fromPayload = safeNumber(payload?.video?.duration_ms)
         return Math.max(fromPayload, videoDurationMs, 1)
     }, [payload, videoDurationMs])
 
     const activeAnchorKey = useMemo(() => {
-        const current = Number(videoCurrentMs || 0)
+        const current = safeNumber(videoCurrentMs)
         return orderedAnchors.findIndex(item => {
             const start = getAnchorStartMs(item)
-            const end = Number(item.answer_end_ms || item.answer_start_ms || start)
+            const end = safeNumber(item.answer_end_ms ?? item.answer_start_ms ?? start)
             return isAnchorActive(current, start, end)
         })
     }, [orderedAnchors, videoCurrentMs])
@@ -262,49 +299,47 @@ function ReplayPageContent() {
         })
     }, [activeAnchorKey, orderedAnchors])
 
-    const currentAnchorIndex = useMemo(() => {
-        if (selectedAnchorIndex >= 0 && selectedAnchorIndex < orderedAnchors.length) {
-            return selectedAnchorIndex
-        }
-        if (activeAnchorKey >= 0) return activeAnchorKey
-        return orderedAnchors.length > 0 ? 0 : -1
-    }, [selectedAnchorIndex, activeAnchorKey, orderedAnchors])
+    useEffect(() => {
+        if (activeAnchorKey < 0 || !anchorListRef.current) return
+        const activeButton = anchorListRef.current.querySelector<HTMLElement>(`[data-anchor-index="${activeAnchorKey}"]`)
+        activeButton?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+    }, [activeAnchorKey])
 
-    const currentAnchor = useMemo(() => {
-        if (currentAnchorIndex < 0) return null
-        return orderedAnchors[currentAnchorIndex] || null
-    }, [currentAnchorIndex, orderedAnchors])
+    const currentAnchorIndex =
+        selectedAnchorIndex >= 0 && selectedAnchorIndex < orderedAnchors.length
+            ? selectedAnchorIndex
+            : activeAnchorKey >= 0
+                ? activeAnchorKey
+                : orderedAnchors.length > 0
+                    ? 0
+                    : -1
 
-    const currentFactChecks = useMemo(() => {
-        if (!currentAnchor) return []
-        return (payload?.audits?.fact_checks || []).filter((item) => matchesCurrentAnchor(item, currentAnchor)).slice(0, 3)
-    }, [payload, currentAnchor])
+    const currentAnchor = currentAnchorIndex >= 0 ? orderedAnchors[currentAnchorIndex] || null : null
+    const currentFactChecks = currentAnchor
+        ? (payload?.audits?.fact_checks || []).filter((item) => matchesCurrentAnchor(item, currentAnchor)).slice(0, 3)
+        : []
+    const currentDimensionGaps = currentAnchor
+        ? (payload?.audits?.dimension_gaps || []).filter((item) => matchesCurrentAnchor(item, currentAnchor)).slice(0, 3)
+        : []
+    const currentShadowAnswer = currentAnchor
+        ? (payload?.shadow_answers || []).find((item) => matchesCurrentAnchor(item, currentAnchor)) || null
+        : null
 
-    const currentDimensionGaps = useMemo(() => {
-        if (!currentAnchor) return []
-        return (payload?.audits?.dimension_gaps || []).filter((item) => matchesCurrentAnchor(item, currentAnchor)).slice(0, 3)
-    }, [payload, currentAnchor])
-
-    const currentShadowAnswer = useMemo(() => {
-        if (!currentAnchor) return null
-        return (payload?.shadow_answers || []).find((item) => matchesCurrentAnchor(item, currentAnchor)) || null
-    }, [payload, currentAnchor])
-
-    const currentLatencyMs = useMemo(() => {
-        if (!currentAnchor) return 0
-        const matched = (payload?.visual_metrics?.latency_matrix?.items || []).find(
-            (item) => String(item.turn_id || '').trim() === String(currentAnchor.turn_id || '').trim()
+    const currentLatencyMs = currentAnchor
+        ? safeNumber(
+            (payload?.visual_metrics?.latency_matrix?.items || []).find(
+                (item) => String(item.turn_id || '').trim() === String(currentAnchor.turn_id || '').trim()
+            )?.latency_ms ?? currentAnchor.latency_ms
         )
-        return Number(matched?.latency_ms ?? currentAnchor.latency_ms ?? 0)
-    }, [payload, currentAnchor])
+        : 0
 
-    const currentCoverageRatio = useMemo(() => {
-        if (!currentAnchor) return 0
-        const matched = (payload?.visual_metrics?.keyword_coverage?.items || []).find(
-            (item) => String(item.turn_id || '').trim() === String(currentAnchor.turn_id || '').trim()
+    const currentCoverageRatio = currentAnchor
+        ? safeNumber(
+            (payload?.visual_metrics?.keyword_coverage?.items || []).find(
+                (item) => String(item.turn_id || '').trim() === String(currentAnchor.turn_id || '').trim()
+            )?.coverage_ratio
         )
-        return Number(matched?.coverage_ratio || 0)
-    }, [payload, currentAnchor])
+        : 0
 
     const currentDiagnosisSummary = useMemo(() => {
         if (!currentAnchor) return '当前暂无题目诊断。'
@@ -324,16 +359,122 @@ function ReplayPageContent() {
         return '当前题没有明显风险信号，建议结合参考答案继续优化表达顺序和信息密度。'
     }, [currentAnchor, currentFactChecks, currentDimensionGaps, currentCoverageRatio, currentLatencyMs])
 
-    const seekTo = (ms: number, anchorIndex?: number) => {
-        if (!videoRef.current) return
-        const targetMs = Math.max(0, Number(ms || 0))
+    const timelineWidthPercent = useMemo(
+        () => Math.min(260, Math.max(100, orderedAnchors.length * 12)),
+        [orderedAnchors.length]
+    )
+
+    // P2-1 优化: 时间轴标记重叠检测 - 改进算法确保最小间距
+    const timelineLabelVisibleFlags = useMemo(() => {
+        const MIN_LABEL_SPACING_PERCENT = 10 // 最小间距 10%
+        const result: boolean[] = []
+
+        if (orderedAnchors.length === 0) return result
+
+        // 计算所有标记的位置
+        const positions = orderedAnchors.map((item, idx) => ({
+            idx,
+            left: clampNumber((getAnchorStartMs(item) / timelineDurationMs) * 100, 0, 100),
+        }))
+
+        // 始终显示当前活跃的标记
+        const visibleIndices = new Set<number>()
+        if (activeAnchorKey >= 0) {
+            visibleIndices.add(activeAnchorKey)
+        }
+
+        // 贪心算法：优先显示间距足够的标记
+        for (const pos of positions) {
+            if (visibleIndices.has(pos.idx)) continue
+
+            const hasConflict = Array.from(visibleIndices).some((visibleIdx) => {
+                const visiblePos = positions[visibleIdx]
+                return Math.abs(pos.left - visiblePos.left) < MIN_LABEL_SPACING_PERCENT
+            })
+
+            if (!hasConflict) {
+                visibleIndices.add(pos.idx)
+            }
+        }
+
+        // 生成布尔数组
+        return orderedAnchors.map((_, idx) => visibleIndices.has(idx))
+    }, [orderedAnchors, timelineDurationMs, activeAnchorKey])
+
+    const seekTo = useCallback((ms: number, anchorIndex?: number) => {
+        const targetMs = clampNumber(safeNumber(ms), 0, timelineDurationMs)
         if (typeof anchorIndex === 'number' && anchorIndex >= 0) {
             setSelectedAnchorIndex(anchorIndex)
         }
+        if (!videoRef.current) return
         videoRef.current.currentTime = targetMs / 1000
         setVideoCurrentMs(targetMs)
         videoRef.current.play().catch(() => undefined)
-    }
+    }, [timelineDurationMs])
+
+    useEffect(() => {
+        if (!interviewId || !payload?.video?.available || !playUrl) return
+
+        const handler = (event: KeyboardEvent) => {
+            if (isTypingTarget(event.target)) return
+
+            const currentMs = videoRef.current ? videoRef.current.currentTime * 1000 : 0
+
+            if (event.key === 'ArrowLeft') {
+                event.preventDefault()
+                seekTo(currentMs - 5000)
+                return
+            }
+            if (event.key === 'ArrowRight') {
+                event.preventDefault()
+                seekTo(currentMs + 5000)
+                return
+            }
+            if (event.code === 'Space') {
+                event.preventDefault()
+                if (!videoRef.current) return
+                if (videoRef.current.paused) {
+                    videoRef.current.play().catch(() => undefined)
+                } else {
+                    videoRef.current.pause()
+                }
+            }
+        }
+
+        window.addEventListener('keydown', handler)
+        return () => window.removeEventListener('keydown', handler)
+    }, [interviewId, payload?.video?.available, playUrl, seekTo])
+
+    // P0-2 优化: 从报告页流转时自动定位到目标题目
+    useEffect(() => {
+        if (hasAutoLocated || !payload || orderedAnchors.length === 0 || (!turnIdParam && !questionIdParam)) {
+            return
+        }
+
+        let targetIndex = -1
+
+        // 优先按 turnId 匹配
+        if (turnIdParam) {
+            targetIndex = orderedAnchors.findIndex(item =>
+                String(item.turn_id || '').trim() === turnIdParam
+            )
+        }
+
+        // 次选按 questionId 或题目内容匹配
+        if (targetIndex < 0 && questionIdParam) {
+            targetIndex = orderedAnchors.findIndex(item =>
+                String(item.turn_id || '').trim() === questionIdParam ||
+                normalizeCompareText(item.question) === normalizeCompareText(questionIdParam)
+            )
+        }
+
+        if (targetIndex >= 0) {
+            const targetAnchor = orderedAnchors[targetIndex]
+            const startMs = getAnchorStartMs(targetAnchor)
+            seekTo(startMs, targetIndex)
+            setHasAutoLocated(true)
+        }
+    }, [payload, orderedAnchors, turnIdParam, questionIdParam, hasAutoLocated, seekTo])
 
     if (loading) {
         return (
@@ -370,7 +511,7 @@ function ReplayPageContent() {
                         <section className="rounded-3xl border border-[#E5E5E5] bg-[#FAF9F6] p-8 shadow-sm">
                             <p className="text-xs uppercase tracking-[0.16em] text-[#999999]">面试回放</p>
                             <h1 className="mt-3 text-3xl font-semibold tracking-tight text-[#111111]">面试复盘</h1>
-
+                            <div className="mt-2"><CacheStateBadge state={cacheState} /></div>
                         </section>
 
                         {error ? (
@@ -449,9 +590,9 @@ function ReplayPageContent() {
             <main className="flex-1 overflow-y-auto">
                 <div className="mx-auto max-w-7xl px-6 py-8">
                     <section className="rounded-3xl border border-[#E5E5E5] bg-[#FAF9F6] p-8 shadow-sm">
-                        <p className="text-xs uppercase tracking-[0.16em] text-[#999999]">面试回放</p>
-                        <h1 className="mt-3 text-3xl font-semibold tracking-tight text-[#111111]">文本锚点 + 视频回放</h1>
-                        <p className="mt-3 text-base text-[#666666]">左侧放大回放视频，右侧查看完整对话锚点；关键节点标签已嵌入时间轴，可直接点击跳转。</p>
+                        <p className="text-xs uppercase tracking-[0.16em] text-[#999999]">面试复盘</p>
+                        <h1 className="mt-3 text-3xl font-semibold tracking-tight text-[#111111]">视频回放</h1>
+                        <div className="mt-2"><CacheStateBadge state={cacheState} /></div>
                     </section>
 
                     <section className="mt-6 grid gap-6 xl:grid-cols-[minmax(0,1.35fr)_minmax(460px,1fr)]">
@@ -492,38 +633,46 @@ function ReplayPageContent() {
                                             <p className="text-sm font-medium text-[#111111]">题目时间轴</p>
                                             <p className="text-xs text-[#666666]">{formatMs(videoCurrentMs)} / {formatMs(timelineDurationMs)}</p>
                                         </div>
-                                        <div className="relative mt-4 h-14">
-                                            <div className="absolute left-0 right-0 top-6 h-2 rounded-full bg-[#E4E0D8]" />
-                                            <div
-                                                className="absolute left-0 top-6 h-2 rounded-full bg-[#111111]"
-                                                style={{ width: `${Math.min(100, Math.max(0, (videoCurrentMs / timelineDurationMs) * 100))}%` }}
-                                            />
+                                        <div className="mt-4 overflow-x-auto pb-1">
+                                            <div className="relative h-14 min-w-[640px]" style={{ width: `${timelineWidthPercent}%` }}>
+                                                <div className="absolute left-0 right-0 top-6 h-2 rounded-full bg-[#E4E0D8]" />
+                                                <div
+                                                    className="absolute left-0 top-6 h-2 rounded-full bg-[#111111]"
+                                                    style={{ width: `${clampNumber((videoCurrentMs / timelineDurationMs) * 100, 0, 100)}%` }}
+                                                />
 
-                                            {orderedAnchors.map((item, idx) => {
-                                                const startMs = getAnchorStartMs(item)
-                                                const left = Math.min(100, Math.max(0, (startMs / timelineDurationMs) * 100))
-                                                const active = idx === activeAnchorKey
-                                                return (
-                                                    <button
-                                                        key={`${item.turn_id}-${idx}`}
-                                                        onClick={() => seekTo(startMs, idx)}
-                                                        className="absolute top-1 -translate-x-1/2"
-                                                        style={{ left: `${left}%` }}
-                                                        title={`${anchorLabel(idx)} ${formatMs(startMs)}`}
-                                                    >
-                                                        <span className={`mb-1 block max-w-[88px] truncate rounded-full border px-2 py-0.5 text-[10px] ${active
-                                                            ? 'border-[#111111] bg-[#111111] text-white'
-                                                            : 'border-[#D9D4CA] bg-white text-[#555555]'
-                                                            }`}>
-                                                            {anchorLabel(idx)}
-                                                        </span>
-                                                        <span className={`mx-auto block h-4 w-4 rounded-full border shadow-sm ${active
-                                                            ? 'border-[#111111] bg-[#111111]'
-                                                            : 'border-[#111111] bg-white hover:bg-[#111111]'
-                                                            }`} />
-                                                    </button>
-                                                )
-                                            })}
+                                                {orderedAnchors.map((item, idx) => {
+                                                    const startMs = getAnchorStartMs(item)
+                                                    const left = clampNumber((startMs / timelineDurationMs) * 100, 0, 100)
+                                                    const active = idx === activeAnchorKey
+                                                    const showLabel = timelineLabelVisibleFlags[idx]
+                                                    return (
+                                                        <button
+                                                            key={`${item.turn_id}-${idx}`}
+                                                            type="button"
+                                                            onClick={() => seekTo(startMs, idx)}
+                                                            className="absolute top-1 -translate-x-1/2"
+                                                            style={{ left: `${left}%` }}
+                                                            title={`${anchorLabel(idx)} ${formatMs(startMs)}`}
+                                                        >
+                                                            {showLabel ? (
+                                                                <span className={`mb-1 block max-w-[88px] truncate rounded-full border px-2 py-0.5 text-[10px] ${active
+                                                                    ? 'border-[#111111] bg-[#111111] text-white'
+                                                                    : 'border-[#D9D4CA] bg-white text-[#555555]'
+                                                                    }`}>
+                                                                    {anchorLabel(idx)}
+                                                                </span>
+                                                            ) : (
+                                                                <span className="mb-1 block h-[21px]" />
+                                                            )}
+                                                            <span className={`mx-auto block h-4 w-4 rounded-full border shadow-sm ${active
+                                                                ? 'border-[#111111] bg-[#111111]'
+                                                                : 'border-[#111111] bg-white hover:bg-[#111111]'
+                                                                }`} />
+                                                        </button>
+                                                    )
+                                                })}
+                                            </div>
                                         </div>
                                     </div>
                                 </>
@@ -540,13 +689,15 @@ function ReplayPageContent() {
                                 <h2 className="text-xl font-semibold text-[#111111]">对话锚点</h2>
                                 <span className="text-xs text-[#999999]">{orderedAnchors.length} 题</span>
                             </div>
-                            <div className="space-y-3 overflow-y-auto pr-1 xl:max-h-[calc(100vh-166px)]">
+                            <div ref={anchorListRef} className="space-y-3 overflow-y-auto pr-1 xl:max-h-[calc(100vh-166px)]">
                                 {orderedAnchors.map((item, idx) => {
                                     const startMs = getAnchorStartMs(item)
                                     const active = idx === activeAnchorKey
                                     return (
                                         <button
                                             key={`${item.turn_id}-${idx}`}
+                                            type="button"
+                                            data-anchor-index={idx}
                                             onClick={() => seekTo(startMs, idx)}
                                             className={`w-full rounded-2xl border p-4 text-left transition ${active
                                                 ? 'border-[#111111] bg-[#F3F1EC]'
@@ -562,7 +713,7 @@ function ReplayPageContent() {
                                             <p className="mt-2 whitespace-pre-wrap break-words text-sm text-[#666666]">
                                                 {item.answer || '未记录回答'}
                                             </p>
-                                            <p className="mt-2 text-xs text-[#999999]">Latency {Number(item.latency_ms || 0).toFixed(0)} ms</p>
+                                            <p className="mt-2 text-xs text-[#999999]">Latency {safeNumber(item.latency_ms).toFixed(0)} ms</p>
                                         </button>
                                     )
                                 })}
@@ -600,13 +751,20 @@ function ReplayPageContent() {
                                         </div>
                                         <div className="rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-3">
                                             <p className="text-xs text-[#999999]">响应时延</p>
-                                            <p className="mt-1 text-sm font-semibold text-[#111111]">{Number(currentLatencyMs || 0).toFixed(0)} ms</p>
+                                            <p className="mt-1 text-sm font-semibold text-[#111111]">{safeNumber(currentLatencyMs).toFixed(0)} ms</p>
                                         </div>
                                         <div className="rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-3">
                                             <p className="text-xs text-[#999999]">关键词覆盖率</p>
                                             <p className="mt-1 text-sm font-semibold text-[#111111]">{(currentCoverageRatio * 100).toFixed(1)}%</p>
                                         </div>
                                     </div>
+
+                                    <DiagnosisTags
+                                        factChecks={currentFactChecks}
+                                        dimensionGaps={currentDimensionGaps}
+                                        coverageRatio={currentCoverageRatio}
+                                        latencyMs={currentLatencyMs}
+                                    />
 
                                     <div className="mt-4 rounded-2xl border border-[#E5E5E5] bg-[#FAF9F6] p-4">
                                         <p className="text-sm font-semibold text-[#111111]">本题判断</p>
@@ -644,9 +802,30 @@ function ReplayPageContent() {
                         </article>
 
                         <article className="rounded-3xl border border-[#E5E5E5] bg-white p-6 shadow-sm">
-                            <h3 className="text-lg font-semibold text-[#111111]">参考答案</h3>
+                            <div className="flex items-center justify-between gap-3">
+                                <h3 className="text-lg font-semibold text-[#111111]">参考答案</h3>
+                                <button
+                                    type="button"
+                                    onClick={() => setCompareMode((prev) => !prev)}
+                                    disabled={!currentAnchor}
+                                    className="rounded-lg border border-[#E5E5E5] bg-[#FAF9F6] px-3 py-1.5 text-xs font-medium text-[#333333] disabled:cursor-not-allowed disabled:opacity-50"
+                                >
+                                    {compareMode ? '标准视图' : '对比视图'}
+                                </button>
+                            </div>
                             <div className="mt-3 space-y-3">
-                                {currentShadowAnswer ? (
+                                {compareMode && currentAnchor ? (
+                                    <div className="grid gap-3 xl:grid-cols-2">
+                                        <div className="rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-4">
+                                            <p className="text-xs font-medium text-[#666666]">我的回答</p>
+                                            <p className="mt-2 text-sm leading-6 text-[#333333]">{currentAnchor.answer || '未记录回答'}</p>
+                                        </div>
+                                        <div className="rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-4">
+                                            <p className="text-xs font-medium text-[#666666]">参考答案</p>
+                                            <p className="mt-2 text-sm leading-6 text-[#333333]">{currentShadowAnswer?.shadow_answer || '暂无优化回答'}</p>
+                                        </div>
+                                    </div>
+                                ) : currentShadowAnswer ? (
                                     <div className="rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-4">
                                         <p className="text-xs text-[#999999]">{currentShadowAnswer.question || currentAnchor?.question || '未记录题目'}</p>
                                         <p className="mt-2 text-sm leading-6 text-[#333333]">{currentShadowAnswer.shadow_answer || '暂无优化回答'}</p>
@@ -654,6 +833,13 @@ function ReplayPageContent() {
                                 ) : (
                                     <p className="text-sm text-[#666666]">当前题暂无参考答案草稿。</p>
                                 )}
+
+                                {compareMode && currentShadowAnswer?.why_better ? (
+                                    <div className="rounded-xl border border-blue-200 bg-blue-50 p-4 text-sm leading-6 text-blue-800">
+                                        <p className="text-xs font-medium uppercase tracking-[0.08em]">优化思路</p>
+                                        <p className="mt-1">{currentShadowAnswer.why_better}</p>
+                                    </div>
+                                ) : null}
                             </div>
                         </article>
                     </section>

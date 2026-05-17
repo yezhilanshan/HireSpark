@@ -41,7 +41,7 @@ class TTSManager:
             or config.get("tts.service_url", "http://127.0.0.1:5001")
         ).strip().rstrip("/")
         self.timeout = float(
-            os.environ.get("TTS_TIMEOUT") or config.get("tts.timeout", 45)
+            os.environ.get("TTS_TIMEOUT") or config.get("tts.timeout", 60)
         )
         self.enabled = _as_bool(
             os.environ.get("TTS_ENABLED"),

@@ -3,16 +3,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
     Bot,
-    ChevronRight,
     Clock3,
     Loader2,
     MessageSquarePlus,
     PanelLeftClose,
     PanelLeftOpen,
-    RefreshCcw,
     Send,
     Sparkles,
     Trash2,
+    User,
 } from 'lucide-react'
 import PersistentSidebar from '@/components/PersistentSidebar'
 import MarkdownMessage from '@/components/MarkdownMessage'
@@ -98,13 +97,20 @@ function formatRelativeTime(value?: string) {
 
 function answerModeMeta(mode?: string) {
     if (mode === 'rag_grounded') {
-        return ['基于知识库', 'border-emerald-200 bg-emerald-50 text-emerald-700'] as const
+        return ['基于知识库', 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400'] as const
     }
     if (mode === 'rag_plus_model') {
-        return ['知识库 + 补充判断', 'border-amber-200 bg-amber-50 text-amber-700'] as const
+        return ['知识库 + 补充判断', 'bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400'] as const
     }
-    return ['知识库证据不足', 'border-slate-200 bg-slate-100 text-slate-600'] as const
+    return ['知识库证据不足', 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400'] as const
 }
+
+const SUGGESTED_PROMPTS = [
+    '帮我梳理前端面试里怎么讲项目难点',
+    '总结 Java 后端高频考点',
+    '如何准备行为面试中的 STAR 回答',
+    '数据结构与算法常见面试题有哪些',
+]
 
 export default function AssistantPage() {
     const initialShellCache = typeof window === 'undefined'
@@ -120,7 +126,7 @@ export default function AssistantPage() {
         : readPageCache<AssistantMessagesCacheData>(initialMessageCacheKey, ASSISTANT_CACHE_TTL_MS)
 
     const [userId, setUserId] = useState(String(initialShellCache?.userId || 'default').trim().toLowerCase() || 'default')
-    const [userName, setUserName] = useState(String(initialShellCache?.userName || 'PanelMind 用户').trim() || 'PanelMind 用户')
+    const [userName, setUserName] = useState(String(initialShellCache?.userName || '职跃星辰 用户').trim() || '职跃星辰 用户')
     const [conversations, setConversations] = useState<Conversation[]>(initialShellCache?.conversations || [])
     const [activeConversationId, setActiveConversationId] = useState(initialActiveConversationId)
     const [messages, setMessages] = useState<Message[]>(initialMessagesCache?.messages || [])
@@ -135,9 +141,10 @@ export default function AssistantPage() {
     const [error, setError] = useState('')
     const [lastPrompt, setLastPrompt] = useState('')
     const [ragStatus, setRagStatus] = useState<RagStatusState>(
-        initialShellCache?.ragStatus || { label: '知识库检查中', description: '正在读取助手状态。', tone: 'border-slate-200 bg-slate-100 text-slate-600' }
+        initialShellCache?.ragStatus || { label: '知识库检查中', description: '正在读取助手状态。', tone: 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400' }
     )
     const bottomRef = useRef<HTMLDivElement | null>(null)
+    const textareaRef = useRef<HTMLTextAreaElement | null>(null)
 
     const activeConversation = useMemo(
         () => conversations.find((item) => item.conversation_id === activeConversationId) || null,
@@ -162,7 +169,7 @@ export default function AssistantPage() {
             setRagStatus({
                 label: '知识库在线',
                 description: `当前可引用 ${Number(rag.count || 0)} 条知识片段`,
-                tone: 'border-emerald-200 bg-emerald-50 text-emerald-700',
+                tone: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-400',
             })
             return
         }
@@ -170,14 +177,14 @@ export default function AssistantPage() {
             setRagStatus({
                 label: '知识库准备中',
                 description: '',
-                tone: 'border-amber-200 bg-amber-50 text-amber-700',
+                tone: 'bg-amber-50 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400',
             })
             return
         }
         setRagStatus({
             label: '知识库未启用',
             description: '当前回答会更多依赖模型补充。',
-            tone: 'border-slate-200 bg-slate-100 text-slate-600',
+            tone: 'bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-400',
         })
     }
 
@@ -296,66 +303,6 @@ export default function AssistantPage() {
             setDeletingConversationId('')
         }
     }
-
-    const sendMessageLegacy = async (overrideText?: string) => {
-        const content = String(overrideText ?? input).trim()
-        if (!content || sending) return
-
-        setSending(true)
-        setError('')
-        setLastPrompt(content)
-
-        try {
-            let conversationId = activeConversationId
-            if (!conversationId) {
-                conversationId = await createConversation()
-            }
-
-            const optimisticMessage: Message = {
-                message_id: `temp_${Date.now()}`,
-                conversation_id: conversationId,
-                role: 'user',
-                content,
-            }
-            setMessages((prev) => [...prev, optimisticMessage])
-            setInput('')
-
-            const response = await fetch(
-                `${BACKEND_API_BASE}/api/assistant/conversations/${encodeURIComponent(conversationId)}/messages`,
-                {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        user_id: userId,
-                        message: content,
-                        temperature: 0.25,
-                    }),
-                }
-            )
-            const data = await response.json().catch(() => ({}))
-            if (!response.ok || !data?.success) {
-                throw new Error(data?.message || data?.error || '发送消息失败。')
-            }
-
-            const userMessage = data?.user_message as Message | undefined
-            const assistantMessage = data?.assistant_message as Message | undefined
-            setMessages((prev) => {
-                const withoutTemp = prev.filter((item) => item.message_id !== optimisticMessage.message_id)
-                const next = [...withoutTemp]
-                if (userMessage) next.push(userMessage)
-                if (assistantMessage) next.push(assistantMessage)
-                return next
-            })
-            await loadConversations(userId, conversationId, true)
-        } catch (sendError) {
-            setMessages((prev) => prev.filter((item) => !item.message_id.startsWith('temp_')))
-            setError(sendError instanceof Error ? sendError.message : '发送消息失败。')
-        } finally {
-            setSending(false)
-        }
-    }
-
-    void sendMessageLegacy
 
     const patchPendingMessageContent = (pendingMessageId: string, content: string) => {
         setMessages((prev) =>
@@ -635,6 +582,14 @@ export default function AssistantPage() {
         }
     }
 
+    const adjustTextareaHeight = () => {
+        const textarea = textareaRef.current
+        if (!textarea) return
+        textarea.style.height = 'auto'
+        const maxHeight = 200
+        textarea.style.height = `${Math.min(textarea.scrollHeight, maxHeight)}px`
+    }
+
     useEffect(() => {
         const bootstrap = async () => {
             try {
@@ -686,259 +641,328 @@ export default function AssistantPage() {
         writePageCache<AssistantMessagesCacheData>(messageCacheKey, { messages })
     }, [userId, activeConversationId, messages])
 
+    useEffect(() => {
+        adjustTextareaHeight()
+    }, [input])
+
     return (
-        <div className="flex min-h-screen bg-[#FAF9F6] dark:bg-[#101217]">
+        <div className="flex h-screen overflow-hidden bg-white dark:bg-[#0f0f0f]">
             <PersistentSidebar />
-            <main className="flex-1 overflow-y-auto">
-                <div className="mx-auto max-w-[1440px] px-6 py-8">
-                    <section className="rounded-3xl border border-[#E5E5E5] dark:border-[#2d3542] bg-[#FAF9F6] dark:bg-[#101217] p-8 shadow-sm">
-                        <div className="flex flex-wrap items-start justify-between gap-4">
-                            <div>
-                                <p className="text-xs font-medium uppercase tracking-[0.18em] text-[#999999] dark:text-[#8e98aa]">AI 问答助手</p>
-                                <h1 className="mt-2 text-3xl font-semibold tracking-tight text-[#111111] dark:text-[#f4f7fb] sm:text-4xl">AI面试助手</h1>
+
+            {/* Conversation sidebar */}
+            {showConversationPanel ? (
+                <aside className="hidden w-[280px] shrink-0 flex-col border-r border-gray-200 bg-gray-50 dark:border-gray-800 dark:bg-[#171717] md:flex">
+                    <div className="flex items-center justify-between px-4 py-3">
+                        <h2 className="text-sm font-semibold text-gray-900 dark:text-gray-100">对话历史</h2>
+                        <div className="flex items-center gap-1">
+                            <button
+                                type="button"
+                                onClick={() => void createConversation().catch((e) => setError(e instanceof Error ? e.message : '创建会话失败。'))}
+                                className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-gray-500 transition hover:bg-gray-200 dark:text-gray-400 dark:hover:bg-gray-700"
+                                aria-label="新建对话"
+                            >
+                                <MessageSquarePlus className="h-4 w-4" />
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => setShowConversationPanel(false)}
+                                className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-gray-500 transition hover:bg-gray-200 dark:text-gray-400 dark:hover:bg-gray-700"
+                                aria-label="隐藏会话栏"
+                            >
+                                <PanelLeftClose className="h-4 w-4" />
+                            </button>
+                        </div>
+                    </div>
+
+                    <div className="flex-1 space-y-0.5 overflow-y-auto px-2 pb-3">
+                        {loading || sidebarLoading ? (
+                            <div className="flex items-center gap-2 px-3 py-8 text-sm text-gray-500 dark:text-gray-400">
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                                加载中...
                             </div>
-                            <div className="flex items-center gap-2">
-                                <button
-                                    type="button"
-                                    onClick={() => setShowConversationPanel((prev) => !prev)}
-                                    className="inline-flex items-center gap-2 rounded-full border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-3 py-1.5 text-xs font-medium text-[#111111] dark:text-[#f4f7fb] transition hover:bg-[#F8F6F0] dark:hover:bg-[#2d3542]"
-                                >
-                                    {showConversationPanel ? <PanelLeftClose className="h-3.5 w-3.5" /> : <PanelLeftOpen className="h-3.5 w-3.5" />}
-                                    <span>{showConversationPanel ? '隐藏会话栏' : '显示会话栏'}</span>
-                                </button>
-                                <div className={`inline-flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-medium ${ragStatus.tone}`}>
-                                    <Sparkles className="h-3.5 w-3.5" />
-                                    <span>{ragStatus.label}</span>
+                        ) : conversations.length === 0 ? (
+                            <div className="px-3 py-8 text-center text-sm text-gray-400 dark:text-gray-500">
+                                还没有对话记录
+                            </div>
+                        ) : (
+                            conversations.map((conversation) => {
+                                const active = conversation.conversation_id === activeConversationId
+                                const deleting = deletingConversationId === conversation.conversation_id
+                                return (
+                                    <div
+                                        key={conversation.conversation_id}
+                                        className={`group relative flex items-center gap-2 rounded-xl px-3 py-2.5 transition cursor-pointer ${
+                                            active
+                                                ? 'bg-gray-200/70 dark:bg-gray-700/70'
+                                                : 'hover:bg-gray-100 dark:hover:bg-gray-800/60'
+                                        }`}
+                                        onClick={() => setActiveConversationId(conversation.conversation_id)}
+                                    >
+                                        <div className="min-w-0 flex-1">
+                                            <p className={`truncate text-sm ${active ? 'font-medium text-gray-900 dark:text-gray-100' : 'text-gray-700 dark:text-gray-300'}`}>
+                                                {conversation.title}
+                                            </p>
+                                            <p className="mt-0.5 text-xs text-gray-400 dark:text-gray-500">
+                                                {formatRelativeTime(conversation.updated_at || conversation.created_at)}
+                                            </p>
+                                        </div>
+                                        <button
+                                            type="button"
+                                            disabled={deleting}
+                                            onClick={(e) => {
+                                                e.stopPropagation()
+                                                void deleteConversation(conversation.conversation_id)
+                                            }}
+                                            className="hidden h-7 w-7 shrink-0 items-center justify-center rounded-lg text-gray-400 transition hover:bg-gray-200 hover:text-red-500 group-hover:inline-flex dark:hover:bg-gray-700 dark:hover:text-red-400"
+                                            aria-label="删除会话"
+                                        >
+                                            {deleting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
+                                        </button>
+                                    </div>
+                                )
+                            })
+                        )}
+                    </div>
+
+                    {/* RAG status */}
+                    <div className="border-t border-gray-200 px-4 py-2.5 dark:border-gray-800">
+                        <div className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${ragStatus.tone}`}>
+                            <Sparkles className="h-3 w-3" />
+                            <span>{ragStatus.label}</span>
+                        </div>
+                    </div>
+                </aside>
+            ) : null}
+
+            {/* Main chat area */}
+            <main className="flex flex-1 flex-col overflow-hidden">
+                {/* Top bar */}
+                <header className="flex h-12 shrink-0 items-center justify-between border-b border-gray-200 px-4 dark:border-gray-800">
+                    <div className="flex items-center gap-2">
+                        {!showConversationPanel ? (
+                            <button
+                                type="button"
+                                onClick={() => setShowConversationPanel(true)}
+                                className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-gray-500 transition hover:bg-gray-100 dark:text-gray-400 dark:hover:bg-gray-800"
+                                aria-label="显示会话栏"
+                            >
+                                <PanelLeftOpen className="h-4 w-4" />
+                            </button>
+                        ) : null}
+                        <h1 className="text-sm font-medium text-gray-900 dark:text-gray-100">
+                            {activeConversation?.title || 'AI 面试助手'}
+                        </h1>
+                    </div>
+                    <button
+                        type="button"
+                        onClick={() => void createConversation().catch((e) => setError(e instanceof Error ? e.message : '创建会话失败。'))}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-xs font-medium text-gray-700 transition hover:bg-gray-50 dark:border-gray-700 dark:bg-[#1a1a1a] dark:text-gray-300 dark:hover:bg-gray-800"
+                    >
+                        <MessageSquarePlus className="h-3.5 w-3.5" />
+                        新对话
+                    </button>
+                </header>
+
+                {/* Messages area */}
+                <div className="flex-1 overflow-y-auto">
+                    {loading ? (
+                        <div className="flex h-full items-center justify-center">
+                            <div className="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400">
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                                正在准备助手...
+                            </div>
+                        </div>
+                    ) : messages.length === 0 ? (
+                        /* Welcome screen */
+                        <div className="flex h-full flex-col items-center justify-center px-4">
+                            <div className="mx-auto max-w-2xl text-center">
+                                <div className="mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-emerald-400 to-teal-600 shadow-lg shadow-emerald-500/20">
+                                    <Bot className="h-8 w-8 text-white" />
+                                </div>
+                                <h2 className="text-2xl font-semibold text-gray-900 dark:text-gray-100">
+                                    你好，{userName}
+                                </h2>
+                                <p className="mt-2 text-base text-gray-500 dark:text-gray-400">
+                                    我是你的 AI 面试助手，可以帮你梳理项目难点、总结高频考点、准备面试回答。
+                                </p>
+
+                                <div className="mt-8 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                                    {SUGGESTED_PROMPTS.map((prompt) => (
+                                        <button
+                                            key={prompt}
+                                            type="button"
+                                            onClick={() => {
+                                                setInput(prompt)
+                                                textareaRef.current?.focus()
+                                            }}
+                                            className="rounded-xl border border-gray-200 bg-white px-4 py-3 text-left text-sm text-gray-700 transition hover:border-gray-300 hover:bg-gray-50 dark:border-gray-700 dark:bg-[#1a1a1a] dark:text-gray-300 dark:hover:border-gray-600 dark:hover:bg-[#222]"
+                                        >
+                                            {prompt}
+                                        </button>
+                                    ))}
                                 </div>
                             </div>
                         </div>
-                        <p className="mt-3 text-xs leading-6 text-[#666666] dark:text-[#bcc5d3]">{ragStatus.description}</p>
-                    </section>
+                    ) : (
+                        /* Messages list */
+                        <div className="mx-auto max-w-3xl px-4 py-6">
+                            {messages.map((message) => {
+                                const isAssistant = message.role === 'assistant'
+                                const [modeLabel, modeTone] = isAssistant ? answerModeMeta(message.answer_mode) : ['', '']
 
-                    <section className={`mt-6 grid gap-6 ${showConversationPanel ? 'grid-cols-1 md:grid-cols-[320px_minmax(0,1fr)]' : 'grid-cols-1'}`}>
-                        {showConversationPanel ? (
-                            <aside className="flex h-[calc(100vh-200px)] flex-col rounded-3xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-5 shadow-sm">
-                                <div className="flex items-center justify-between gap-3">
-                                    <div>
-                                        <h2 className="text-lg font-semibold text-[#111111] dark:text-[#f4f7fb]">历史会话</h2>
-                                        <p className="mt-1 text-xs leading-6 text-[#666666] dark:text-[#bcc5d3]">按当前登录用户保存。</p>
+                                return (
+                                    <div key={message.message_id} className="mb-6 last:mb-0">
+                                        <div className={`flex gap-3 ${isAssistant ? '' : 'flex-row-reverse'}`}>
+                                            {/* Avatar */}
+                                            <div className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full ${
+                                                isAssistant
+                                                    ? 'bg-gradient-to-br from-emerald-400 to-teal-600'
+                                                    : 'bg-gray-900 dark:bg-gray-600'
+                                            }`}>
+                                                {isAssistant ? (
+                                                    <Bot className="h-4 w-4 text-white" />
+                                                ) : (
+                                                    <User className="h-4 w-4 text-white" />
+                                                )}
+                                            </div>
+
+                                            {/* Message content */}
+                                            <div className={`min-w-0 flex-1 ${isAssistant ? '' : 'flex flex-col items-end'}`}>
+                                                <p className={`mb-1 text-xs font-medium ${isAssistant ? 'text-gray-500 dark:text-gray-400' : 'text-gray-500 dark:text-gray-400'}`}>
+                                                    {isAssistant ? 'AI 助手' : '你'}
+                                                </p>
+
+                                                <div className={`max-w-[85%] rounded-2xl px-4 py-3 text-sm leading-7 ${
+                                                    isAssistant
+                                                        ? 'bg-gray-100 text-gray-900 dark:bg-[#1e1e1e] dark:text-gray-100'
+                                                        : 'bg-gray-900 text-white dark:bg-gray-700'
+                                                }`}>
+                                                    {isAssistant ? (
+                                                        <MarkdownMessage content={message.content} className="text-inherit" />
+                                                    ) : (
+                                                        <div className="whitespace-pre-wrap">{message.content}</div>
+                                                    )}
+                                                </div>
+
+                                                {/* Assistant metadata */}
+                                                {isAssistant ? (
+                                                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                                                        {modeLabel ? (
+                                                            <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${modeTone}`}>
+                                                                <Sparkles className="h-3 w-3" />
+                                                                {modeLabel}
+                                                            </span>
+                                                        ) : null}
+                                                    </div>
+                                                ) : null}
+
+                                                {/* Citations */}
+                                                {isAssistant && Array.isArray(message.citations) && message.citations.length > 0 ? (
+                                                    <div className="mt-3 space-y-2">
+                                                        <p className="text-xs font-medium text-gray-500 dark:text-gray-400">参考来源</p>
+                                                        <div className="grid gap-2 sm:grid-cols-2">
+                                                            {message.citations.slice(0, 4).map((citation, index) => (
+                                                                <div
+                                                                    key={`${message.message_id}_${index}`}
+                                                                    className="rounded-xl border border-gray-200 bg-white p-3 dark:border-gray-700 dark:bg-[#1a1a1a]"
+                                                                >
+                                                                    <div className="flex items-start justify-between gap-2">
+                                                                        <p className="text-xs font-medium text-gray-900 dark:text-gray-100">{citation.title}</p>
+                                                                        {typeof citation.score === 'number' ? (
+                                                                            <span className="shrink-0 rounded-full bg-gray-100 px-1.5 py-0.5 text-[10px] font-medium text-gray-500 dark:bg-gray-800 dark:text-gray-400">
+                                                                                {citation.score.toFixed(2)}
+                                                                            </span>
+                                                                        ) : null}
+                                                                    </div>
+                                                                    <p className="mt-0.5 text-[11px] text-gray-400 dark:text-gray-500">{citation.source}</p>
+                                                                    <p className="mt-1.5 text-xs leading-5 text-gray-600 dark:text-gray-400 line-clamp-3">{citation.snippet}</p>
+                                                                </div>
+                                                            ))}
+                                                        </div>
+                                                    </div>
+                                                ) : null}
+                                            </div>
+                                        </div>
                                     </div>
+                                )
+                            })}
+
+                            {/* Sending indicator */}
+                            {sending ? (
+                                <div className="mb-6 flex gap-3">
+                                    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-emerald-400 to-teal-600">
+                                        <Bot className="h-4 w-4 text-white" />
+                                    </div>
+                                    <div>
+                                        <p className="mb-1 text-xs font-medium text-gray-500 dark:text-gray-400">AI 助手</p>
+                                        <div className="inline-flex items-center gap-2 rounded-2xl bg-gray-100 px-4 py-3 dark:bg-[#1e1e1e]">
+                                            <div className="flex gap-1">
+                                                <span className="h-2 w-2 animate-bounce rounded-full bg-gray-400 [animation-delay:-0.3s] dark:bg-gray-500" />
+                                                <span className="h-2 w-2 animate-bounce rounded-full bg-gray-400 [animation-delay:-0.15s] dark:bg-gray-500" />
+                                                <span className="h-2 w-2 animate-bounce rounded-full bg-gray-400 dark:bg-gray-500" />
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            ) : null}
+
+                            <div ref={bottomRef} />
+                        </div>
+                    )}
+                </div>
+
+                {/* Input area */}
+                <div className="shrink-0 border-t border-gray-200 bg-white px-4 py-3 dark:border-gray-800 dark:bg-[#0f0f0f]">
+                    <div className="mx-auto max-w-3xl">
+                        {error ? (
+                            <div className="mb-2 flex items-center justify-between rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700 dark:border-red-900/50 dark:bg-red-900/20 dark:text-red-400">
+                                <span className="text-xs">{error}</span>
+                                {lastPrompt ? (
                                     <button
                                         type="button"
-                                        onClick={() => void createConversation().catch((e) => setError(e instanceof Error ? e.message : '创建会话失败。'))}
-                                        className="inline-flex items-center gap-2 rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-[#FAF9F6] dark:bg-[#101217] px-3 py-2 text-sm font-medium text-[#111111] dark:text-[#f4f7fb] transition hover:bg-[#F3F1EB] dark:hover:bg-[#2d3542]"
+                                        onClick={() => void sendMessage(lastPrompt)}
+                                        className="shrink-0 rounded-lg bg-red-100 px-2 py-1 text-xs font-medium text-red-700 transition hover:bg-red-200 dark:bg-red-900/40 dark:text-red-400 dark:hover:bg-red-900/60"
                                     >
-                                        <MessageSquarePlus className="h-4 w-4" />
-                                        新建
+                                        重试
                                     </button>
-                                </div>
-
-
-                                <div className="mt-4 flex-1 space-y-2 overflow-y-auto min-h-0">
-                                    {loading || sidebarLoading ? (
-                                        <div className="flex items-center gap-2 rounded-2xl border border-dashed border-[#E5E5E5] dark:border-[#2d3542] px-4 py-5 text-sm text-[#666666] dark:text-[#bcc5d3]">
-                                            <Loader2 className="h-4 w-4 animate-spin" />
-                                            加载会话列表中...
-                                        </div>
-                                    ) : conversations.length === 0 ? (
-                                        <div className="rounded-2xl border border-dashed border-[#E5E5E5] dark:border-[#2d3542] px-4 py-6 text-sm leading-7 text-[#666666] dark:text-[#bcc5d3]">
-                                            还没有历史会话。你可以先新建一个会话，向助手提问岗位准备、项目表达或知识点梳理。
-                                        </div>
-                                    ) : (
-                                        conversations.map((conversation) => {
-                                            const active = conversation.conversation_id === activeConversationId
-                                            const deleting = deletingConversationId === conversation.conversation_id
-                                            return (
-                                                <div
-                                                    key={conversation.conversation_id}
-                                                    className={`w-full rounded-2xl border px-4 py-3 text-left transition ${active ? 'border-[#D9D1BC] bg-[#F7F2E6] shadow-sm' : 'border-[#EAE7DD] dark:border-[#2d3542] bg-[#FCFBF8] dark:bg-[#181c24] hover:border-[#DDD7C7] hover:bg-[#F8F5EE] dark:hover:border-[#2d3542] dark:hover:bg-[#2d3542]'
-                                                        }`}
-                                                >
-                                                    <div className="flex items-start justify-between gap-3">
-                                                        <button
-                                                            type="button"
-                                                            onClick={() => setActiveConversationId(conversation.conversation_id)}
-                                                            className="min-w-0 flex-1 text-left"
-                                                        >
-                                                            <p className="truncate text-sm font-semibold text-[#111111] dark:text-[#f4f7fb]">{conversation.title}</p>
-                                                            <p className="mt-1 line-clamp-2 text-xs leading-6 text-[#666666] dark:text-[#bcc5d3]">{conversation.last_message_preview || '还没有消息内容'}</p>
-                                                        </button>
-                                                        <button
-                                                            type="button"
-                                                            disabled={deleting}
-                                                            onClick={() => void deleteConversation(conversation.conversation_id)}
-                                                            className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[#E5E5E5] dark:border-[#2d3542] text-[#999999] dark:text-[#8e98aa] transition hover:text-red-600 hover:border-red-200 disabled:cursor-not-allowed disabled:opacity-50"
-                                                            aria-label="删除会话"
-                                                        >
-                                                            {deleting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Trash2 className="h-3.5 w-3.5" />}
-                                                        </button>
-                                                        <ChevronRight className={`mt-0.5 h-4 w-4 shrink-0 ${active ? 'text-[#111111] dark:text-[#f4f7fb]' : 'text-[#999999] dark:text-[#8e98aa]'}`} />
-                                                    </div>
-                                                    <div className="mt-3 flex items-center gap-2 text-[11px] text-[#999999] dark:text-[#8e98aa]">
-                                                        <Clock3 className="h-3.5 w-3.5" />
-                                                        <span>{formatRelativeTime(conversation.updated_at || conversation.created_at)}</span>
-                                                    </div>
-                                                </div>
-                                            )
-                                        })
-                                    )}
-                                </div>
-                            </aside>
+                                ) : null}
+                            </div>
                         ) : null}
 
-                        <section className="overflow-hidden rounded-3xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] shadow-sm">
-                            <div className="border-b border-[#EAE7DD] dark:border-[#2d3542] px-6 py-5">
-                                <h2 className="text-xl font-semibold text-[#111111] dark:text-[#f4f7fb]">{activeConversation?.title || 'AI 问答助手'}</h2>
-                                <p className="mt-1 text-sm leading-6 text-[#666666] dark:text-[#bcc5d3]">优先使用知识库回答求职问答、项目表达和岗位准备问题；证据不足时会明确标注。</p>
-                            </div>
+                        <div className="flex items-end gap-2 rounded-2xl border border-gray-200 bg-gray-50 px-3 py-2 transition focus-within:border-gray-400 dark:border-gray-700 dark:bg-[#1a1a1a] dark:focus-within:border-gray-500">
+                            <textarea
+                                ref={textareaRef}
+                                value={input}
+                                onChange={(event) => setInput(event.target.value)}
+                                onKeyDown={(event) => {
+                                    if (event.key === 'Enter' && !event.shiftKey) {
+                                        event.preventDefault()
+                                        void sendMessage()
+                                    }
+                                }}
+                                rows={1}
+                                placeholder="输入你的问题..."
+                                className="max-h-[200px] min-h-[24px] flex-1 resize-none bg-transparent text-sm leading-6 text-gray-900 outline-none placeholder:text-gray-400 dark:text-gray-100 dark:placeholder:text-gray-500"
+                            />
+                            <button
+                                type="button"
+                                onClick={() => void sendMessage()}
+                                disabled={!input.trim() || sending}
+                                className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-gray-900 text-white transition hover:bg-gray-700 disabled:cursor-not-allowed disabled:bg-gray-300 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-gray-200 dark:disabled:bg-gray-700"
+                                aria-label="发送消息"
+                            >
+                                {sending ? (
+                                    <Loader2 className="h-4 w-4 animate-spin" />
+                                ) : (
+                                    <Send className="h-4 w-4" />
+                                )}
+                            </button>
+                        </div>
 
-                            <div className="flex h-[68vh] min-h-[500px] max-h-[820px] flex-col sm:h-[72vh] sm:min-h-[620px]">
-                                <div className="flex-1 space-y-4 overflow-y-auto px-6 py-6">
-                                    {loading ? (
-                                        <div className="flex items-center gap-2 text-sm text-[#666666] dark:text-[#bcc5d3]">
-                                            <Loader2 className="h-4 w-4 animate-spin" />
-                                            正在准备助手工作区...
-                                        </div>
-                                    ) : messages.length === 0 ? (
-                                        <div className="flex min-h-[420px] items-center justify-center">
-                                            <div className="max-w-xl rounded-3xl border border-dashed border-[#E5E5E5] dark:border-[#2d3542] bg-[#FAF9F6] dark:bg-[#101217] px-8 py-10 text-center">
-                                                <div className="mx-auto flex h-14 w-14 items-center justify-center rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24]">
-                                                    <Bot className="h-6 w-6 text-[#111111] dark:text-[#f4f7fb]" />
-                                                </div>
-                                                <h3 className="mt-5 text-xl font-semibold text-[#111111] dark:text-[#f4f7fb]">开始一段可追溯的 AI 对话</h3>
-                                                <p className="mt-3 text-sm leading-7 text-[#666666] dark:text-[#bcc5d3]">
-                                                    你可以直接问：帮我梳理前端面试里怎么讲项目难点，或者根据知识库总结 Java 后端高频考点。
-                                                </p>
-                                            </div>
-                                        </div>
-                                    ) : (
-                                        messages.map((message) => {
-                                            const isAssistant = message.role === 'assistant'
-                                            const [modeLabel, modeTone] = answerModeMeta(message.answer_mode)
-                                            return (
-                                                <article key={message.message_id} className="space-y-3">
-                                                    <div className={`flex ${isAssistant ? 'justify-start' : 'justify-end'}`}>
-                                                        <div className={`max-w-4xl rounded-[28px] border px-5 py-4 text-sm leading-7 shadow-sm ${isAssistant ? 'border-[#E8E4D9] dark:border-[#2d3542] bg-[#FAF9F6] dark:bg-[#181c24] text-[#1A1A1A] dark:text-[#f4f7fb]' : 'border-[#111111] bg-[#111111] text-white'}`}>
-                                                            <div className="mb-2 flex items-center gap-2 text-xs font-medium opacity-80">
-                                                                {isAssistant ? <Bot className="h-3.5 w-3.5" /> : <span className="inline-block h-2 w-2 rounded-full bg-current" />}
-                                                                <span>{isAssistant ? 'AI 助手' : '你'}</span>
-                                                            </div>
-                                                            {isAssistant ? (
-                                                                <MarkdownMessage content={message.content} className="text-inherit" />
-                                                            ) : (
-                                                                <div className="whitespace-pre-wrap">{message.content}</div>
-                                                            )}
-                                                            {!isAssistant ? (
-                                                                <button
-                                                                    type="button"
-                                                                    onClick={() => setInput(message.content)}
-                                                                    className="mt-3 inline-flex items-center gap-2 rounded-full border border-white/20 px-3 py-1 text-xs text-white/80 transition hover:bg-white/10 hover:text-white"
-                                                                >
-                                                                    <RefreshCcw className="h-3 w-3" />
-                                                                    再次提问
-                                                                </button>
-                                                            ) : null}
-                                                        </div>
-                                                    </div>
-
-                                                    {isAssistant ? (
-                                                        <div className="mr-auto max-w-4xl space-y-3">
-                                                            <div className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-medium ${modeTone}`}>
-                                                                <Sparkles className="h-3.5 w-3.5" />
-                                                                <span>{modeLabel}</span>
-                                                            </div>
-                                                            {Array.isArray(message.citations) && message.citations.length > 0 ? (
-                                                                <div className="grid gap-3 md:grid-cols-2">
-                                                                    {message.citations.slice(0, 4).map((citation, index) => (
-                                                                        <div key={`${message.message_id}_${index}`} className="rounded-2xl border border-[#EAE7DD] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
-                                                                            <div className="flex items-start justify-between gap-3">
-                                                                                <div>
-                                                                                    <p className="text-sm font-semibold text-[#111111] dark:text-[#f4f7fb]">{citation.title}</p>
-                                                                                    <p className="mt-1 text-xs text-[#999999] dark:text-[#8e98aa]">{citation.source}</p>
-                                                                                </div>
-                                                                                {typeof citation.score === 'number' ? (
-                                                                                    <span className="rounded-full bg-[#F5F1E8] px-2 py-1 text-[11px] font-medium text-[#8A6A35]">{citation.score.toFixed(2)}</span>
-                                                                                ) : null}
-                                                                            </div>
-                                                                            <p className="mt-3 text-xs leading-6 text-[#666666] dark:text-[#bcc5d3]">{citation.snippet}</p>
-                                                                        </div>
-                                                                    ))}
-                                                                </div>
-                                                            ) : null}
-                                                        </div>
-                                                    ) : null}
-                                                </article>
-                                            )
-                                        })
-                                    )}
-
-                                    {sending ? (
-                                        <div className="flex items-center gap-2 rounded-2xl border border-[#EAE7DD] dark:border-[#2d3542] bg-[#FAF9F6] dark:bg-[#101217] px-4 py-3 text-sm text-[#666666] dark:text-[#bcc5d3]">
-                                            <Loader2 className="h-4 w-4 animate-spin" />
-                                            正在基于知识库组织回答...
-                                        </div>
-                                    ) : null}
-                                    <div ref={bottomRef} />
-                                </div>
-
-                                <div className="border-t border-[#EAE7DD] dark:border-[#2d3542] px-6 py-5">
-                                    {error ? (
-                                        <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-                                            <span>{error}</span>
-                                            {lastPrompt ? (
-                                                <button
-                                                    type="button"
-                                                    onClick={() => void sendMessage(lastPrompt)}
-                                                    className="inline-flex items-center gap-2 rounded-xl border border-red-200 bg-white px-3 py-2 text-sm font-medium text-red-700 transition hover:bg-red-50"
-                                                >
-                                                    <RefreshCcw className="h-4 w-4" />
-                                                    重新发送
-                                                </button>
-                                            ) : null}
-                                        </div>
-                                    ) : null}
-
-                                    <div className="rounded-[28px] border border-[#E5E5E5] dark:border-[#2d3542] bg-[#FAF9F6] dark:bg-[#101217] p-3">
-                                        <textarea
-                                            value={input}
-                                            onChange={(event) => setInput(event.target.value)}
-                                            onKeyDown={(event) => {
-                                                if (event.key === 'Enter' && !event.shiftKey) {
-                                                    event.preventDefault()
-                                                    void sendMessage()
-                                                }
-                                            }}
-                                            rows={3}
-                                            placeholder="继续追问，或直接让助手基于知识库帮你梳理一个主题。"
-                                            className="w-full resize-none bg-transparent px-3 py-2 text-sm leading-7 text-[#111111] dark:text-[#f4f7fb] outline-none placeholder:text-[#999999] dark:placeholder:text-[#8e98aa]"
-                                        />
-                                        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[#E5E5E5] dark:border-[#2d3542] px-3 pt-3">
-                                            <p className="text-xs leading-6 text-[#666666] dark:text-[#bcc5d3]">支持多轮续聊、历史保存和知识库引用展示。</p>
-                                            <div className="flex items-center gap-2">
-                                                <button
-                                                    type="button"
-                                                    onClick={() => void createConversation().catch((e) => setError(e instanceof Error ? e.message : '创建会话失败。'))}
-                                                    className="inline-flex items-center gap-2 rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-3 py-2 text-sm font-medium text-[#111111] dark:text-[#f4f7fb] transition hover:bg-[#F8F6F0] dark:hover:bg-[#2d3542]"
-                                                >
-                                                    <MessageSquarePlus className="h-4 w-4" />
-                                                    新会话
-                                                </button>
-                                                <button
-                                                    type="button"
-                                                    onClick={() => void sendMessage()}
-                                                    disabled={!input.trim() || sending}
-                                                    className="inline-flex items-center gap-2 rounded-xl bg-[#111111] px-4 py-2 text-sm font-medium text-white transition hover:bg-[#222222] disabled:cursor-not-allowed disabled:bg-[#B6B1A4]"
-                                                >
-                                                    {sending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
-                                                    发送
-                                                </button>
-                                            </div>
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-                        </section>
-                    </section>
+                        <p className="mt-2 text-center text-[11px] text-gray-400 dark:text-gray-500">
+                            AI 助手基于知识库回答，内容仅供参考。支持 Shift+Enter 换行。
+                        </p>
+                    </div>
                 </div>
             </main>
         </div>

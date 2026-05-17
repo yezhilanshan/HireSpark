@@ -14,7 +14,6 @@ from flask_socketio import SocketIO, emit
 from flask_cors import CORS # 跨域资源共享中间件
 import base64
 import hashlib
-import hmac
 import time
 import json
 import threading
@@ -102,6 +101,16 @@ from utils.security import (
     ValidationError
 )
 from database import DatabaseManager
+from routes.account import (
+    AUTH_DEFAULT_EMAIL,
+    AUTH_DEFAULT_NAME,
+    AUTH_DEFAULT_PASSWORD,
+    create_account_blueprint,
+    hash_auth_password,
+)
+from routes.knowledge_graph import create_knowledge_graph_blueprint
+from routes.system import create_system_blueprint
+from routes.user import create_user_blueprint
 
 # 初始化日志
 logger = get_logger(__name__)
@@ -125,12 +134,15 @@ FLASK_DEBUG = config.get('system.debug', False)# 调试模式
 
 INSIGHTS_RECENT_LIMIT = 5
 INSIGHTS_RECENT_SCAN_LIMIT = 30
+INSIGHTS_REPORT_SCAN_LIMIT = 8
 INSIGHTS_LOOKBACK_DAYS = 30
 INSIGHTS_WEEKLY_DAYS = 7
 INSIGHTS_PER_ROUND_LIMIT = 3
 INSIGHTS_CACHE_TTL_SECONDS = 600
 INSIGHTS_TRACKED_ROUNDS = ('technical', 'project', 'system_design', 'hr')
 INSIGHTS_SUMMARY_CACHE = {}
+INSIGHTS_AI_SUMMARY_ENABLED = str(os.environ.get("INSIGHTS_AI_SUMMARY_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
+INSIGHTS_AI_SUMMARY_TIMEOUT_SECONDS = 30
 TRAINING_VALIDATION_QUESTION_COUNT = 3
 TRAINING_STATUS_LABELS = {
     'planned': '计划中',
@@ -159,12 +171,6 @@ ASSISTANT_POSITION_HINTS = {
     'product_manager': ('产品', '需求', 'prd', 'roadmap', '转化', '用户增长', '产品经理'),
     'devops': ('devops', 'docker', 'kubernetes', 'k8s', 'ci/cd', '运维', '部署'),
 }
-
-
-AUTH_DEFAULT_EMAIL = str(os.environ.get('AUTH_LOGIN_EMAIL', 'admin@zhiyuexingchen.cn') or '').strip().lower() or 'admin@zhiyuexingchen.cn'
-AUTH_DEFAULT_PASSWORD = str(os.environ.get('AUTH_LOGIN_PASSWORD', '职跃星辰123') or '').strip() or '职跃星辰123'
-AUTH_DEFAULT_NAME = str(os.environ.get('AUTH_LOGIN_NAME', '职跃星辰 管理员') or '').strip() or '职跃星辰 管理员'
-AUTH_EMAIL_PATTERN = re.compile(r'^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$')
 
 
 def _safe_int(value, default: int) -> int:
@@ -262,67 +268,6 @@ ASSISTANT_HISTORY_COMPRESS_KEEP_TURNS = max(
     ),
 )
 
-AUTH_PASSWORD_PBKDF2_ITERATIONS = max(
-    60000,
-    min(
-        600000,
-        _safe_int(os.environ.get('AUTH_PASSWORD_PBKDF2_ITERATIONS', 180000), 180000),
-    ),
-)
-
-
-def _normalize_auth_email(raw_email: str) -> str:
-    return str(raw_email or '').strip().lower()
-
-
-def _normalize_auth_name(raw_name: str) -> str:
-    return str(raw_name or '').strip()
-
-
-def _hash_auth_password(password: str, salt_hex: str | None = None) -> str:
-    normalized_password = str(password or '')
-    if not salt_hex:
-        salt_hex = os.urandom(16).hex()
-    try:
-        salt_bytes = bytes.fromhex(str(salt_hex))
-    except Exception:
-        salt_hex = os.urandom(16).hex()
-        salt_bytes = bytes.fromhex(salt_hex)
-
-    digest = hashlib.pbkdf2_hmac(
-        'sha256',
-        normalized_password.encode('utf-8'),
-        salt_bytes,
-        AUTH_PASSWORD_PBKDF2_ITERATIONS,
-    )
-    return f"pbkdf2_sha256${AUTH_PASSWORD_PBKDF2_ITERATIONS}${salt_hex}${digest.hex()}"
-
-
-def _verify_auth_password(password: str, stored_hash: str) -> bool:
-    normalized_hash = str(stored_hash or '').strip()
-    normalized_password = str(password or '')
-    if not normalized_hash:
-        return False
-
-    parts = normalized_hash.split('$')
-    if len(parts) != 4 or parts[0] != 'pbkdf2_sha256':
-        return hmac.compare_digest(normalized_hash, normalized_password)
-
-    try:
-        iterations = int(parts[1])
-        salt_hex = parts[2]
-        expected_digest = parts[3]
-        test_digest = hashlib.pbkdf2_hmac(
-            'sha256',
-            normalized_password.encode('utf-8'),
-            bytes.fromhex(salt_hex),
-            iterations,
-        ).hex()
-        return hmac.compare_digest(expected_digest, test_digest)
-    except Exception:
-        return False
-
-
 ASR_SPEECH_END_GRACE_MS = max(
     0,
     min(
@@ -333,10 +278,25 @@ ASR_SPEECH_END_GRACE_MS = max(
 ASR_SEGMENT_PREFER_FINAL_ONLY = _env_bool("ASR_SEGMENT_PREFER_FINAL_ONLY", True)
 ASR_FINAL_USE_HINT_PROMPT = _env_bool("ASR_FINAL_USE_HINT_PROMPT", False)
 ASR_DEBUG_STREAM_ENABLED = _env_bool("ASR_DEBUG_STREAM_ENABLED", True)
+ASR_MIN_SEGMENT_UNITS = max(1, min(12, _safe_int(os.environ.get("ASR_MIN_SEGMENT_UNITS", 3), 3)))
 ASR_PENDING_AUDIO_MAX_CHUNKS = max(4, min(240, _safe_int(os.environ.get("ASR_PENDING_AUDIO_MAX_CHUNKS", 80), 80)))
 ASR_PENDING_AUDIO_MAX_BYTES = max(
     32000,
     min(4 * 1024 * 1024, _safe_int(os.environ.get("ASR_PENDING_AUDIO_MAX_BYTES", 512000), 512000)),
+)
+RUNTIME_RECONNECT_GRACE_SECONDS = max(
+    5,
+    min(
+        300,
+        _safe_int(os.environ.get("RUNTIME_RECONNECT_GRACE_SECONDS", 90), 90),
+    ),
+)
+RUNTIME_COMMIT_DELAY_SECONDS = max(
+    0.0,
+    min(
+        1.0,
+        _safe_int(config.get('interview.commit_delay_ms', os.environ.get("RUNTIME_COMMIT_DELAY_MS", 120)), 120) / 1000.0,
+    ),
 )
 
 
@@ -446,7 +406,7 @@ if ResumeOptimizer is not None:
 try:
     seed_result = db_manager.ensure_user(
         email=AUTH_DEFAULT_EMAIL,
-        password_hash=_hash_auth_password(AUTH_DEFAULT_PASSWORD),
+        password_hash=hash_auth_password(AUTH_DEFAULT_PASSWORD),
         display_name=AUTH_DEFAULT_NAME,
         is_demo=True,
     )
@@ -475,6 +435,20 @@ if evaluation_service is None and evaluation_import_error:
     logger.error(f"评估服务初始化失败：{evaluation_import_error}")
 elif evaluation_service is not None:
     logger.info("三层评价服务初始化成功")
+
+    def _on_evaluation_completed(interview_id: str, turn_id: str, status: str) -> None:
+        """评估完成时通知相关前端客户端刷新报告。"""
+        try:
+            socketio.emit('evaluation_completed', {
+                'interview_id': interview_id,
+                'turn_id': turn_id,
+                'status': status,
+                'timestamp': time.time(),
+            })
+        except Exception as exc:
+            logger.warning(f"评估完成通知发送失败: {exc}")
+
+    evaluation_service.register_completion_callback(_on_evaluation_completed)
 
 video_upload_service = VideoUploadService(logger=logger)
 report_generator = ReportGenerator()
@@ -720,17 +694,37 @@ def _extract_runtime_question_core(reply_text: str, fallback: str = "") -> str:
     if not source:
         return str(fallback or "").strip()
 
+    def trim_question_segment(candidate: str) -> str:
+        normalized = str(candidate or "").strip()
+        parts = [part.strip() for part in re.split(r"[，,；;。.!！]\s*", normalized) if part.strip()]
+        if len(parts) >= 2 and parts[-1].endswith(("？", "?")):
+            prefix = "".join(parts[:-1])
+            if any(marker in prefix for marker in ("回答", "刚才", "不错", "概括", "完整", "补充", "遗漏", "欠缺", "换一个方向")):
+                return parts[-1]
+        return normalized
+
     if llm_manager is not None:
         parser = getattr(llm_manager, "_extract_primary_question", None)
         if callable(parser):
             try:
-                parsed = str(parser(source) or "").strip()
+                parsed = trim_question_segment(str(parser(source) or "").strip())
                 if parsed:
                     return parsed
             except Exception:
                 pass
 
     lines = [line.strip() for line in source.splitlines() if line.strip()]
+    question_segments = [
+        trim_question_segment(
+            re.sub(r"^(?:下一题|追问|问题|请回答|请你回答)\s*[:：]\s*", "", match.strip())
+        )
+        for match in re.findall(r"[^。！？!?\n；;]*[？?]", source)
+        if match.strip()
+    ]
+    for candidate in reversed(question_segments):
+        if len(candidate) >= 6:
+            return candidate
+
     for line in reversed(lines):
         if len(line) >= 6 and line.endswith(("？", "?")):
             return line
@@ -951,9 +945,9 @@ def _build_answer_rag_context(
     try:
         analysis_result = None
         question_id = _extract_question_id_from_plan(question_plan)
-        if question_id:
+        if question_id or str(current_question or "").strip():
             analysis_result = rag_service.analyze_answer(
-                question_id=question_id,
+                question_id=question_id or None,
                 candidate_answer=user_answer,
                 session_state=interview_state,
                 current_question=current_question,
@@ -1300,6 +1294,23 @@ def _pick_segment_text(final_text: str, partial_text: str, merged_pending_text: 
     return final_text
 
 
+def _is_low_information_asr_segment(text: str) -> bool:
+    normalized = re.sub(r"[\s，。！？!?；;,.、~～…]+", "", str(text or "").strip().lower())
+    if not normalized:
+        return True
+    units = _count_text_units(normalized)
+    if units >= ASR_MIN_SEGMENT_UNITS:
+        return False
+    filler_only = {
+        "嗯", "啊", "哦", "噢", "呃", "额", "诶", "哎", "唉",
+        "好", "好的", "对", "是", "不是", "这个", "那个", "就是", "然后",
+        "谢谢", "不好意思",
+    }
+    if normalized in filler_only:
+        return True
+    return units <= 1
+
+
 def _text_token_overlap_ratio(text_a: str, text_b: str) -> float:
     tokens_a = set(re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9]+", str(text_a or "").lower()))
     tokens_b = set(re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9]+", str(text_b or "").lower()))
@@ -1329,22 +1340,16 @@ def _reconcile_final_answer_text(draft_text: str, rewritten_text: str) -> tuple[
 
     draft_units = _count_text_units(draft)
     rewritten_units = _count_text_units(rewritten)
-    if draft_units >= 8 and rewritten_units <= max(4, int(draft_units * 0.62)):
-        merged = merge_answer_text(draft, rewritten)
-        if merged and _count_text_units(merged) >= int(draft_units * 0.9):
-            return merged, 'merge_guard_short_rewrite'
+    if draft_units >= 8 and rewritten_units <= max(4, int(draft_units * 0.55)):
         return draft, 'fallback_short_rewrite'
 
     overlap_ratio = _text_token_overlap_ratio(draft, rewritten)
-    if draft_units >= 8 and rewritten_units >= 8 and overlap_ratio < 0.35:
-        if rewritten_units >= max(8, int(draft_units * 0.92)):
+    if draft_units >= 8 and rewritten_units >= 8 and overlap_ratio < 0.25:
+        if rewritten_units >= max(8, int(draft_units * 0.85)):
             return rewritten, 'asr_final_rewrite_low_overlap_preferred'
         return draft, 'fallback_low_overlap_draft'
 
-    merged = merge_answer_text(draft, rewritten)
-    if merged and _count_text_units(merged) >= max(draft_units, rewritten_units):
-        return merged, 'merge_rewrite_and_draft'
-    if rewritten_units >= draft_units:
+    if rewritten_units >= max(4, int(draft_units * 0.55)):
         return rewritten, 'asr_final_rewrite_preferred'
     return draft, 'fallback_draft_preferred'
 
@@ -1530,7 +1535,7 @@ def _schedule_answer_session_finalize(
     expected_speech_epoch = speech_epoch or getattr(answer_session, 'last_speech_epoch', 0)
     expected_asr_generation = asr_generation or getattr(answer_session, 'last_asr_generation', 0)
 
-    if expected_speech_epoch and current.speech_epoch != expected_speech_epoch:
+    if expected_speech_epoch and getattr(answer_session, 'last_speech_epoch', 0) != expected_speech_epoch:
         _log_runtime_event(
             current,
             'answer_session_finalize_dropped',
@@ -1538,8 +1543,8 @@ def _schedule_answer_session_finalize(
             source=reason,
             answer_session_id=answer_session.answer_session_id,
             expected_speech_epoch=expected_speech_epoch,
-            current_speech_epoch=current.speech_epoch,
-            reason_detail='speech_epoch_advanced_before_schedule',
+            current_speech_epoch=getattr(answer_session, 'last_speech_epoch', 0),
+            reason_detail='answer_session_epoch_changed_before_schedule',
         )
         return
 
@@ -1568,17 +1573,21 @@ def _schedule_answer_session_finalize(
         live_answer_session = live_runtime.current_answer_session
         if not live_answer_session or live_answer_session.answer_session_id != answer_session_id:
             return
-        if expected_speech_epoch and live_runtime.speech_epoch != expected_speech_epoch:
+        if getattr(live_runtime, 'active_asr_generation', 0) or getattr(live_runtime, 'active_client_speech_epoch', 0):
             _log_runtime_event(
                 live_runtime,
-                'answer_session_finalize_dropped',
+                'answer_session_finalize_retry',
                 level='debug',
                 source=reason,
                 answer_session_id=answer_session_id,
-                expected_speech_epoch=expected_speech_epoch,
-                current_speech_epoch=live_runtime.speech_epoch,
-                reason_detail='speech_epoch_advanced',
+                active_asr_generation=getattr(live_runtime, 'active_asr_generation', 0) or '',
+                active_client_speech_epoch=getattr(live_runtime, 'active_client_speech_epoch', 0) or '',
+                reason_detail='speech_active',
             )
+            retry_timer = threading.Timer(0.5, finalize_task)
+            retry_timer.daemon = True
+            live_runtime.pending_answer_finalize_timer = retry_timer
+            retry_timer.start()
             return
         if expected_speech_epoch and getattr(live_answer_session, 'last_speech_epoch', 0) != expected_speech_epoch:
             _log_runtime_event(
@@ -1642,11 +1651,24 @@ def _finalize_answer_segment(
     if asr_generation and current.last_finalized_asr_generation == asr_generation:
         current.last_finalized_asr_generation = 0
         current.last_finalized_asr_speech_epoch = 0
+    segment_added = False
     if segment_text:
-        answer_session.finalize_segment(segment_text)
-    if speech_epoch and speech_epoch >= getattr(answer_session, 'last_speech_epoch', 0):
+        if _is_low_information_asr_segment(segment_text):
+            _log_runtime_event(
+                current,
+                'answer_segment_ignored',
+                level='debug',
+                source=reason,
+                answer_session_id=answer_session.answer_session_id,
+                segment_preview=segment_text[:160],
+                reason_detail='low_information_asr_segment',
+            )
+        else:
+            answer_session.finalize_segment(segment_text)
+            segment_added = True
+    if segment_added and speech_epoch and speech_epoch >= getattr(answer_session, 'last_speech_epoch', 0):
         answer_session.last_speech_epoch = speech_epoch
-    if asr_generation and asr_generation >= getattr(answer_session, 'last_asr_generation', 0):
+    if segment_added and asr_generation and asr_generation >= getattr(answer_session, 'last_asr_generation', 0):
         answer_session.last_asr_generation = asr_generation
 
     answer_session.mark_status('paused_short')
@@ -1863,7 +1885,15 @@ def _generate_policy_response(
                 reference_question=reference_question,
             )
         if next_question and next_question_plan:
-            intro = "这个点先到这里，我们换一个方向。" if next_action == 'switch_question' else "这部分回答得比较扎实，我们提升一点难度。"
+            transition_text = llm_manager.generate_natural_transition(
+                previous_question=current_question,
+                user_answer=user_answer,
+                next_question=next_question,
+                transition_type=next_action,
+                position=position,
+                round_type=round_type,
+                chat_history=chat_history,
+            )
             final_state = planning_state
             final_state = rag_service.mark_question_asked(planning_state, next_question_plan)
             switched_decision = _with_runtime_question(
@@ -1872,7 +1902,7 @@ def _generate_policy_response(
                 fallback_question=next_question,
             )
             return (
-                f"{intro}\n\n{next_question}",
+                transition_text,
                 analysis_result,
                 switched_decision,
                 final_state,
@@ -2176,6 +2206,93 @@ def _track_answer_timeline(runtime, turn_id: str) -> None:
     })
 
 
+def _timestamp_to_epoch_seconds(raw_timestamp, runtime) -> float:
+    try:
+        value = float(raw_timestamp or 0.0)
+    except Exception:
+        value = 0.0
+    if value > 1_000_000_000_000:
+        return value / 1000.0
+    if value > 1_000_000_000:
+        return value
+    if runtime and runtime.started_at:
+        if value > 10_000:
+            return float(runtime.started_at) + value / 1000.0
+        if value > 0:
+            return float(runtime.started_at) + value
+    return value or time.time()
+
+
+def _build_turn_detection_state(runtime, turn_id: str) -> dict:
+    fallback = dict(getattr(runtime, 'pending_detection_state', {}) or {})
+    timeline = []
+    if runtime and runtime.data_manager:
+        timeline = list((runtime.data_manager.get_interview_data() or {}).get('timeline') or [])
+
+    answer_end_at = time.time()
+    answer_start_at = (
+        getattr(runtime, 'current_answer_started_at', None)
+        or getattr(runtime, 'current_question_estimated_end_at', None)
+        or getattr(runtime, 'current_question_started_at', None)
+        or 0.0
+    )
+    detection_rows = []
+    for item in timeline:
+        if not isinstance(item, dict) or str(item.get('type') or '').strip() != 'detection_state':
+            continue
+        ts_epoch = _timestamp_to_epoch_seconds(item.get('timestamp'), runtime)
+        if answer_start_at and (ts_epoch < float(answer_start_at) - 0.5 or ts_epoch > answer_end_at + 0.5):
+            continue
+        detection_rows.append(item)
+
+    if not detection_rows:
+        recent_rows = [
+            item for item in timeline
+            if isinstance(item, dict) and str(item.get('type') or '').strip() == 'detection_state'
+        ][-40:]
+        detection_rows = recent_rows
+
+    if not detection_rows:
+        return fallback
+
+    def _norm_percent(value):
+        parsed = _safe_float(value, 0.0)
+        return parsed * 100.0 if parsed <= 1.0 else parsed
+
+    risk_values = [_norm_percent(item.get('risk_score', item.get('probability', 0.0))) for item in detection_rows]
+    offscreen_values = [_norm_percent(item.get('off_screen_ratio', 0.0)) for item in detection_rows]
+    face_counts = [_safe_int(item.get('face_count'), 1) for item in detection_rows]
+    hr_values = [
+        _safe_float(item.get('hr'), None)
+        for item in detection_rows
+        if _safe_float(item.get('hr'), None) is not None
+    ]
+    flags = sorted({
+        str(flag).strip()
+        for item in detection_rows
+        for flag in (item.get('flags') or [])
+        if str(flag).strip()
+    })
+    latest = dict(detection_rows[-1] or {})
+    latest_insights = latest.get('camera_insights') if isinstance(latest.get('camera_insights'), dict) else {}
+    return {
+        **fallback,
+        'turn_id': str(turn_id or getattr(runtime, 'turn_id', '') or '').strip(),
+        'sample_count': len(detection_rows),
+        'risk_score': round(max(risk_values + [0.0]), 2),
+        'risk_score_avg': round(_safe_avg(risk_values), 2) if risk_values else 0.0,
+        'off_screen_ratio': round(_safe_avg(offscreen_values), 2) if offscreen_values else 0.0,
+        'off_screen_ratio_max': round(max(offscreen_values + [0.0]), 2),
+        'has_face': all(bool(item.get('has_face', True)) for item in detection_rows),
+        'face_count': max(face_counts + [1]),
+        'flags': flags,
+        'hr': round(_safe_avg(hr_values), 2) if hr_values else latest.get('hr'),
+        'rppg_reliable': any(bool(item.get('rppg_reliable', False)) for item in detection_rows),
+        'camera_insights': latest_insights,
+        'video_features': latest.get('video_features') if isinstance(latest.get('video_features'), dict) else {},
+    }
+
+
 def _maybe_enqueue_replay_generation(interview_id: str, force: bool = False) -> None:
     normalized_id = str(interview_id or '').strip()
     if not normalized_id:
@@ -2353,6 +2470,7 @@ def _record_runtime_dialogue(
     question_id: str = "",
 ):
     normalized_turn_id = str(turn_id or runtime.turn_id or '').strip() or f"turn_{runtime.turn_index}"
+    resolved_question_id = _resolve_evaluation_question_id(runtime, question, question_id)
     if runtime.data_manager:
         runtime.data_manager.add_frame_data({
             'type': 'interview_dialogue',
@@ -2398,13 +2516,13 @@ def _record_runtime_dialogue(
             enqueue_result = evaluation_service.enqueue_evaluation(
                 interview_id=runtime.interview_id,
                 turn_id=normalized_turn_id,
-                question_id=str(question_id or "").strip() or _extract_question_id_from_plan(runtime.last_question_plan),
+                question_id=resolved_question_id,
                 user_id=runtime.user_id,
                 round_type=runtime.round_type,
                 position=runtime.position,
                 question=question,
                 answer=answer,
-                detection_state=dict(runtime.pending_detection_state or {}),
+                detection_state=_build_turn_detection_state(runtime, normalized_turn_id),
             )
             if not enqueue_result.get('success'):
                 _log_runtime_event(
@@ -2416,6 +2534,32 @@ def _record_runtime_dialogue(
                 )
         except Exception as e:
             logger.warning(f"投递三层评估任务失败：{e}")
+
+
+def _normalize_question_for_match(text: str) -> str:
+    return re.sub(r"\s+", "", str(text or "").strip().lower().replace("？", "?"))
+
+
+def _resolve_evaluation_question_id(runtime, question: str, explicit_question_id: str = "") -> str:
+    question_id = str(explicit_question_id or "").strip() or _extract_question_id_from_plan(runtime.last_question_plan)
+    if not question_id:
+        return ""
+
+    planned_question = _extract_question_text_from_plan(runtime.last_question_plan)
+    forced_question = str(getattr(runtime, 'forced_question_text', '') or '').strip()
+    current = _normalize_question_for_match(question)
+    candidates = [
+        _normalize_question_for_match(planned_question),
+        _normalize_question_for_match(forced_question),
+    ]
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if current == candidate or current in candidate or candidate in current:
+            return question_id
+
+    # 普通追问或教练生成问题不强制沿用上一道主问题 ID，让 RAG 按当前题面检索 rubric。
+    return ""
 
 
 def _format_coach_mode_reply(coach_payload: dict) -> str:
@@ -2456,6 +2600,20 @@ AUTO_END_LOW_SCORE = 45.0
 AUTO_END_SCORE_WAIT_SECONDS = 3.0
 AUTO_END_SCORE_POLL_SECONDS = 0.2
 
+EVALUATION_STATUS_PRIORITY = {
+    'ok': 5,
+    'partial_ok': 4,
+    'running': 3,
+    'pending': 2,
+    'queued': 1,
+    'skipped': 0,
+    'failed': 0,
+    'unknown': 0,
+}
+
+FINAL_SCORE_DIRECT_FUSION_WEIGHT = 0.35
+FINAL_SCORE_STABLE_WEIGHT = 0.65
+
 
 def _extract_turn_sequence(turn_id: str) -> int:
     normalized_turn_id = str(turn_id or '').strip()
@@ -2490,12 +2648,44 @@ def _extract_fusion_score_from_evaluation(row) -> float | None:
     return None
 
 
-def _evaluation_row_priority(row) -> tuple[int, int, int]:
+def _evaluation_row_priority(row) -> tuple[int, int, int, int]:
     status = str((row or {}).get('status') or '').strip().lower()
     has_score = _extract_fusion_score_from_evaluation(row) is not None
-    status_rank = 2 if status == 'ok' else 1 if status == 'partial_ok' else 0
-    updated_at = str((row or {}).get('updated_at') or '').strip()
-    return (status_rank, int(has_score), 1 if updated_at else 0)
+    return (
+        int(EVALUATION_STATUS_PRIORITY.get(status or 'unknown', 0)),
+        int(has_score),
+        _evaluation_row_updated_epoch(row),
+        _safe_int((row or {}).get('id'), 0),
+    )
+
+
+
+def _evaluation_row_updated_epoch(row) -> int:
+    value = str((row or {}).get('updated_at') or (row or {}).get('created_at') or '').strip()
+    if not value:
+        return 0
+    normalized = value.replace('T', ' ').replace('Z', '').split('.')[0]
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+        try:
+            return int(datetime.strptime(normalized[:19] if fmt.endswith('%S') else normalized[:10], fmt).timestamp())
+        except Exception:
+            continue
+    try:
+        return int(datetime.fromisoformat(normalized).timestamp())
+    except Exception:
+        return 0
+
+
+def _dedupe_evaluation_rows_by_turn(rows):
+    """同一 turn 只保留最可信且最新的一条评估记录。"""
+    deduped = {}
+    for index, row in enumerate(rows or []):
+        turn_id = str((row or {}).get('turn_id') or '').strip()
+        dedupe_key = turn_id or str((row or {}).get('eval_task_key') or f'row_{index}')
+        existing = deduped.get(dedupe_key)
+        if existing is None or _evaluation_row_priority(row) > _evaluation_row_priority(existing):
+            deduped[dedupe_key] = row
+    return list(deduped.values())
 
 
 def _collect_scored_turns(interview_id: str):
@@ -2839,15 +3029,15 @@ def _start_runtime_asr(runtime, reason: str = "speech_start") -> bool:
             previous_final = _merge_asr_fragments(live_runtime.pending_asr_finals)
             # partial 只保留最新快照，避免 revision 抖动导致重复累积。
             live_runtime.pending_asr_partials = [partial_text]
-            _final_text, _partial_text, preview_text = _build_pending_asr_text(live_runtime)
+            _final_text, _partial_text, new_segment_preview = _build_pending_asr_text(live_runtime)
             answer_session = _ensure_answer_session(live_runtime)
             answer_session.mark_status('recording')
-            answer_session.update_partial(preview_text)
+            answer_session.update_partial(new_segment_preview)
             _emit_realtime_speech_metrics(
                 live_runtime,
                 answer_session,
                 is_speaking=True,
-                text_snapshot=preview_text or partial_text,
+                text_snapshot=new_segment_preview or partial_text,
                 source='asr_partial',
             )
             _print_asr_console(live_runtime, 'partial', partial_text, asr_generation)
@@ -2869,11 +3059,11 @@ def _start_runtime_asr(runtime, reason: str = "speech_start") -> bool:
                     f"prev_partial_units={_count_text_units(previous_partial)} "
                     f"prev_final_units={_count_text_units(previous_final)} "
                     f"incoming_units={_count_text_units(partial_text)} "
-                    f"preview_units={_count_text_units(preview_text)}"
+                    f"preview_units={_count_text_units(new_segment_preview)}"
                 ),
                 partial_preview=partial_text[:160],
                 final_preview=previous_final[:160],
-                text_snapshot=preview_text[:200],
+                text_snapshot=new_segment_preview[:200],
             )
             _emit_answer_session_update(live_runtime, source='asr_partial')
             socketio.emit('asr_partial', {
@@ -2883,7 +3073,7 @@ def _start_runtime_asr(runtime, reason: str = "speech_start") -> bool:
                 'speech_epoch': live_runtime.active_asr_speech_epoch or live_runtime.speech_epoch,
                 'asr_generation': asr_generation,
                 'text': partial_text,
-                'full_text': preview_text,
+                'full_text': new_segment_preview,
                 'interrupt_epoch': live_runtime.interrupt_epoch,
                 'timestamp': time.time()
             }, to=live_runtime.client_id)
@@ -2915,20 +3105,20 @@ def _start_runtime_asr(runtime, reason: str = "speech_start") -> bool:
             if not final_text:
                 return
             previous_partial = _merge_asr_fragments(live_runtime.pending_asr_partials)
-            previous_final = _merge_asr_fragments(live_runtime.pending_asr_finals)
-            merged_final = _merge_asr_fragments(live_runtime.pending_asr_finals)
-            merged_final = merge_answer_text(merged_final, final_text) if merged_final else final_text
+            previous_final = live_runtime.pending_asr_finals[0] if live_runtime.pending_asr_finals else ""
+            # 直接使用已合并的文本与新 final 合并，避免重复合并
+            merged_final = merge_answer_text(previous_final, final_text) if previous_final else final_text
             live_runtime.pending_asr_finals = [merged_final]
             live_runtime.pending_asr_partials.clear()
-            _merged_final, _merged_partial, preview_text = _build_pending_asr_text(live_runtime)
+            _merged_final, _merged_partial, new_segment_preview = _build_pending_asr_text(live_runtime)
             answer_session = _ensure_answer_session(live_runtime)
             answer_session.mark_status('recording')
-            answer_session.update_partial(preview_text)
+            answer_session.update_partial(new_segment_preview)
             _emit_realtime_speech_metrics(
                 live_runtime,
                 answer_session,
                 is_speaking=True,
-                text_snapshot=preview_text or merged_final,
+                text_snapshot=new_segment_preview or merged_final,
                 source='asr_final',
             )
             _print_asr_console(live_runtime, 'final', final_text, asr_generation)
@@ -2951,11 +3141,11 @@ def _start_runtime_asr(runtime, reason: str = "speech_start") -> bool:
                     f"prev_partial_units={_count_text_units(previous_partial)} "
                     f"incoming_units={_count_text_units(final_text)} "
                     f"merged_final_units={_count_text_units(merged_final)} "
-                    f"preview_units={_count_text_units(preview_text)}"
+                    f"preview_units={_count_text_units(new_segment_preview)}"
                 ),
                 partial_preview=previous_partial[:160],
                 final_preview=final_text[:160],
-                text_snapshot=preview_text[:200],
+                text_snapshot=new_segment_preview[:200],
             )
             _emit_answer_session_update(live_runtime, source='asr_sentence_final')
             socketio.emit('asr_final', {
@@ -2966,7 +3156,7 @@ def _start_runtime_asr(runtime, reason: str = "speech_start") -> bool:
                 'asr_generation': asr_generation,
                 'text': final_text,
                 'full_text': merged_final,
-                'preview_text': preview_text,
+                'preview_text': new_segment_preview,
                 'interrupt_epoch': live_runtime.interrupt_epoch,
                 'timestamp': time.time()
             }, to=live_runtime.client_id)
@@ -3122,7 +3312,7 @@ def _schedule_runtime_commit(
         if answer_text:
             _process_runtime_commit(current, answer_text, turn_id, source)
 
-    runtime.pending_commit_timer = threading.Timer(0.45, commit_task)
+    runtime.pending_commit_timer = threading.Timer(RUNTIME_COMMIT_DELAY_SECONDS, commit_task)
     runtime.pending_commit_timer.daemon = True
     runtime.pending_commit_timer.start()
     _log_runtime_event(
@@ -4222,42 +4412,18 @@ def _assistant_generate_reply(
 
 # ==================== 基础路由 ====================
 
-@app.route('/')
-def index():
-    """主页路由"""
-    logger.debug("收到主页请求")
-    return jsonify({
-        'message': 'AI Interview Platform API',
-        'version': config.get('system.version', '1.0.0'),
-        'status': 'running',
-        'environment': config.get('system.environment', 'development')
-    })
-
-
-@app.route('/health')
-def health():
-    """健康检查"""
-    logger.debug("健康检查请求")
-    perf_stats = performance_monitor.get_system_stats()
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': time.time(),
-        'performance': {
-            'fps': perf_stats['fps'],
-            'cpu_percent': perf_stats['cpu_percent'],
-            'memory_percent': perf_stats['memory_percent']
-        },
-        'services': {
-            'llm': bool(llm_manager and getattr(llm_manager, 'enabled', False)),
-            'rag': bool(rag_service),
-            'asr': bool(asr_manager and getattr(asr_manager, 'enabled', False)),
-            'assistant': bool(assistant_service and getattr(assistant_service, 'enabled', False)),
-            'tts': tts_manager.get_status() if tts_manager else {
-                'enabled': False,
-                'error': tts_import_error or 'tts manager unavailable'
-            }
-        }
-    })
+app.register_blueprint(create_system_blueprint(
+    config=config,
+    logger=logger,
+    performance_monitor=performance_monitor,
+    db_manager=db_manager,
+    llm_manager=llm_manager,
+    rag_service=rag_service,
+    asr_manager=asr_manager,
+    assistant_service=assistant_service,
+    tts_manager=tts_manager,
+    tts_import_error=tts_import_error,
+))
 
 
 @app.route('/api/prewarm', methods=['GET', 'POST'])
@@ -4312,705 +4478,26 @@ def api_prewarm():
     })
 
 
-MEMBERSHIP_TEAM_DISCOUNT = 0.8
-MEMBERSHIP_PLAN_CATALOG = {
-    'single': {
-        'id': 'single',
-        'title': '按次订阅',
-        'description': '适合偶尔练习、临近面试冲刺时按需使用。',
-        'unit_label': '/次',
-        'base_price': 5,
-        'detail': '单次开通即可使用，适合先试用产品能力或补一场专项训练。',
-        'highlight': '灵活体验',
-        'quota_total': 1,
-        'duration_days': None,
-    },
-    'monthly': {
-        'id': 'monthly',
-        'title': '按月订阅',
-        'description': '适合持续打磨表达、节奏和岗位匹配度。',
-        'unit_label': '/月',
-        'base_price': 40,
-        'detail': '按月更适合稳定训练节奏，方便在求职周期内持续复盘和跟踪。',
-        'highlight': '热门选择',
-        'quota_total': 0,
-        'duration_days': 30,
-    },
-    'yearly': {
-        'id': 'yearly',
-        'title': '按年订阅',
-        'description': '适合长期提升与系统训练，综合性价比更高。',
-        'unit_label': '/年',
-        'base_price': 400,
-        'detail': '年付包含每年 200 次使用额度，适合长期备战或全年训练规划。',
-        'highlight': '年度最省',
-        'quota_total': 200,
-        'duration_days': 365,
-    },
-}
+# ==================== 账号与会员接口 ====================
 
+app.register_blueprint(create_account_blueprint(db_manager=db_manager))
 
-def _normalize_membership_mode(value) -> str:
-    normalized = str(value or '').strip().lower()
-    return 'team' if normalized == 'team' else 'personal'
 
+# ==================== 用户提醒接口 ====================
 
-def _normalize_membership_plan_id(value) -> str:
-    normalized = str(value or '').strip().lower()
-    return normalized if normalized in MEMBERSHIP_PLAN_CATALOG else ''
+app.register_blueprint(create_user_blueprint(
+    db_manager=db_manager,
+    logger=logger,
+))
 
 
-def _serialize_membership_catalog():
-    return {
-        'team_discount': MEMBERSHIP_TEAM_DISCOUNT,
-        'modes': [
-            {'id': 'personal', 'label': '个人版', 'min_team_size': 1},
-            {'id': 'team', 'label': '团队版', 'min_team_size': 2},
-        ],
-        'plans': list(MEMBERSHIP_PLAN_CATALOG.values()),
-    }
+# ==================== 知识图谱接口 ====================
 
-
-def _calculate_membership_selection(mode, plan_id, team_size):
-    normalized_mode = _normalize_membership_mode(mode)
-    normalized_plan_id = _normalize_membership_plan_id(plan_id)
-    if not normalized_plan_id:
-        raise ValueError('无效的订阅方案')
-
-    try:
-        normalized_team_size = int(team_size or 1)
-    except Exception:
-        normalized_team_size = 1
-
-    if normalized_mode == 'team':
-        normalized_team_size = max(2, min(normalized_team_size, 50))
-        discount = MEMBERSHIP_TEAM_DISCOUNT
-    else:
-        normalized_team_size = 1
-        discount = 1.0
-
-    plan = MEMBERSHIP_PLAN_CATALOG[normalized_plan_id]
-    base_price = float(plan.get('base_price') or 0)
-    unit_price = round(base_price * discount, 2)
-    total_price = round(unit_price * normalized_team_size, 2)
-    base_quota = int(plan.get('quota_total') or 0)
-    quota_total = base_quota * normalized_team_size if base_quota > 0 else 0
-    expires_at = None
-    duration_days = plan.get('duration_days')
-    if duration_days:
-        expires_at = (datetime.utcnow() + timedelta(days=int(duration_days))).isoformat(timespec='seconds')
-
-    return {
-        'membership_mode': normalized_mode,
-        'plan_id': normalized_plan_id,
-        'team_size': normalized_team_size,
-        'plan': plan,
-        'unit_price': unit_price,
-        'total_price': total_price,
-        'quota_total': quota_total,
-        'quota_used': 0,
-        'expires_at': expires_at,
-    }
-
-
-def _serialize_membership_snapshot(user):
-    if not user:
-        return {
-            'status': 'inactive',
-            'mode': 'personal',
-            'plan_id': None,
-            'plan_title': None,
-            'team_size': 1,
-            'auto_renew': False,
-            'started_at': None,
-            'expires_at': None,
-            'usage': {'total': 0, 'used': 0, 'remaining': 0},
-        }
-
-    status = str(user.get('membership_status') or 'inactive').strip() or 'inactive'
-    plan_id = _normalize_membership_plan_id(user.get('membership_plan_id'))
-    plan = MEMBERSHIP_PLAN_CATALOG.get(plan_id) if plan_id else None
-    quota_total = max(0, int(user.get('membership_cycle_quota') or 0))
-    quota_used = max(0, int(user.get('membership_cycle_used') or 0))
-    return {
-        'status': status,
-        'mode': _normalize_membership_mode(user.get('membership_mode')),
-        'plan_id': plan_id or None,
-        'plan_title': plan.get('title') if plan else None,
-        'team_size': max(1, int(user.get('membership_team_size') or 1)),
-        'auto_renew': bool(user.get('membership_auto_renew')),
-        'started_at': user.get('membership_started_at'),
-        'expires_at': user.get('membership_expires_at'),
-        'usage': {
-            'total': quota_total,
-            'used': quota_used,
-            'remaining': max(0, quota_total - quota_used),
-        },
-    }
-
-
-def _serialize_membership_order(order):
-    if not order:
-        return None
-    plan = MEMBERSHIP_PLAN_CATALOG.get(str(order.get('plan_id') or '').strip())
-    return {
-        'order_id': order.get('order_id'),
-        'membership_mode': order.get('membership_mode'),
-        'plan_id': order.get('plan_id'),
-        'plan_title': plan.get('title') if plan else None,
-        'team_size': int(order.get('team_size') or 1),
-        'unit_price': float(order.get('unit_price') or 0),
-        'total_price': float(order.get('total_price') or 0),
-        'status': str(order.get('status') or 'pending').strip() or 'pending',
-        'quota_total': int(order.get('quota_total') or 0),
-        'quota_used': int(order.get('quota_used') or 0),
-        'created_at': order.get('created_at'),
-        'updated_at': order.get('updated_at'),
-    }
-
-
-@app.route('/api/membership/overview', methods=['GET'])
-def api_membership_overview():
-    user_email = _normalize_auth_email(request.args.get('user_email', ''))
-    if not user_email:
-        return jsonify({'success': False, 'error': '缺少用户邮箱'}), 400
-
-    user = db_manager.get_user_by_email(user_email)
-    if not user:
-        return jsonify({'success': False, 'error': '用户不存在'}), 404
-
-    orders = db_manager.list_membership_orders(user_email=user_email, limit=6)
-    return jsonify({
-        'success': True,
-        'catalog': _serialize_membership_catalog(),
-        'current_membership': _serialize_membership_snapshot(user),
-        'recent_orders': [_serialize_membership_order(order) for order in orders],
-    })
-
-
-@app.route('/api/membership/orders', methods=['POST'])
-def api_membership_create_order():
-    payload = request.get_json(silent=True) or {}
-    user_email = _normalize_auth_email(payload.get('user_email', ''))
-    membership_mode = _normalize_membership_mode(payload.get('membership_mode'))
-    plan_id = _normalize_membership_plan_id(payload.get('plan_id'))
-    team_size = payload.get('team_size', 1)
-
-    if not user_email:
-        return jsonify({'success': False, 'error': '缺少用户邮箱'}), 400
-
-    user = db_manager.get_user_by_email(user_email)
-    if not user:
-        return jsonify({'success': False, 'error': '用户不存在'}), 404
-    if not plan_id:
-        return jsonify({'success': False, 'error': '请选择有效的订阅方案'}), 400
-
-    try:
-        summary = _calculate_membership_selection(membership_mode, plan_id, team_size)
-    except ValueError as exc:
-        return jsonify({'success': False, 'error': str(exc)}), 400
-
-    order_id = f"mem_{uuid.uuid4().hex[:12]}"
-    created = db_manager.create_membership_order({
-        'order_id': order_id,
-        'user_email': user_email,
-        'membership_mode': summary['membership_mode'],
-        'plan_id': summary['plan_id'],
-        'team_size': summary['team_size'],
-        'unit_price': summary['unit_price'],
-        'total_price': summary['total_price'],
-        'quota_total': summary['quota_total'],
-        'quota_used': summary['quota_used'],
-        'status': 'pending',
-    })
-    if not created.get('success'):
-        return jsonify({'success': False, 'error': str(created.get('error') or '创建订单失败')}), 500
-
-    return jsonify({
-        'success': True,
-        'order': _serialize_membership_order(created.get('order')),
-    }), 201
-
-
-@app.route('/api/membership/orders/pay', methods=['POST'])
-def api_membership_pay_order():
-    payload = request.get_json(silent=True) or {}
-    user_email = _normalize_auth_email(payload.get('user_email', ''))
-    order_id = str(payload.get('order_id', '') or '').strip()
-
-    if not user_email or not order_id:
-        return jsonify({'success': False, 'error': '缺少支付参数'}), 400
-
-    user = db_manager.get_user_by_email(user_email)
-    if not user:
-        return jsonify({'success': False, 'error': '用户不存在'}), 404
-
-    order = db_manager.get_membership_order(order_id=order_id, user_email=user_email)
-    if not order:
-        return jsonify({'success': False, 'error': '订单不存在'}), 404
-
-    if str(order.get('status') or '').strip() == 'paid':
-        return jsonify({
-            'success': True,
-            'order': _serialize_membership_order(order),
-            'current_membership': _serialize_membership_snapshot(user),
-        })
-
-    try:
-        summary = _calculate_membership_selection(
-            order.get('membership_mode'),
-            order.get('plan_id'),
-            order.get('team_size'),
-        )
-    except ValueError as exc:
-        return jsonify({'success': False, 'error': str(exc)}), 400
-
-    started_at = datetime.utcnow().isoformat(timespec='seconds')
-    updated_user = db_manager.update_user_membership(user_email, {
-        'membership_status': 'active',
-        'membership_mode': summary['membership_mode'],
-        'membership_plan_id': summary['plan_id'],
-        'membership_team_size': summary['team_size'],
-        'membership_cycle_quota': summary['quota_total'],
-        'membership_cycle_used': 0,
-        'membership_auto_renew': summary['plan_id'] in {'monthly', 'yearly'},
-        'membership_started_at': started_at,
-        'membership_expires_at': summary['expires_at'],
-    })
-    if not updated_user.get('success'):
-        return jsonify({'success': False, 'error': str(updated_user.get('error') or '开通会员失败')}), 500
-
-    order_update = db_manager.update_membership_order_status(order_id, 'paid', quota_used=0)
-    if not order_update.get('success'):
-        return jsonify({'success': False, 'error': str(order_update.get('error') or '更新订单状态失败')}), 500
-
-    latest_user = db_manager.get_user_by_email(user_email)
-    latest_order = db_manager.get_membership_order(order_id=order_id, user_email=user_email)
-    return jsonify({
-        'success': True,
-        'order': _serialize_membership_order(latest_order),
-        'current_membership': _serialize_membership_snapshot(latest_user),
-        'message': '会员已开通',
-    })
-
-
-@app.route('/api/auth/register', methods=['POST'])
-def api_auth_register():
-    payload = request.get_json(silent=True) or {}
-
-    email = _normalize_auth_email(payload.get('email', ''))
-    password = str(payload.get('password', '') or '')
-    display_name = _normalize_auth_name(payload.get('name', ''))
-
-    if not email or not AUTH_EMAIL_PATTERN.match(email):
-        return jsonify({
-            'success': False,
-            'error': '请输入有效邮箱地址。',
-        }), 400
-    if len(password) < 8:
-        return jsonify({
-            'success': False,
-            'error': '密码长度至少为 8 位。',
-        }), 400
-    if len(password) > 128:
-        return jsonify({
-            'success': False,
-            'error': '密码长度不能超过 128 位。',
-        }), 400
-    if len(display_name) < 2:
-        return jsonify({
-            'success': False,
-            'error': '昵称至少需要 2 个字符。',
-        }), 400
-    if len(display_name) > 40:
-        return jsonify({
-            'success': False,
-            'error': '昵称长度不能超过 40 个字符。',
-        }), 400
-
-    existing = db_manager.get_user_by_email(email)
-    if existing:
-        return jsonify({
-            'success': False,
-            'error': '该邮箱已注册，请直接登录。',
-        }), 409
-
-    created = db_manager.create_user(
-        email=email,
-        password_hash=_hash_auth_password(password),
-        display_name=display_name,
-        is_demo=False,
-    )
-    if not created or not created.get('success'):
-        return jsonify({
-            'success': False,
-            'error': str((created or {}).get('error') or '注册失败，请稍后重试。'),
-        }), 500
-
-    user = created.get('user') or {}
-    return jsonify({
-        'success': True,
-        'user': {
-            'id': user.get('id'),
-            'email': user.get('email'),
-            'name': user.get('display_name') or display_name,
-        },
-    }), 201
-
-
-@app.route('/api/auth/login', methods=['POST'])
-def api_auth_login():
-    payload = request.get_json(silent=True) or {}
-    email = _normalize_auth_email(payload.get('email', ''))
-    password = str(payload.get('password', '') or '')
-
-    if not email or not password:
-        return jsonify({
-            'success': False,
-            'error': '请输入完整的邮箱和密码。',
-        }), 400
-
-    user = db_manager.get_user_by_email(email)
-    if not user:
-        return jsonify({
-            'success': False,
-            'error': '邮箱或密码错误。',
-        }), 401
-
-    stored_hash = str(user.get('password_hash') or '')
-    if not _verify_auth_password(password, stored_hash):
-        return jsonify({
-            'success': False,
-            'error': '邮箱或密码错误。',
-        }), 401
-
-    return jsonify({
-        'success': True,
-        'user': {
-            'id': user.get('id'),
-            'email': user.get('email'),
-            'name': user.get('display_name') or AUTH_DEFAULT_NAME,
-            'is_demo': bool(user.get('is_demo')),
-        },
-    })
-
-
-@app.route('/api/auth/change-password', methods=['POST'])
-def api_auth_change_password():
-    payload = request.get_json(silent=True) or {}
-    email = _normalize_auth_email(payload.get('email', ''))
-    current_password = str(payload.get('current_password', '') or '')
-    new_password = str(payload.get('new_password', '') or '')
-
-    if not email or not current_password or not new_password:
-        return jsonify({'success': False, 'error': '请完整填写邮箱、当前密码和新密码。'}), 400
-
-    user = db_manager.get_user_by_email(email)
-    if not user:
-        return jsonify({'success': False, 'error': '用户不存在。'}), 404
-
-    stored_hash = str(user.get('password_hash') or '')
-    if not _verify_auth_password(current_password, stored_hash):
-        return jsonify({'success': False, 'error': '当前密码错误。'}), 401
-
-    if len(new_password) < 8:
-        return jsonify({'success': False, 'error': '新密码长度至少为 8 位。'}), 400
-    if len(new_password) > 128:
-        return jsonify({'success': False, 'error': '新密码长度不能超过 128 位。'}), 400
-    if new_password == current_password:
-        return jsonify({'success': False, 'error': '新密码不能与当前密码相同。'}), 400
-
-    new_hash = _hash_auth_password(new_password)
-    result = db_manager.update_password(email, new_hash)
-    if not result.get('success'):
-        return jsonify({'success': False, 'error': str(result.get('error') or '密码修改失败，请稍后重试。')}), 500
-
-    return jsonify({'success': True, 'message': '密码修改成功。'})
-
-
-def _coerce_notification_bool(value, default=True):
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    normalized = str(value).strip().lower()
-    if normalized in {'1', 'true', 'yes', 'on'}:
-        return True
-    if normalized in {'0', 'false', 'no', 'off'}:
-        return False
-    return default
-
-
-def _normalize_notification_settings_payload(payload=None, user_id='default'):
-    source = payload or {}
-    return {
-        'user_id': str(user_id or 'default').strip().lower() or 'default',
-        'in_app_enabled': _coerce_notification_bool(source.get('in_app_enabled'), True),
-        'inactivity_24h_enabled': _coerce_notification_bool(source.get('inactivity_24h_enabled'), True),
-        'streak_enabled': _coerce_notification_bool(source.get('streak_enabled'), True),
-        'weekly_plan_due_enabled': _coerce_notification_bool(source.get('weekly_plan_due_enabled'), True),
-    }
-
-
-def _parse_app_datetime(value):
-    text = str(value or '').strip()
-    if not text:
-        return None
-    for parser in (
-        lambda item: datetime.fromisoformat(item.replace('Z', '+00:00')),
-        lambda item: datetime.strptime(item, '%Y-%m-%d %H:%M:%S'),
-        lambda item: datetime.strptime(item, '%Y-%m-%d'),
-    ):
-        try:
-            return parser(text)
-        except Exception:
-            continue
-    return None
-
-
-def _compute_training_streak_days(interviews):
-    day_set = set()
-    for item in interviews or []:
-        timestamp = _parse_app_datetime(item.get('start_time') or item.get('created_at'))
-        if timestamp is None:
-            continue
-        day_set.add(timestamp.date())
-
-    if not day_set:
-        return 0
-
-    streak = 0
-    cursor = datetime.now().date()
-    while cursor in day_set:
-        streak += 1
-        cursor = cursor - timedelta(days=1)
-    return streak
-
-
-def _build_behavior_reminders_payload(user_id='default'):
-    normalized_user_id = str(user_id or 'default').strip().lower() or 'default'
-    settings = db_manager.get_notification_settings(normalized_user_id) if hasattr(db_manager, 'get_notification_settings') else {
-        'user_id': normalized_user_id,
-        'in_app_enabled': True,
-        'inactivity_24h_enabled': True,
-        'streak_enabled': True,
-        'weekly_plan_due_enabled': True,
-    }
-
-    interviews = db_manager.get_interviews(limit=180, offset=0) if hasattr(db_manager, 'get_interviews') else []
-    sorted_interviews = sorted(
-        interviews or [],
-        key=lambda item: _parse_app_datetime(item.get('start_time') or item.get('created_at')) or datetime.min,
-        reverse=True,
-    )
-    last_training_dt = _parse_app_datetime(
-        (sorted_interviews[0] or {}).get('start_time') or (sorted_interviews[0] or {}).get('created_at')
-    ) if sorted_interviews else None
-
-    now = datetime.now()
-    current_streak_days = _compute_training_streak_days(sorted_interviews)
-    hours_since_training = None
-    if last_training_dt is not None:
-        hours_since_training = round(max(0.0, (now - last_training_dt).total_seconds()) / 3600, 1)
-
-    week_anchor = _parse_week_anchor('')
-    week_start, _ = _build_week_range(week_anchor)
-    current_bundle = db_manager.get_training_plan_bundle(
-        user_id=normalized_user_id,
-        week_start_date=week_start.strftime('%Y-%m-%d'),
-    ) if hasattr(db_manager, 'get_training_plan_bundle') else {'plan': None, 'tasks': []}
-    current_plan = (current_bundle or {}).get('plan') or {}
-    current_tasks = (current_bundle or {}).get('tasks') or []
-
-    unfinished_statuses = {'planned', 'training', 'validation', 'reflow'}
-    pending_tasks = [
-        item for item in current_tasks
-        if str((item or {}).get('status') or '').strip().lower() in unfinished_statuses
-    ]
-    week_end_dt = _parse_app_datetime(current_plan.get('week_end_date'))
-    days_until_week_end = None
-    if week_end_dt is not None:
-        days_until_week_end = (week_end_dt.date() - now.date()).days
-
-    reminders = []
-    if settings.get('in_app_enabled', True):
-        if settings.get('inactivity_24h_enabled', True):
-            if last_training_dt is None:
-                reminders.append({
-                    'id': 'first-training',
-                    'type': 'inactivity_24h',
-                    'tone': 'warning',
-                    'title': '今天还没有开始训练',
-                    'message': '先完成一轮短练习，能更快把状态找回来，也能避免训练节奏断掉。',
-                    'cta_label': '开始一场训练',
-                    'cta_href': '/interview/setup',
-                })
-            elif (now - last_training_dt) >= timedelta(hours=24):
-                reminders.append({
-                    'id': 'inactivity-24h',
-                    'type': 'inactivity_24h',
-                    'tone': 'warning',
-                    'title': '你已经超过 24 小时没有训练',
-                    'message': f'上一次训练时间是 {last_training_dt.strftime("%m-%d %H:%M")}，建议今天先完成一场 15 到 30 分钟的专项练习。',
-                    'cta_label': '恢复训练',
-                    'cta_href': '/interview/setup',
-                })
-
-        if settings.get('streak_enabled', True) and current_streak_days >= 3:
-            reminders.append({
-                'id': f'streak-{current_streak_days}',
-                'type': 'streak',
-                'tone': 'success',
-                'title': f'你已连续训练 {current_streak_days} 天',
-                'message': '现在最适合继续巩固同一类短板，把“偶尔答对”拉成“稳定答好”。',
-                'cta_label': '继续保持',
-                'cta_href': '/insights',
-            })
-
-        if settings.get('weekly_plan_due_enabled', True) and pending_tasks:
-            if days_until_week_end is not None and days_until_week_end < 0:
-                reminders.append({
-                    'id': 'weekly-plan-overdue',
-                    'type': 'weekly_plan_due',
-                    'tone': 'danger',
-                    'title': '本周训练计划已到期，仍有任务未验收',
-                    'message': f'还有 {len(pending_tasks)} 项任务未完成，建议先完成最高优先级任务，再决定是否回流到下周。',
-                    'cta_label': '查看周计划',
-                    'cta_href': '/insights',
-                })
-            elif days_until_week_end is not None and days_until_week_end <= 1:
-                reminders.append({
-                    'id': 'weekly-plan-due-soon',
-                    'type': 'weekly_plan_due',
-                    'tone': 'info',
-                    'title': '本周训练计划即将到期',
-                    'message': f'还有 {len(pending_tasks)} 项任务待验收，建议优先处理本周最关键的一项。',
-                    'cta_label': '去完成任务',
-                    'cta_href': '/insights',
-                })
-
-    return {
-        'settings': settings,
-        'summary': {
-            'last_training_at': last_training_dt.strftime('%Y-%m-%d %H:%M:%S') if last_training_dt else '',
-            'hours_since_training': hours_since_training,
-            'current_streak_days': current_streak_days,
-            'weekly_plan_pending_count': len(pending_tasks),
-            'weekly_plan_due_at': week_end_dt.strftime('%Y-%m-%d') if week_end_dt else '',
-            'in_app_enabled': bool(settings.get('in_app_enabled', True)),
-        },
-        'reminders': reminders,
-    }
-
-
-@app.route('/api/user/notification-settings', methods=['GET'])
-def api_get_notification_settings():
-    user_id = str(request.args.get('user_id', 'default') or 'default').strip().lower() or 'default'
-    settings = db_manager.get_notification_settings(user_id) if hasattr(db_manager, 'get_notification_settings') else {}
-    return jsonify({
-        'success': True,
-        'settings': settings,
-    })
-
-
-@app.route('/api/user/notification-settings', methods=['PUT'])
-def api_update_notification_settings():
-    if not hasattr(db_manager, 'upsert_notification_settings'):
-        return jsonify({'success': False, 'error': 'notification settings unavailable'}), 503
-
-    payload = request.get_json(silent=True) or {}
-    user_id = str(payload.get('user_id') or request.args.get('user_id', 'default') or 'default').strip().lower() or 'default'
-    normalized_payload = _normalize_notification_settings_payload(payload, user_id=user_id)
-    result = db_manager.upsert_notification_settings(normalized_payload)
-    if not result.get('success'):
-        return jsonify({'success': False, 'error': result.get('error') or 'update notification settings failed'}), 500
-    return jsonify({
-        'success': True,
-        'settings': result.get('settings') or normalized_payload,
-    })
-
-
-@app.route('/api/user/reminders', methods=['GET'])
-def api_user_reminders():
-    try:
-        user_id = str(request.args.get('user_id', 'default') or 'default').strip().lower() or 'default'
-        payload = _build_behavior_reminders_payload(user_id=user_id)
-        return jsonify({
-            'success': True,
-            **payload,
-        })
-    except Exception as e:
-        logger.error(f"获取用户提醒失败: {e}", exc_info=True)
-        return jsonify({'success': False, 'error': str(e), 'reminders': [], 'summary': {}}), 500
-
-
-@app.route('/api/knowledge-graph/health', methods=['GET'])
-def api_knowledge_graph_health():
-    if knowledge_graph_service is None:
-        return jsonify({
-            'success': False,
-            'enabled': False,
-            'error': 'knowledge graph service unavailable',
-            'details': knowledge_graph_import_error or '',
-        }), 503
-
-    return jsonify({
-        'success': True,
-        'data': knowledge_graph_service.health(),
-    })
-
-
-@app.route('/api/knowledge-graph/profile', methods=['GET'])
-def api_knowledge_graph_profile():
-    if knowledge_graph_service is None:
-        return jsonify({
-            'success': False,
-            'error': 'knowledge graph service unavailable',
-            'details': knowledge_graph_import_error or '',
-        }), 503
-
-    try:
-        user_id = str(request.args.get('user_id', 'default') or 'default').strip().lower() or 'default'
-        payload = knowledge_graph_service.build_user_graph(user_id=user_id)
-        return jsonify({
-            'success': True,
-            **payload,
-        })
-    except Exception as e:
-        logger.error(f"生成知识图谱失败: {e}", exc_info=True)
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'summary': {},
-            'nodes': [],
-            'edges': [],
-        }), 500
-
-
-@app.route('/api/knowledge-graph/sync', methods=['POST'])
-def api_knowledge_graph_sync():
-    if knowledge_graph_service is None:
-        return jsonify({
-            'success': False,
-            'error': 'knowledge graph service unavailable',
-            'details': knowledge_graph_import_error or '',
-        }), 503
-
-    try:
-        payload = request.get_json(silent=True) or {}
-        user_id = str(payload.get('user_id') or request.args.get('user_id', 'default') or 'default').strip().lower() or 'default'
-        result = knowledge_graph_service.sync_user_graph(user_id=user_id)
-        return jsonify({
-            'success': True,
-            'data': result,
-        })
-    except Exception as e:
-        logger.error(f"同步知识图谱到 Neo4j 失败: {e}", exc_info=True)
-        return jsonify({
-            'success': False,
-            'error': str(e),
-        }), 500
-
+app.register_blueprint(create_knowledge_graph_blueprint(
+    knowledge_graph_service=knowledge_graph_service,
+    knowledge_graph_import_error=knowledge_graph_import_error,
+    logger=logger,
+))
 
 @app.route('/api/assistant/health')
 def api_assistant_health():
@@ -5542,89 +5029,6 @@ def api_assistant_chat():
         }), 500
 
 
-@app.route('/api/performance')
-def get_performance():
-    """获取性能统计"""
-    logger.debug("性能统计请求")
-    return jsonify({
-        'success': True,
-        'data': performance_monitor.get_performance_summary()
-    })
-
-
-@app.route('/api/performance/bottlenecks')
-def get_bottlenecks():
-    """获取性能瓶颈"""
-    threshold_ms = request.args.get('threshold', 100.0, type=float)
-    bottlenecks = performance_monitor.get_bottlenecks(threshold_ms)
-    return jsonify({
-        'success': True,
-        'data': bottlenecks
-    })
-
-
-@app.route('/api/question-bank')
-def get_question_bank():
-    """读取数据库题库（interview_rounds.questions）"""
-    try:
-        round_type = str(request.args.get('round_type', '') or '').strip()
-        position = str(request.args.get('position', '') or '').strip()
-        difficulty = str(request.args.get('difficulty', '') or '').strip()
-        keyword = str(request.args.get('keyword', '') or '').strip().lower()
-        limit = request.args.get('limit', 500, type=int) or 500
-        limit = max(1, min(limit, 2000))
-
-        question_bank = db_manager.get_question_bank(
-            round_type=round_type or None,
-            position=position or None,
-            difficulty=difficulty or None,
-        )
-
-        if keyword:
-            question_bank = [
-                item for item in question_bank
-                if keyword in str(item.get('question', '')).lower()
-                or keyword in str(item.get('category', '')).lower()
-                or keyword in str(item.get('round_type', '')).lower()
-                or keyword in str(item.get('position', '')).lower()
-                or keyword in str(item.get('description', '')).lower()
-            ]
-
-        total = len(question_bank)
-        truncated = question_bank[:limit]
-        categories = sorted({
-            str(item.get('category', '')).strip()
-            for item in question_bank
-            if str(item.get('category', '')).strip()
-        })
-        facets = db_manager.get_question_bank_facets()
-
-        return jsonify({
-            'success': True,
-            'count': len(truncated),
-            'total': total,
-            'limit': limit,
-            'question_bank': truncated,
-            'categories': categories,
-            'facets': facets,
-            'message': '' if total > 0 else 'question bank is empty',
-        })
-
-    except Exception as e:
-        logger.error(f"获取题库失败：{e}", exc_info=True)
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'question_bank': [],
-            'categories': [],
-            'facets': {
-                'round_types': [],
-                'positions': [],
-                'difficulties': [],
-            }
-        }), 500
-
-
 # ==================== Socket.IO 事件 ====================
 
 @socketio.on('connect')
@@ -5643,17 +5047,75 @@ def handle_connect():
 def handle_disconnect():
     """客户端断开事件"""
     client_id = request.sid
-    runtime = session_registry.remove(client_id)
+    runtime = session_registry.get(client_id)
     if runtime:
-        runtime.ended = True
-        if runtime.pending_commit_timer:
-            runtime.pending_commit_timer.cancel()
-        _cancel_answer_finalize_timer(runtime)
-        _reset_pending_asr_audio(runtime)
-        if asr_manager and runtime.active_asr_stream_id:
-            asr_manager.stop_session(runtime.active_asr_stream_id)
-        _log_runtime_event(runtime, 'disconnect_cleanup')
+        runtime.disconnected_at = time.time()
+
+        def cleanup_if_not_resumed():
+            current = session_registry.get(client_id)
+            if (
+                not current
+                or current.session_id != runtime.session_id
+                or current.client_id != client_id
+                or not current.disconnected_at
+                or time.time() - current.disconnected_at < RUNTIME_RECONNECT_GRACE_SECONDS
+            ):
+                return
+
+            removed = session_registry.remove(client_id)
+            if removed:
+                removed.ended = True
+                if removed.pending_commit_timer:
+                    removed.pending_commit_timer.cancel()
+                _cancel_answer_finalize_timer(removed)
+                _reset_pending_asr_audio(removed)
+                if asr_manager and removed.active_asr_stream_id:
+                    asr_manager.stop_session(removed.active_asr_stream_id)
+                _log_runtime_event(removed, 'disconnect_cleanup', reconnect_grace_seconds=RUNTIME_RECONNECT_GRACE_SECONDS)
+
+        runtime.disconnect_cleanup_timer = threading.Timer(RUNTIME_RECONNECT_GRACE_SECONDS, cleanup_if_not_resumed)
+        runtime.disconnect_cleanup_timer.daemon = True
+        runtime.disconnect_cleanup_timer.start()
+        _log_runtime_event(runtime, 'disconnect_grace_started', reconnect_grace_seconds=RUNTIME_RECONNECT_GRACE_SECONDS)
     logger.info(f"客户端已断开 - ID: {client_id}")
+
+
+@socketio.on('session_resume')
+def handle_session_resume(data=None):
+    """客户端 Socket.IO 重连后按稳定 session_id 恢复运行时。"""
+    client_id = request.sid
+    session_id = str((data or {}).get('session_id', '')).strip()
+    if not session_id:
+        emit('session_resume_failed', {
+            'session_id': '',
+            'code': 'MISSING_SESSION_ID',
+            'message': 'session_id is required for resume',
+        })
+        return
+
+    runtime = session_registry.rebind_client(session_id, client_id)
+    if not runtime or runtime.ended:
+        emit('session_resume_failed', {
+            'session_id': session_id,
+            'code': 'SESSION_NOT_FOUND',
+            'message': 'Session cannot be resumed',
+        })
+        return
+
+    _log_runtime_event(runtime, 'session_resumed', client_id=client_id)
+    _emit_orchestrator_state(runtime)
+    emit('session_resumed', {
+        'session_id': runtime.session_id,
+        'interview_id': runtime.interview_id,
+        'turn_id': runtime.turn_id,
+        'mode': runtime.mode,
+        'current_question': runtime.current_question_core or runtime.current_question,
+        'current_question_kind': runtime.current_question_kind,
+        'formal_question_count': runtime.formal_question_count,
+        'topic_question_count': runtime.topic_question_count,
+        'interrupt_epoch': runtime.interrupt_epoch,
+        'timestamp': time.time(),
+    })
 
 
 @socketio.on('session_start')
@@ -5793,6 +5255,9 @@ def handle_session_start(data=None):
             return
 
         _emit_orchestrator_state(runtime)
+
+        # 不在 session_start 阶段持有真实流式 ASR 连接。流式识别连接长时间空转后
+        # 容易把第一段正式音频放进一个陈旧解码上下文；正式流在 speech_start 时创建。
 
         initial_question = runtime.forced_question_text or ""
         initial_question_context = _build_initial_interview_context(
@@ -6122,10 +5587,8 @@ def handle_speech_start(data=None):
         client_speech_epoch=client_speech_epoch or '',
     )
     _interrupt_runtime(runtime, 'speech_start')
-    _cancel_answer_finalize_timer(runtime)
     _reset_pending_asr_audio(runtime)
     answer_session = _ensure_answer_session(runtime)
-    answer_session.last_speech_epoch = runtime.speech_epoch
     answer_session.mark_status('recording')
     _emit_realtime_speech_metrics(
         runtime,
@@ -6590,6 +6053,53 @@ def _safe_avg(values):
     return (sum(valid) / len(valid)) if valid else 0.0
 
 
+def _build_final_score_snapshot(structured_snapshot, evaluation_v2):
+    """将直接融合分和稳定化分合成为报告最终展示分。"""
+    fusion_score = _safe_float(((evaluation_v2 or {}).get('fusion') or {}).get('overall_score'), None)
+    round_aggregation = (structured_snapshot or {}).get('round_aggregation') if isinstance((structured_snapshot or {}).get('round_aggregation'), dict) else {}
+    stability = (round_aggregation or {}).get('interview_stability') if isinstance((round_aggregation or {}).get('interview_stability'), dict) else {}
+    stable_score = _safe_float((stability or {}).get('overall_score_stable'), None)
+    structured_score = _safe_float((structured_snapshot or {}).get('overall_score'), None)
+
+    if fusion_score is not None and stable_score is not None:
+        overall_score = round(
+            float(fusion_score) * FINAL_SCORE_DIRECT_FUSION_WEIGHT
+            + float(stable_score) * FINAL_SCORE_STABLE_WEIGHT,
+            1,
+        )
+        source = 'stable_fusion_blend'
+    elif stable_score is not None:
+        overall_score = round(float(stable_score), 1)
+        source = 'round_stability'
+    elif fusion_score is not None:
+        overall_score = round(float(fusion_score), 1)
+        source = 'direct_fusion'
+    elif structured_score is not None:
+        overall_score = round(float(structured_score), 1)
+        source = 'structured_content'
+    else:
+        overall_score = None
+        source = 'pending'
+
+    return {
+        'overall_score': overall_score,
+        'source': source,
+        'formula': (
+            f'final = {FINAL_SCORE_STABLE_WEIGHT:.2f} * round_aggregation.interview_stability.overall_score_stable '
+            f'+ {FINAL_SCORE_DIRECT_FUSION_WEIGHT:.2f} * evaluation_v2.fusion.overall_score'
+        ),
+        'components': {
+            'fusion_overall_score': fusion_score,
+            'stable_overall_score': stable_score,
+            'structured_overall_score': structured_score,
+        },
+        'weights': {
+            'stable': FINAL_SCORE_STABLE_WEIGHT,
+            'fusion': FINAL_SCORE_DIRECT_FUSION_WEIGHT,
+        },
+    }
+
+
 def _build_round_aggregation_snapshot(interview_id: str, decoded_rows=None, dialogues=None):
     rows = list(decoded_rows or [])
     if not rows:
@@ -6638,9 +6148,13 @@ def _build_round_aggregation_snapshot(interview_id: str, decoded_rows=None, dial
 def _safe_float(value, default=0.0):
     try:
         if value is None:
+            if default is None:
+                return None
             return float(default)
         return float(value)
     except Exception:
+        if default is None:
+            return None
         return float(default)
 
 
@@ -6744,6 +6258,142 @@ def _classify_reason_tags(dim_key: str, reason_text: str):
     if not tags:
         tags.add('结构')
     return [tag for tag in ('技术', '表达', '结构') if tag in tags]
+
+
+def _content_token_count(text: str) -> int:
+    content = str(text or '').strip()
+    if not content:
+        return 0
+    return len(re.findall(r'[A-Za-z0-9_]+|[\u4e00-\u9fff]', content))
+
+
+def _question_echo_ratio(question: str, answer: str) -> float:
+    question_tokens = set(re.findall(r'[A-Za-z0-9_]+|[\u4e00-\u9fff]', str(question or '').lower()))
+    answer_tokens = set(re.findall(r'[A-Za-z0-9_]+|[\u4e00-\u9fff]', str(answer or '').lower()))
+    if not question_tokens or not answer_tokens:
+        return 0.0
+    return len(question_tokens & answer_tokens) / max(1, len(answer_tokens))
+
+
+def _iter_dimension_evidence_items(final_dims):
+    for dim_payload in (final_dims or {}).values():
+        if not isinstance(dim_payload, dict):
+            continue
+        evidence = dim_payload.get('evidence') if isinstance(dim_payload.get('evidence'), dict) else {}
+        yield dim_payload, evidence
+
+
+def _detect_content_sample_quality(question: str, answer: str, layer1, final_dims):
+    """区分真实低分回答和误收环境音/未作答样本，避免把后者画成能力画像。"""
+    answer_text = str(answer or '').strip()
+    layer1 = layer1 if isinstance(layer1, dict) else {}
+    final_dims = final_dims if isinstance(final_dims, dict) else {}
+
+    scores = []
+    hit_count = 0
+    no_content_reason_count = 0
+    for dim_payload, evidence in _iter_dimension_evidence_items(final_dims):
+        score = (dim_payload or {}).get('score')
+        if isinstance(score, (int, float)):
+            scores.append(float(score))
+        hit_count += len(evidence.get('hit_rubric_points') or [])
+        reason_text = f"{dim_payload.get('reason') or ''} {evidence.get('deduction_rationale') or ''}"
+        if any(marker in reason_text for marker in ('没有提供', '没有提到', '没有回答', '未提供', '未提及', '未能提供', '完全没有', '无任何', '缺乏实质')):
+            no_content_reason_count += 1
+
+    key_points = layer1.get('key_points') if isinstance(layer1.get('key_points'), dict) else {}
+    covered_points = key_points.get('covered') or []
+    coverage_ratio = _safe_float(key_points.get('coverage_ratio'), 0.0)
+    signals = layer1.get('signals') if isinstance(layer1.get('signals'), dict) else {}
+    hit_count += len(signals.get('hit') or [])
+
+    avg_score = _safe_avg(scores) if scores else 0.0
+    token_count = _content_token_count(answer_text)
+    echo_ratio = _question_echo_ratio(question, answer_text)
+    answer_lower = answer_text.lower()
+    non_answer_patterns = [
+        '不知道',
+        '不确定',
+        '没听清',
+        '没准备好',
+        '还没开始',
+        '等一等',
+        '让我看一下',
+        '啥问题',
+        '咋突然开始面试',
+        '请你现在回答我的问题',
+        'hello',
+        '哈喽',
+    ]
+    # Only flag as non-answer if the pattern dominates the answer (short text or pattern at start)
+    has_non_answer_marker = False
+    for pattern in non_answer_patterns:
+        if pattern in answer_text or pattern in answer_lower:
+            if token_count <= 12 or answer_text.startswith(pattern) or answer_lower.startswith(pattern):
+                has_non_answer_marker = True
+                break
+    has_positive_content_signal = bool(covered_points or coverage_ratio >= 0.1 or (hit_count > 0 and avg_score > 5.0))
+    no_content_reason_threshold = max(2, int(len(final_dims or {}) * 0.5))
+    has_no_content_reason = bool(no_content_reason_count >= no_content_reason_threshold)
+
+    reasons = []
+    if token_count < 8:
+        reasons.append('answer_too_short')
+    if has_non_answer_marker:
+        reasons.append('non_answer_marker')
+    if echo_ratio >= 0.68 and token_count <= 36:
+        reasons.append('mostly_repeats_question')
+    if avg_score <= 5.0 and coverage_ratio <= 0.05 and not has_positive_content_signal:
+        reasons.append('zero_content_match')
+    if has_no_content_reason:
+        reasons.append('no_content_reason')
+
+    ineffective = (
+        avg_score <= 5.0
+        and coverage_ratio <= 0.05
+        and not has_positive_content_signal
+        and (
+            has_non_answer_marker
+            or token_count < 8
+            or (echo_ratio >= 0.68 and token_count <= 36)
+            or has_no_content_reason
+        )
+    )
+
+    return {
+        'effective': not ineffective,
+        'reasons': reasons,
+        'avg_score': round(float(avg_score), 1),
+        'coverage_ratio': round(float(coverage_ratio), 4),
+        'token_count': int(token_count),
+        'question_echo_ratio': round(float(echo_ratio), 4),
+    }
+
+
+def _is_fallback_scored_evaluation(row, layer2) -> bool:
+    """识别启发式回退评分，避免把它当作可追溯语义依据。"""
+    status = str((row or {}).get('status') or '').strip().lower()
+    error_code = str((row or {}).get('error_code') or '').strip().upper()
+    error_message = str((row or {}).get('error_message') or '').strip()
+    layer2 = layer2 if isinstance(layer2, dict) else {}
+    mode = str(layer2.get('evaluation_mode') or '').strip().lower()
+    note = str(layer2.get('evaluation_note') or '').strip().lower()
+    rubric_reason = str(((layer2.get('rubric_eval') or {}) if isinstance(layer2.get('rubric_eval'), dict) else {}).get('reason') or '').strip()
+    dim_reasons = [
+        str((payload or {}).get('reason') or '').strip()
+        for payload in ((layer2.get('final_dimension_scores') or layer2.get('dimension_scores') or {}) if isinstance(layer2.get('final_dimension_scores') or layer2.get('dimension_scores'), dict) else {}).values()
+        if isinstance(payload, dict)
+    ]
+    fallback_reason_count = sum(1 for reason in dim_reasons if '回退评分' in reason or '文本长度与结构' in reason)
+    return bool(
+        mode.startswith('heuristic')
+        or 'fallback' in mode
+        or 'fallback' in note
+        or (status == 'partial_ok' and error_code.startswith('LAYER2'))
+        or ('Expecting' in error_message and 'delimiter' in error_message)
+        or '回退评分' in rubric_reason
+        or (dim_reasons and fallback_reason_count >= max(1, int(len(dim_reasons) * 0.6)))
+    )
 
 
 def _normalize_event_offset_seconds(timestamp_value, started_at):
@@ -7072,27 +6722,10 @@ def _build_content_performance_snapshot(interview_id: str, dialogues=None):
     decoded_rows = _decode_evaluation_rows(raw_rows)
     decoded_rows = _filter_evaluation_rows_by_dialogues(decoded_rows, dialogues)
 
-    status_priority = {
-        'ok': 2,
-        'partial_ok': 1,
-    }
-    scored_by_turn = {}
-    for index, row in enumerate(decoded_rows):
-        status = str(row.get('status') or '').strip().lower()
-        if status not in {'ok', 'partial_ok'}:
-            continue
-        turn_id = str(row.get('turn_id') or '').strip()
-        dedupe_key = turn_id or str(row.get('eval_task_key') or f'row_{index}')
-        existing = scored_by_turn.get(dedupe_key)
-        if not existing:
-            scored_by_turn[dedupe_key] = row
-            continue
-        existing_status = str(existing.get('status') or '').strip().lower()
-        current_priority = int(status_priority.get(status, 0))
-        existing_priority = int(status_priority.get(existing_status, 0))
-        if current_priority >= existing_priority:
-            scored_by_turn[dedupe_key] = row
-    scored_rows = list(scored_by_turn.values())
+    scored_rows = [
+        row for row in _dedupe_evaluation_rows_by_turn(decoded_rows)
+        if str((row or {}).get('status') or '').strip().lower() in {'ok', 'partial_ok'}
+    ]
     if not scored_rows:
         pending_message = '结构化评分处理中，请稍后刷新。' if total_questions > 0 else '暂无可追溯评分样本。'
         return {
@@ -7116,6 +6749,8 @@ def _build_content_performance_snapshot(interview_id: str, dialogues=None):
     dim_scores = {}
     dim_reasons = {}
     question_evidence = []
+    excluded_questions = []
+    fallback_sample_count = 0
 
     for row in scored_rows:
         layer1 = row.get('layer1') or {}
@@ -7137,6 +6772,41 @@ def _build_content_performance_snapshot(interview_id: str, dialogues=None):
             round_type,
             layer2.get('final_dimension_scores') or layer2.get('dimension_scores') or {},
         )
+        if _is_fallback_scored_evaluation(row, layer2):
+            fallback_sample_count += 1
+            excluded_questions.append({
+                'turn_id': turn_id,
+                'round_type': round_type,
+                'question_excerpt': _compact_text(question, limit=100),
+                'answer_excerpt': _compact_text(answer, limit=180),
+                'overall_score': round(float(overall_score or 0.0), 1),
+                'exclude_reasons': ['fallback_scoring'],
+                'error_code': str(row.get('error_code') or '').strip(),
+                'error_message': _compact_text(row.get('error_message') or '', limit=140),
+                'trace_source': f"interview_evaluations/{str(row.get('evaluation_version') or 'v1').strip() or 'v1'}",
+            })
+            continue
+
+        sample_quality = _detect_content_sample_quality(
+            question=question,
+            answer=answer,
+            layer1=layer1,
+            final_dims=final_dims,
+        )
+        if not sample_quality.get('effective'):
+            excluded_questions.append({
+                'turn_id': turn_id,
+                'round_type': round_type,
+                'question_excerpt': _compact_text(question, limit=100),
+                'answer_excerpt': _compact_text(answer, limit=180),
+                'overall_score': round(float(overall_score or 0.0), 1),
+                'exclude_reasons': sample_quality.get('reasons') or [],
+                'coverage_ratio': sample_quality.get('coverage_ratio'),
+                'token_count': sample_quality.get('token_count'),
+                'trace_source': f"interview_evaluations/{str(row.get('evaluation_version') or 'v1').strip() or 'v1'}",
+            })
+            continue
+
         weak_dims = []
         content_dimension_scores = []
         for dim_key, dim_payload in (final_dims or {}).items():
@@ -7209,18 +6879,54 @@ def _build_content_performance_snapshot(interview_id: str, dialogues=None):
             ],
         })
 
+    if not question_evidence:
+        status = 'no_effective_answer' if excluded_questions else 'processing'
+        status_message = (
+            '已检索到评分记录，但本场没有可用于内容能力画像的有效回答；疑似误收环境音、题干复述或未作答。'
+            if excluded_questions
+            else ('结构化评分处理中，请稍后刷新。' if total_questions > 0 else '暂无可追溯评分样本。')
+        )
+        return {
+            'status': status,
+            'status_message': status_message,
+            'question_evidence': [],
+            'weak_dimensions': [],
+            'excluded_questions': excluded_questions[:6],
+            'effective_sample_size': 0,
+            'excluded_sample_count': len(excluded_questions),
+            'scoring_basis': {
+                'overall_formula': 'session_overall_score = mean(question.overall_score_final)',
+                'question_formula': 'question.overall_score_final = mean(final_dimension_scores)',
+                'sample_size': 0,
+                'total_scored_samples': len(scored_rows),
+                'excluded_sample_count': len(excluded_questions),
+                'fallback_sample_count': fallback_sample_count,
+            },
+        }
+
     return {
         'status': 'ready',
-        'status_message': '已基于单题结构化评估生成内容表现依据。',
+        'status_message': (
+            f'已基于单题结构化评估生成内容表现依据；已排除 {len(excluded_questions)} 个无有效回答样本。'
+            if excluded_questions
+            else '已基于单题结构化评估生成内容表现依据。'
+        ),
         'question_evidence': sorted(
             question_evidence,
             key=lambda item: float(item.get('overall_score') or 0.0)
         )[:6],
         'weak_dimensions': weak_dimensions[:6],
+        'excluded_questions': excluded_questions[:6],
+        'effective_sample_size': len(question_evidence),
+        'excluded_sample_count': len(excluded_questions),
+        'fallback_sample_count': fallback_sample_count,
         'scoring_basis': {
             'overall_formula': 'session_overall_score = mean(question.overall_score_final)',
             'question_formula': 'question.overall_score_final = mean(final_dimension_scores)',
             'sample_size': len(question_evidence),
+            'total_scored_samples': len(scored_rows),
+            'excluded_sample_count': len(excluded_questions),
+            'fallback_sample_count': fallback_sample_count,
         },
     }
 
@@ -7465,7 +7171,11 @@ def _build_legacy_score_breakdown_from_dimensions(dimension_items, speech_dimens
 
 def _build_growth_report_v2(dialogues, evaluation_rows=None, speech_rows=None):
     speech_summary = aggregate_expression_metrics(speech_rows or [])
-    decoded_evaluations = _decode_evaluation_rows(evaluation_rows or [])
+    decoded_evaluations = _dedupe_evaluation_rows_by_turn(_decode_evaluation_rows(evaluation_rows or []))
+    decoded_evaluations = [
+        row for row in decoded_evaluations
+        if not _is_fallback_scored_evaluation(row, (row or {}).get('layer2') or {})
+    ]
     rounds = [str(d.get('round_type') or 'unknown') for d in dialogues]
     round_counter = Counter(rounds)
     started_at = _parse_db_datetime(dialogues[0].get('created_at')) if dialogues else None
@@ -7521,12 +7231,19 @@ def _build_growth_report_v2(dialogues, evaluation_rows=None, speech_rows=None):
             speech_adjustments = (layer2.get('speech_adjustments') or {})
             summary = (layer2.get('summary') or {})
             turn_id = str(row.get('turn_id') or '').strip()
-            overall_score = float(
-                layer2.get('overall_score_final')
-                or row.get('overall_score')
-                or layer2.get('overall_score')
-                or 0.0
+            fusion = row.get('fusion') or {}
+            _candidate_score = (
+                fusion.get('overall_score')
+                if fusion.get('overall_score') is not None
+                else row.get('overall_score')
+                if row.get('overall_score') is not None
+                else layer2.get('overall_score_final')
+                if layer2.get('overall_score_final') is not None
+                else layer2.get('overall_score')
+                if layer2.get('overall_score') is not None
+                else 0.0
             )
+            overall_score = float(_candidate_score)
             round_score_values.setdefault(round_type, []).append(overall_score)
             speech_used = bool(layer2.get('speech_used'))
             speech_expression_score = (
@@ -7739,7 +7456,7 @@ def _build_growth_report_v2(dialogues, evaluation_rows=None, speech_rows=None):
         report_mode = 'structured_evaluation'
         has_structured = True
     else:
-        overall_score = 0.0
+        overall_score = None
         dimension_items = []
         score_breakdown = {
             'technical_correctness': 0.0,
@@ -7759,13 +7476,13 @@ def _build_growth_report_v2(dialogues, evaluation_rows=None, speech_rows=None):
         ]
         question_reviews = [
             {
-                'turn_id': item.get('id', ''),
+                'turn_id': item.get('turn_id') or item.get('id', ''),
                 'question_id': '',
                 'round_type': item.get('round_type', 'unknown'),
                 'question': item.get('question', ''),
                 'answer': item.get('answer', ''),
                 'rubric_level': '',
-                'overall_score': 0.0,
+                'overall_score': None,
                 'confidence': 0.0,
                 'status': 'pending_structured_evaluation',
                 'dimensions': [],
@@ -7822,7 +7539,7 @@ def _build_growth_report_v2(dialogues, evaluation_rows=None, speech_rows=None):
         },
         'summary': {
             'overall_score': overall_score,
-            'level': _score_to_level(overall_score),
+            'level': _score_to_level(overall_score) if overall_score is not None else None,
             'interview_count': len(dialogues),
             'started_at': dialogues[0].get('created_at') if dialogues else '',
             'ended_at': dialogues[-1].get('created_at') if dialogues else '',
@@ -7888,33 +7605,12 @@ def _build_structured_snapshot(interview_id: str, dialogues=None):
     decoded_rows = _decode_evaluation_rows(raw_rows)
     decoded_rows = _filter_evaluation_rows_by_dialogues(decoded_rows, dialogues)
 
-    status_priority = {
-        'ok': 5,
-        'partial_ok': 4,
-        'running': 3,
-        'pending': 2,
-        'queued': 1,
-        'skipped': 0,
-        'failed': 0,
-        'unknown': 0,
-    }
-    deduped_rows = {}
-    for index, row in enumerate(decoded_rows):
-        turn_id = str(row.get('turn_id') or '').strip()
-        dedupe_key = turn_id or str(row.get('eval_task_key') or f'row_{index}')
-        existing = deduped_rows.get(dedupe_key)
-        if not existing:
-            deduped_rows[dedupe_key] = row
-            continue
-
-        current_status = str(row.get('status') or 'unknown').strip().lower() or 'unknown'
-        existing_status = str(existing.get('status') or 'unknown').strip().lower() or 'unknown'
-        current_priority = int(status_priority.get(current_status, 0))
-        existing_priority = int(status_priority.get(existing_status, 0))
-        # 同优先级时用后到记录覆盖，保证同状态下取较新版本。
-        if current_priority >= existing_priority:
-            deduped_rows[dedupe_key] = row
-    decoded_rows = list(deduped_rows.values())
+    decoded_rows = _dedupe_evaluation_rows_by_turn(decoded_rows)
+    fallback_scored_count = sum(
+        1
+        for row in decoded_rows
+        if _is_fallback_scored_evaluation(row, (row or {}).get('layer2') or {})
+    )
 
     if not decoded_rows:
         pending_message = '结构化评分处理中，请稍后刷新。' if total_questions > 0 else '暂无可评分题目。'
@@ -7965,6 +7661,8 @@ def _build_structured_snapshot(interview_id: str, dialogues=None):
         round_type = str(row.get('round_type') or 'technical').strip() or 'technical'
 
         layer2 = row.get('layer2') or {}
+        if _is_fallback_scored_evaluation(row, layer2):
+            continue
         score_value = (
             layer2.get('overall_score_final')
             or row.get('overall_score')
@@ -7998,6 +7696,9 @@ def _build_structured_snapshot(interview_id: str, dialogues=None):
     else:
         status = 'processing' if total_questions > 0 else 'empty'
         status_message = '结构化评分处理中，请稍后刷新。' if total_questions > 0 else '暂无可评分题目。'
+        if fallback_scored_count > 0 and not has_pending_status:
+            status = 'fallback_only'
+            status_message = '本场仅有回退评分样本，未纳入结构化能力画像。'
         if status_counts.get('skipped', 0) > 0 and status_counts.get('ok', 0) == 0 and status_counts.get('partial_ok', 0) == 0:
             status = 'failed'
             status_message = '未匹配到可用评分标准，暂无法生成结构化评分。'
@@ -8023,7 +7724,11 @@ def _build_structured_snapshot(interview_id: str, dialogues=None):
     ]
 
     overall_score = round(_safe_avg(all_scores), 1) if all_scores else None
-    round_aggregation = _build_round_aggregation_snapshot(interview_id, decoded_rows=decoded_rows, dialogues=dialogues)
+    round_aggregation_rows = [
+        row for row in decoded_rows
+        if not _is_fallback_scored_evaluation(row, (row or {}).get('layer2') or {})
+    ]
+    round_aggregation = _build_round_aggregation_snapshot(interview_id, decoded_rows=round_aggregation_rows, dialogues=dialogues)
     return {
         'status': status,
         'status_message': status_message,
@@ -8035,6 +7740,7 @@ def _build_structured_snapshot(interview_id: str, dialogues=None):
         'round_aggregation': round_aggregation,
         'dimension_scores': dimension_items,
         'status_counts': dict(status_counts),
+        'fallback_scored_count': int(fallback_scored_count),
     }
 
 
@@ -8067,29 +7773,12 @@ def _build_evaluation_v2_snapshot(interview_id: str, dialogues=None):
             'questions': [],
         }
 
-    status_priority = {
-        'ok': 5,
-        'partial_ok': 4,
-        'running': 3,
-        'pending': 2,
-        'queued': 1,
-        'skipped': 0,
-        'failed': 0,
-        'unknown': 0,
-    }
-    deduped_rows = {}
-    for index, row in enumerate(decoded_rows):
-        turn_id = str(row.get('turn_id') or '').strip()
-        dedupe_key = turn_id or str(row.get('eval_task_key') or f'row_{index}')
-        existing = deduped_rows.get(dedupe_key)
-        if not existing:
-            deduped_rows[dedupe_key] = row
-            continue
-        current_status = str(row.get('status') or 'unknown').strip().lower() or 'unknown'
-        existing_status = str(existing.get('status') or 'unknown').strip().lower() or 'unknown'
-        if int(status_priority.get(current_status, 0)) >= int(status_priority.get(existing_status, 0)):
-            deduped_rows[dedupe_key] = row
-    decoded_rows = list(deduped_rows.values())
+    decoded_rows = _dedupe_evaluation_rows_by_turn(decoded_rows)
+    fallback_scored_count = sum(
+        1
+        for row in decoded_rows
+        if _is_fallback_scored_evaluation(row, (row or {}).get('layer2') or {})
+    )
 
     valid_score_status = {'ok', 'partial_ok'}
     layer_scores = {'text': [], 'speech': [], 'video': []}
@@ -8120,6 +7809,8 @@ def _build_evaluation_v2_snapshot(interview_id: str, dialogues=None):
             continue
 
         turn_id = str(row.get('turn_id') or '').strip()
+        if _is_fallback_scored_evaluation(row, row.get('layer2') or {}):
+            continue
         if turn_id:
             scored_turns.add(turn_id)
 
@@ -8130,8 +7821,11 @@ def _build_evaluation_v2_snapshot(interview_id: str, dialogues=None):
 
         if not text_layer:
             layer2 = row.get('layer2') or {}
+            _text_score = layer2.get('overall_score_final')
+            if _text_score is None:
+                _text_score = layer2.get('overall_score')
             text_layer = {
-                'overall_score': layer2.get('overall_score_final') or layer2.get('overall_score')
+                'overall_score': _text_score
             }
 
         for layer_name, layer_data in (('text', text_layer), ('speech', speech_layer), ('video', video_layer)):
@@ -8217,6 +7911,9 @@ def _build_evaluation_v2_snapshot(interview_id: str, dialogues=None):
     else:
         status = 'processing' if total_questions > 0 else 'empty'
         status_message = '三层评分处理中，请稍后刷新。' if total_questions > 0 else '暂无可评分题目。'
+        if fallback_scored_count > 0 and not has_pending_status:
+            status = 'fallback_only'
+            status_message = '本场仅有回退评分样本，未纳入三层融合画像。'
 
     def _aggregate_confidence_breakdown(parts):
         aggregated = {}
@@ -8272,6 +7969,7 @@ def _build_evaluation_v2_snapshot(interview_id: str, dialogues=None):
         },
         'questions': questions[:8],
         'status_counts': dict(status_counts),
+        'fallback_scored_count': int(fallback_scored_count),
     }
 
 
@@ -8313,6 +8011,7 @@ def _build_immediate_report_payload(interview_id: str):
 
     structured_snapshot = _build_structured_snapshot(normalized_id, dialogues=dialogues)
     evaluation_v2 = _build_evaluation_v2_snapshot(normalized_id, dialogues=dialogues)
+    final_score = _build_final_score_snapshot(structured_snapshot, evaluation_v2)
     content_performance = _build_content_performance_snapshot(normalized_id, dialogues=dialogues)
     speech_performance = _build_speech_performance_snapshot(normalized_id)
     camera_performance = _build_camera_performance_snapshot(
@@ -8365,6 +8064,7 @@ def _build_immediate_report_payload(interview_id: str):
                 'rppg_reliable_ratio': float((statistics or {}).get('rppg_reliable_ratio')) if isinstance((statistics or {}).get('rppg_reliable_ratio'), (int, float)) else None,
             },
         },
+        'final_score': final_score,
         'structured_evaluation': structured_snapshot,
         'evaluation_v2': evaluation_v2,
         'content_performance': content_performance,
@@ -8713,7 +8413,10 @@ def _build_insight_item_from_payload(interview_row, report_payload=None):
         or _infer_interview_round_for_insights(interview_id)
     )
 
-    score = interview_stability.get('overall_score_stable')
+    final_score_payload = (report_payload.get('final_score') or {}) if isinstance(report_payload, dict) else {}
+    score = final_score_payload.get('overall_score')
+    if not isinstance(score, (int, float)):
+        score = interview_stability.get('overall_score_stable')
     if not isinstance(score, (int, float)):
         evaluation_v2 = (report_payload.get('evaluation_v2') or {}) if isinstance(report_payload, dict) else {}
         fusion = (evaluation_v2.get('fusion') or {}) if isinstance(evaluation_v2, dict) else {}
@@ -8729,7 +8432,8 @@ def _build_insight_item_from_payload(interview_row, report_payload=None):
     risk_probability = (((report_payload.get('anti_cheat') or {}) if isinstance(report_payload, dict) else {}).get('max_probability'))
     risk_score = None
     if isinstance(risk_probability, (int, float)):
-        risk_score = max(0.0, min(100.0, float(risk_probability) * 100.0))
+        risk_value = float(risk_probability)
+        risk_score = max(0.0, min(100.0, risk_value if risk_value > 1.0 else risk_value * 100.0))
     if not isinstance(risk_score, (int, float)):
         row_risk_probability = (interview_row or {}).get('max_probability')
         if isinstance(row_risk_probability, (int, float)):
@@ -9263,11 +8967,14 @@ def _pick_recommended_review_for_insights(sample_items, fit_breakdown):
 
 
 def _generate_insights_ai_summary(payload):
+    if not INSIGHTS_AI_SUMMARY_ENABLED:
+        raise RuntimeError("AI summary generation is disabled")
     if llm_manager is None or not getattr(llm_manager, 'enabled', False):
-        return None
+        raise RuntimeError("AI summary model is unavailable")
 
     target_model = str(
-        config.get('assistant.qwen.fallback_text_model', '')
+        os.environ.get('LLM_MODEL', '').strip()
+        or config.get('assistant.qwen.fallback_text_model', '')
         or config.get('llm.model', 'qwen-max')
     ).strip() or 'qwen-max'
 
@@ -9317,12 +9024,14 @@ def _generate_insights_ai_summary(payload):
         model=target_model,
         temperature=0.2,
         max_tokens=1200,
-        timeout=25,
+        timeout=INSIGHTS_AI_SUMMARY_TIMEOUT_SECONDS,
     )
     if not result.get('success'):
-        return None
+        raise RuntimeError(str(result.get('error') or 'AI summary generation failed'))
     data = result.get('data')
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        raise RuntimeError("AI summary response is invalid")
+    return data
 
 
 def _build_insights_summary_payload():
@@ -9342,7 +9051,10 @@ def _build_insights_summary_payload():
 
     recent_scan_rows = interviews[:max(INSIGHTS_RECENT_LIMIT, INSIGHTS_RECENT_SCAN_LIMIT)]
     sample_candidates_by_round = _build_cross_round_sample_candidates(interviews)
-    selected_rows = {str((item or {}).get('interview_id') or '').strip(): item for item in recent_scan_rows}
+    selected_rows = {
+        str((item or {}).get('interview_id') or '').strip(): item
+        for item in recent_scan_rows[:INSIGHTS_REPORT_SCAN_LIMIT]
+    }
     for round_items in sample_candidates_by_round.values():
         for item in round_items:
             selected_rows[str((item or {}).get('interview_id') or '').strip()] = item
@@ -9465,7 +9177,7 @@ def _build_insights_summary_payload():
             for item in sample_items[:8]
         ],
     }
-    ai_summary = _generate_insights_ai_summary(ai_seed_payload) or {}
+    ai_summary = _generate_insights_ai_summary(ai_seed_payload)
     fit_fallback = _build_insights_fit_summary_fallback(target_position_label, fit_score, fit_breakdown)
     growth_fallback = _build_insights_growth_advice_fallback(primary_gap_candidate, weakest_round_label, target_position_label)
     ai_primary_gap = ai_summary.get('primary_gap') if isinstance(ai_summary.get('primary_gap'), dict) else {}
@@ -9503,6 +9215,11 @@ def _build_insights_summary_payload():
                 if isinstance(ai_summary.get('growth_advice'), list) and ai_summary.get('growth_advice')
                 else growth_fallback
             ),
+        },
+        'ai_summary_meta': {
+            'status': 'generated',
+            'required': True,
+            'timeout_seconds': INSIGHTS_AI_SUMMARY_TIMEOUT_SECONDS,
         },
     }
 
@@ -9981,6 +9698,41 @@ def api_video_play_url(interview_id):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+def _resolve_local_video_path(raw_path: str) -> Path | None:
+    normalized = str(raw_path or '').strip()
+    if not normalized:
+        return None
+
+    raw = Path(normalized)
+    candidates = [raw] if raw.is_absolute() else [Path.cwd() / raw]
+    app_root = Path(__file__).resolve().parent
+    project_root = app_root.parent
+    allowed_roots = {app_root.resolve(), project_root.resolve(), Path.cwd().resolve()}
+    candidates.extend([app_root / raw, project_root / raw])
+
+    parts = raw.parts
+    if parts and str(parts[0]).lower() == 'backend':
+        stripped = Path(*parts[1:]) if len(parts) > 1 else Path()
+        candidates.extend([app_root / stripped, project_root / stripped])
+
+    seen = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
+        key = str(resolved).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if not resolved.exists() or not resolved.is_file():
+            continue
+        if not any(str(resolved).startswith(str(root)) for root in allowed_roots):
+            continue
+        return resolved
+    return None
+
+
 @app.route('/api/interview/video/raw/<interview_id>')
 def api_video_raw(interview_id):
     """本地视频回放（签名鉴权）。"""
@@ -9994,13 +9746,13 @@ def api_video_raw(interview_id):
         asset = db_manager.get_interview_asset(interview_id) if hasattr(db_manager, 'get_interview_asset') else None
         if not asset:
             return jsonify({'success': False, 'error': 'video asset not found'}), 404
-        local_path = str(asset.get('local_path', '')).strip()
-        if not local_path or not Path(local_path).exists():
+        local_path = _resolve_local_video_path(str(asset.get('local_path', '')).strip())
+        if not local_path:
             return jsonify({'success': False, 'error': 'video file missing'}), 404
 
         response = send_file(
-            local_path,
-            mimetype='video/mp4' if local_path.lower().endswith('.mp4') else 'video/webm',
+            str(local_path),
+            mimetype='video/mp4' if str(local_path).lower().endswith('.mp4') else 'video/webm',
             conditional=True,
         )
         response.headers['Accept-Ranges'] = 'bytes'
@@ -10622,6 +10374,16 @@ def get_interviews_from_db():
         offset = request.args.get('offset', 0, type=int)
 
         interviews = db_manager.get_interviews(limit=limit, offset=offset)
+        interview_ids = [
+            str(item.get('interview_id') or '').strip()
+            for item in interviews
+            if str(item.get('interview_id') or '').strip()
+        ]
+        score_map = (
+            db_manager.get_interview_structured_score_map(interview_ids)
+            if hasattr(db_manager, 'get_interview_structured_score_map')
+            else {}
+        )
         for item in interviews:
             interview_id = str(item.get('interview_id') or '').strip()
             if not interview_id:
@@ -10632,51 +10394,36 @@ def get_interviews_from_db():
                 item['dominant_round'] = ''
                 continue
 
-            # 历史列表与报告详情必须走同一评分逻辑：统一复用结构化快照计算。
+            # 列表接口走批量评分摘要，避免每一行同步构建完整报告快照。
             dialogues = db_manager.get_interview_dialogues(interview_id) if hasattr(db_manager, 'get_interview_dialogues') else []
-            structured_snapshot = _build_structured_snapshot(interview_id, dialogues=dialogues)
-            structured_status = str(structured_snapshot.get('status') or 'unknown').strip() or 'unknown'
-            overall_score = structured_snapshot.get('overall_score')
-            round_aggregation = structured_snapshot.get('round_aggregation') if isinstance(structured_snapshot.get('round_aggregation'), dict) else {}
-            interview_stability = round_aggregation.get('interview_stability') if isinstance(round_aggregation.get('interview_stability'), dict) else {}
-            round_summary = round_aggregation.get('round_summary') if isinstance(round_aggregation.get('round_summary'), dict) else {}
+            score_info = dict(score_map.get(interview_id) or {})
             round_counter = Counter(
                 str(row.get('round_type') or '').strip().lower()
                 for row in dialogues
                 if str(row.get('round_type') or '').strip()
             )
             dominant_round = round_counter.most_common(1)[0][0] if round_counter else ''
-            if not dominant_round:
-                dominant_round = str(
-                    interview_stability.get('dominant_round_type')
-                    or round_summary.get('dominant_round_type')
-                    or ''
-                ).strip().lower()
             item['dominant_round'] = dominant_round
-            stable_overall_score = interview_stability.get('overall_score_stable')
-            evaluated_questions = int(structured_snapshot.get('evaluated_questions') or 0)
-            display_score = None
-
-            if isinstance(stable_overall_score, (int, float)):
-                display_score = float(stable_overall_score)
-            else:
-                evaluation_v2_snapshot = _build_evaluation_v2_snapshot(interview_id, dialogues=dialogues)
-                fusion_payload = evaluation_v2_snapshot.get('fusion') if isinstance(evaluation_v2_snapshot.get('fusion'), dict) else {}
-                fusion_overall_score = fusion_payload.get('overall_score')
-                if isinstance(fusion_overall_score, (int, float)):
-                    display_score = float(fusion_overall_score)
-                elif isinstance(overall_score, (int, float)):
-                    display_score = float(overall_score)
+            evaluated_questions = int(score_info.get('scored_turns') or 0)
+            display_score = score_info.get('overall_score')
 
             if isinstance(display_score, (int, float)):
                 item['overall_score'] = float(display_score)
                 item['scored_turns'] = evaluated_questions
-                item['score_source'] = 'structured_evaluation'
+                item['score_source'] = score_info.get('score_source') or 'structured_evaluation'
+                item['structured_status'] = 'ready'
             else:
                 item['overall_score'] = None
                 item['scored_turns'] = evaluated_questions
                 item['score_source'] = 'not_available'
-            item['structured_status'] = structured_status
+                item['structured_status'] = 'processing' if dialogues else 'empty'
+            item['final_score'] = {
+                'overall_score': item['overall_score'],
+                'source': item['score_source'],
+                'components': {
+                    'structured_overall_score': item['overall_score'],
+                },
+            }
 
         return jsonify({
             'success': True,
@@ -10720,410 +10467,15 @@ def get_interview_detail(interview_id):
 
 # ==================== 简历相关接口 ====================
 
-@app.route('/api/resume/upload', methods=['POST'])
-def upload_resume():
-    """上传并解析简历"""
-    try:
-        if resume_parser is None:
-            return jsonify({
-                'success': False,
-                'error': '简历解析器未初始化'
-            }), 500
+from routes.resume import create_resume_blueprint
 
-        if 'file' not in request.files:
-            return jsonify({
-                'success': False,
-                'error': '请选择要上传的文件'
-            }), 400
-
-        file = request.files.get('file')
-        user_id = request.form.get('user_id', 'default')
-
-        if not file or file.filename == '':
-            return jsonify({
-                'success': False,
-                'error': '未选择文件'
-            }), 400
-
-        # 检查文件类型
-        allowed_extensions = ['.pdf', '.doc', '.docx', '.png', '.jpg', '.jpeg']
-        file_ext = Path(file.filename).suffix.lower()
-        if file_ext not in allowed_extensions:
-            return jsonify({
-                'success': False,
-                'error': f'不支持的文件格式，请上传 {", ".join(allowed_extensions)} 格式的文件'
-            }), 400
-
-        # 创建上传目录
-        upload_dir = Path('uploads/resumes')
-        upload_dir.mkdir(parents=True, exist_ok=True)
-
-        # 生成唯一文件名
-        import uuid
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        unique_filename = f"{timestamp}_{uuid.uuid4().hex[:8]}{file_ext}"
-        file_path = upload_dir / unique_filename
-
-        # 保存文件
-        file.save(str(file_path))
-
-        # 计算文件哈希（用于去重）
-        import hashlib
-        with open(file_path, 'rb') as f:
-            file_hash = hashlib.md5(f.read()).hexdigest()
-
-        # 检查是否已存在相同简历（仅标记，不拦截：每次上传都重新识别）
-        duplicate_resume_id = None
-        existing = db_manager.get_resumes(limit=1000)
-        for resume in existing:
-            if resume.get('file_hash') == file_hash:
-                duplicate_resume_id = resume.get('id')
-                logger.info(f"发现重复简历（将继续重新解析）：{file.filename}, 重复ID: {duplicate_resume_id}")
-                break
-
-        # 保存到数据库（状态为解析中）
-        resume_data = {
-            'user_id': user_id,
-            'file_name': file.filename,
-            'file_path': str(file_path),
-            'file_size': os.path.getsize(file_path),
-            'file_hash': file_hash,
-            'parsed_data': {},
-            'status': 'parsing'
-        }
-
-        save_result = db_manager.save_resume(resume_data)
-        if not save_result.get('success'):
-            return jsonify({
-                'success': False,
-                'error': save_result.get('error')
-            }), 500
-
-        resume_id = save_result['resume_id']
-
-        # 标记为解析中（便于前端状态展示）
-        db_manager.update_resume_status(resume_id, 'parsing')
-
-        # 解析简历
-        logger.info(f"开始解析简历：{file.filename}")
-        parsed_result = resume_parser.parse_file(str(file_path))
-
-        if parsed_result.get('error'):
-            # 解析失败
-            db_manager.update_resume_status(resume_id, 'error', parsed_result.get('error'))
-            return jsonify({
-                'success': False,
-                'error': parsed_result.get('error')
-            }), 500
-
-        # 更新简历数据
-        resume_data['parsed_data'] = parsed_result
-        db_manager.update_resume_status(resume_id, 'parsed')
-
-        # 重新保存解析后的数据
-        with db_manager.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE resumes
-                SET parsed_data = ?,
-                    projects = ?,
-                    experiences = ?,
-                    education = ?,
-                    skills = ?,
-                    status = 'parsed',
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            ''', (
-                json.dumps(parsed_result, ensure_ascii=False),
-                json.dumps(parsed_result.get('projects', []), ensure_ascii=False),
-                json.dumps(parsed_result.get('experiences', []), ensure_ascii=False),
-                json.dumps(parsed_result.get('education', []), ensure_ascii=False),
-                json.dumps(parsed_result.get('skills', []), ensure_ascii=False),
-                resume_id
-            ))
-            conn.commit()
-
-        logger.info(f"✓ 简历解析完成：{file.filename}")
-
-        return jsonify({
-            'success': True,
-            'message': '简历上传并解析成功',
-            'resume_id': resume_id,
-            'data': parsed_result,
-            'duplicate': duplicate_resume_id is not None,
-            'duplicate_of': duplicate_resume_id
-        })
-
-    except Exception as e:
-        logger.error(f"上传简历失败：{e}", exc_info=True)
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-
-@app.route('/api/resume', methods=['GET'])
-def get_resume():
-    """获取简历列表或详情"""
-    try:
-        resume_id = request.args.get('id', type=int)
-        user_id = request.args.get('user_id', 'default')
-        limit = request.args.get('limit', 100, type=int)
-        offset = request.args.get('offset', 0, type=int)
-
-        if resume_id:
-            # 获取指定简历详情
-            resume = db_manager.get_resume(resume_id)
-            if resume:
-                return jsonify({
-                    'success': True,
-                    'resume': resume
-                })
-            else:
-                return jsonify({
-                    'success': False,
-                    'error': '简历不存在'
-                }), 404
-        else:
-            # 获取简历列表
-            resumes = db_manager.get_resumes(user_id=user_id, limit=limit, offset=offset)
-            return jsonify({
-                'success': True,
-                'count': len(resumes),
-                'resumes': resumes
-            })
-
-    except Exception as e:
-        logger.error(f"获取简历失败：{e}", exc_info=True)
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-
-@app.route('/api/resume/latest', methods=['GET'])
-def get_latest_resume():
-    """获取最新的简历"""
-    try:
-        user_id = request.args.get('user_id', 'default')
-        resume = db_manager.get_latest_resume(user_id=user_id)
-
-        if resume:
-            return jsonify({
-                'success': True,
-                'resume': resume
-            })
-        else:
-            return jsonify({
-                'success': True,
-                'resume': None,
-                'message': '暂无简历'
-            })
-
-    except Exception as e:
-        logger.error(f"获取最新简历失败：{e}", exc_info=True)
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-
-@app.route('/api/resume/<int:resume_id>', methods=['DELETE'])
-def delete_resume(resume_id):
-    """删除简历"""
-    try:
-        result = db_manager.delete_resume(resume_id)
-        if result.get('success'):
-            return jsonify(result)
-        else:
-            return jsonify(result), 500
-
-    except Exception as e:
-        logger.error(f"删除简历失败：{e}", exc_info=True)
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-
-@app.route('/api/resume/parse', methods=['POST'])
-def reparse_resume():
-    """重新解析简历"""
-    try:
-        data = request.get_json()
-        resume_id = data.get('resume_id')
-
-        if not resume_id:
-            return jsonify({
-                'success': False,
-                'error': '缺少 resume_id 参数'
-            }), 400
-
-        if resume_parser is None:
-            return jsonify({
-                'success': False,
-                'error': '简历解析器未初始化'
-            }), 500
-
-        # 获取简历信息
-        resume = db_manager.get_resume(resume_id)
-        if not resume:
-            return jsonify({
-                'success': False,
-                'error': '简历不存在'
-            }), 404
-
-        file_path = resume.get('file_path')
-        if not isinstance(file_path, str) or not file_path.strip():
-            return jsonify({
-                'success': False,
-                'error': '简历文件路径无效'
-            }), 400
-
-        if not os.path.exists(file_path):
-            return jsonify({
-                'success': False,
-                'error': '简历文件不存在'
-            }), 404
-
-        # 重新解析
-        logger.info(f"重新解析简历：{resume.get('file_name')}")
-        parsed_result = resume_parser.parse_file(file_path)
-
-        if parsed_result.get('error'):
-            db_manager.update_resume_status(resume_id, 'error', parsed_result.get('error'))
-            return jsonify({
-                'success': False,
-                'error': parsed_result.get('error')
-            }), 500
-
-        # 更新解析结果
-        with db_manager.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE resumes
-                SET parsed_data = ?,
-                    projects = ?,
-                    experiences = ?,
-                    education = ?,
-                    skills = ?,
-                    status = 'parsed',
-                    error_message = NULL,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            ''', (
-                json.dumps(parsed_result, ensure_ascii=False),
-                json.dumps(parsed_result.get('projects', []), ensure_ascii=False),
-                json.dumps(parsed_result.get('experiences', []), ensure_ascii=False),
-                json.dumps(parsed_result.get('education', []), ensure_ascii=False),
-                json.dumps(parsed_result.get('skills', []), ensure_ascii=False),
-                resume_id
-            ))
-            conn.commit()
-
-        logger.info(f"✓ 简历重新解析完成：{resume.get('file_name')}")
-
-        return jsonify({
-            'success': True,
-            'message': '简历重新解析成功',
-            'data': parsed_result
-        })
-
-    except Exception as e:
-        logger.error(f"重新解析简历失败：{e}", exc_info=True)
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-
-@app.route('/api/resume/optimize', methods=['POST'])
-def optimize_resume():
-    """基于目标岗位/JD 对当前简历做轻量优化，并返回前后对比。"""
-    try:
-        if resume_optimizer_service is None:
-            return jsonify({
-                'success': False,
-                'error': resume_optimizer_import_error or '简历优化服务未初始化'
-            }), 500
-
-        data = request.get_json(silent=True) or {}
-        user_id = str(data.get('user_id') or 'default').strip() or 'default'
-        job_description = str(data.get('job_description') or '').strip()
-        strategy = str(data.get('strategy') or 'keywords').strip().lower()
-        profile_form = data.get('profile_form') if isinstance(data.get('profile_form'), dict) else {}
-
-        if strategy not in {'nudge', 'keywords', 'full'}:
-            strategy = 'keywords'
-
-        if not job_description:
-            return jsonify({
-                'success': False,
-                'error': '请先填写目标岗位描述（JD）后再开始优化。'
-            }), 400
-
-        latest_resume = db_manager.get_latest_resume(user_id=user_id)
-        result = resume_optimizer_service.optimize(
-            user_id=user_id,
-            latest_resume=latest_resume,
-            profile_form=profile_form,
-            job_description=job_description,
-            strategy=strategy,
-        )
-        return jsonify({
-            'success': True,
-            'result': result,
-        })
-    except Exception as e:
-        logger.error(f"简历优化失败：{e}", exc_info=True)
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-
-@app.route('/api/resume/optimizations', methods=['GET'])
-def list_resume_optimizations():
-    """获取简历优化历史。"""
-    try:
-        user_id = request.args.get('user_id', 'default')
-        limit = request.args.get('limit', 10, type=int)
-        offset = request.args.get('offset', 0, type=int)
-        history = db_manager.get_resume_optimizations(user_id=user_id, limit=limit, offset=offset)
-        return jsonify({
-            'success': True,
-            'count': len(history),
-            'optimizations': history,
-        })
-    except Exception as e:
-        logger.error(f"获取简历优化历史失败：{e}", exc_info=True)
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
-
-
-@app.route('/api/resume/optimizations/<optimization_id>', methods=['GET'])
-def get_resume_optimization(optimization_id):
-    """获取单条简历优化详情。"""
-    try:
-        user_id = request.args.get('user_id', 'default')
-        item = db_manager.get_resume_optimization(optimization_id, user_id=user_id)
-        if not item:
-            return jsonify({
-                'success': False,
-                'error': '简历优化记录不存在'
-            }), 404
-        return jsonify({
-            'success': True,
-            'optimization': item,
-        })
-    except Exception as e:
-        logger.error(f"获取简历优化详情失败：{e}", exc_info=True)
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
+app.register_blueprint(create_resume_blueprint(
+    db_manager=db_manager,
+    resume_parser=resume_parser,
+    resume_optimizer_service=resume_optimizer_service,
+    resume_optimizer_import_error=resume_optimizer_import_error,
+    logger=logger,
+))
 
 
 # ==================== 应用启动 ====================

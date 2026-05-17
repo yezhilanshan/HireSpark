@@ -7,6 +7,18 @@ import type { GraphEdge, GraphNode, GraphPayload, GraphSummary } from './types'
 const BACKEND_API_BASE = getBackendBaseUrl()
 const KNOWLEDGE_GRAPH_REFRESH_KEY = 'zhiyuexingchen:knowledge-graph:refresh'
 
+const preferredNodeTypes = ['knowledge', 'capability', 'weakness', 'project', 'training']
+
+async function resolveCurrentUserId() {
+    try {
+        const response = await fetch('/api/auth/me', { cache: 'no-store' })
+        const payload = await response.json().catch(() => ({}))
+        return String(payload?.user?.email || 'default').trim().toLowerCase() || 'default'
+    } catch {
+        return 'default'
+    }
+}
+
 export function useKnowledgeGraphData() {
     const [loading, setLoading] = useState(true)
     const [refreshing, setRefreshing] = useState(false)
@@ -22,7 +34,10 @@ export function useKnowledgeGraphData() {
         setError('')
 
         try {
-            const response = await fetch(`${BACKEND_API_BASE}/api/knowledge-graph/profile`)
+            const userId = await resolveCurrentUserId()
+            const response = await fetch(
+                `${BACKEND_API_BASE}/api/knowledge-graph/profile?user_id=${encodeURIComponent(userId)}`
+            )
             const payload = (await response.json()) as GraphPayload
 
             if (!response.ok || !payload.success) {
@@ -30,18 +45,17 @@ export function useKnowledgeGraphData() {
             }
 
             const nextNodes = Array.isArray(payload.nodes) ? payload.nodes : []
-            const visibleNodes = nextNodes.filter(
-                (node) => node.type === 'knowledge' || node.type === 'project'
-            )
 
             setSummary(payload.summary || {})
             setNodes(nextNodes)
             setEdges(Array.isArray(payload.edges) ? payload.edges : [])
             setSelectedNodeId((previous) => {
-                if (previous && visibleNodes.some((node) => node.id === previous)) {
+                if (previous && nextNodes.some((node) => node.id === previous)) {
                     return previous
                 }
-                return visibleNodes.find((node) => node.type === 'knowledge')?.id || visibleNodes[0]?.id || ''
+                return preferredNodeTypes
+                    .map((type) => nextNodes.find((node) => node.type === type)?.id)
+                    .find(Boolean) || nextNodes[0]?.id || ''
             })
         } catch (err) {
             setError(err instanceof Error ? err.message : '知识图谱加载失败')
@@ -66,7 +80,7 @@ export function useKnowledgeGraphData() {
     }, [refreshGraph])
 
     const graphVisibleNodes = useMemo(
-        () => nodes.filter((node) => node.type === 'knowledge' || node.type === 'project'),
+        () => nodes,
         [nodes]
     )
 

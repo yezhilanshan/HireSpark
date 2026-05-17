@@ -3,6 +3,7 @@ param(
     [string]$BackendCondaEnv = "interview",
     [string]$TtsCondaEnv = "interview-tts",
     [switch]$SkipFrontend,
+    [switch]$StartASR,
     [switch]$SkipASR
 )
 
@@ -195,12 +196,60 @@ if (`$LASTEXITCODE -ne 0) {
     ) | Out-Null
 }
 
+function Wait-HttpReady {
+    param(
+        [string]$Name,
+        [string]$Url,
+        [int]$TimeoutSeconds = 60
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    Write-Host "[职跃星辰] Waiting for ${Name}: $Url" -ForegroundColor DarkCyan
+
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 3
+            if ($response.StatusCode -ge 200 -and $response.StatusCode -lt 500) {
+                Write-Host "[职跃星辰] $Name is ready." -ForegroundColor Green
+                return $true
+            }
+        }
+        catch {
+            Start-Sleep -Seconds 2
+            continue
+        }
+    }
+
+    Write-Warning "$Name did not become ready within $TimeoutSeconds seconds: $Url"
+    return $false
+}
+
+function Assert-PortFree {
+    param(
+        [int]$Port,
+        [string]$ServiceName
+    )
+
+    $listeners = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+    if ($null -eq $listeners) {
+        return
+    }
+
+    $pids = @(
+        $listeners |
+            Where-Object { $_.OwningProcess -gt 0 } |
+            Select-Object -ExpandProperty OwningProcess -Unique
+    )
+    $pidText = if ($pids.Count -gt 0) { $pids -join ", " } else { "unknown" }
+    throw "$ServiceName port $Port is already in use by process id(s): $pidText. Close the old service window or stop that process before running start_all.ps1 again."
+}
+
 if (-not (Test-Path -Path $BackendScript -PathType Leaf)) {
     throw "Backend entry not found: $BackendScript"
 }
 
 $startFrontend = -not $SkipFrontend
-$startAsr = -not $SkipASR
+$startAsr = [bool]$StartASR -and -not $SkipASR
 
 if ($startFrontend -and -not (Test-Path -Path $FrontendDir -PathType Container)) {
     throw "Frontend directory not found: $FrontendDir"
@@ -233,6 +282,12 @@ if ($startFrontend -and $null -eq $npmCommand) {
     throw "npm command not found. Please install Node.js first."
 }
 
+Assert-PortFree -Port 5000 -ServiceName "Backend"
+Assert-PortFree -Port 5001 -ServiceName "TTS"
+if ($startFrontend) {
+    Assert-PortFree -Port 3000 -ServiceName "Frontend"
+}
+
 $hasDashScopeApiKey = Resolve-DashScopeApiKey
 if ($startAsr -and -not $hasDashScopeApiKey) {
     throw "ASR requires DASHSCOPE_API_KEY (or BAILIAN_API_KEY). Please set it in environment variables or .env."
@@ -243,7 +298,7 @@ Write-Host "职跃星辰 unified startup script" -ForegroundColor Cyan
 Write-Host "Project root: $ScriptRoot" -ForegroundColor Gray
 Write-Host "============================================================" -ForegroundColor DarkCyan
 
-$backendCommand = "& '$condaExe' run -n '$BackendCondaEnv' python '.\backend\app.py'"
+$backendCommand = "`$env:SOCKETIO_ASYNC_MODE = 'threading'; & '$condaExe' run -n '$BackendCondaEnv' python '.\backend\app.py'"
 
 $ttsCommand = "& '$condaExe' run -n '$TtsCondaEnv' python -m uvicorn $TtsModule --host 0.0.0.0 --port 5001"
 
@@ -254,10 +309,10 @@ if ($startAsr) {
 $frontendCommand = "Set-Location '.\frontend'; if ((-not (Test-Path '.\node_modules')) -or (-not (Test-Path '.\node_modules\.bin\next.cmd'))) { npm install; if (`$LASTEXITCODE -ne 0) { exit `$LASTEXITCODE } }; npm run dev"
 
 Start-ServiceWindow -ServiceName "Backend" -WorkingDirectory $ScriptRoot -Command $backendCommand
-Start-Sleep -Seconds 3
+Wait-HttpReady -Name "Backend Socket.IO" -Url "http://127.0.0.1:5000/socket.io/?EIO=4&transport=polling" -TimeoutSeconds 90 | Out-Null
 
 Start-ServiceWindow -ServiceName "TTS" -WorkingDirectory $ScriptRoot -Command $ttsCommand
-Start-Sleep -Seconds 2
+Wait-HttpReady -Name "TTS" -Url "http://127.0.0.1:5001/health" -TimeoutSeconds 60 | Out-Null
 
 if ($startAsr) {
     Start-ServiceWindow -ServiceName "ASR" -WorkingDirectory $ScriptRoot -Command $asrCommand
@@ -276,5 +331,5 @@ if ($startFrontend) {
 }
 Write-Host ""
 Write-Host "Tips:" -ForegroundColor DarkCyan
-Write-Host "1) Use -SkipASR when microphone/ASR is not needed." -ForegroundColor Gray
+Write-Host "1) live_asr.py is no longer started by default; use -StartASR only for the standalone desktop ASR client." -ForegroundColor Gray
 Write-Host "2) Use -SkipFrontend to only run backend-side services." -ForegroundColor Gray

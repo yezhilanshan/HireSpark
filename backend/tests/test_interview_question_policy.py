@@ -50,6 +50,34 @@ class _FakeLLMForSwitchFallback:
         return "你刚才的回答还比较概括，请补充一个具体实现细节？"
 
 
+class _FakeRAGForQuestionTextAnalysis:
+    enabled = True
+
+    def __init__(self):
+        self.analyze_kwargs = None
+
+    def analyze_answer(self, **kwargs):
+        self.analyze_kwargs = kwargs
+        return {
+            "question_id": "",
+            "matched_rubric_id": "q_by_text",
+            "coverage": {"basic": 0.5, "good": 0.0, "excellent": 0.0},
+            "correctness": 0.4,
+            "depth": 0.3,
+            "confidence": 0.6,
+            "followups": [],
+            "recommended_followup_ids": [],
+        }
+
+    @staticmethod
+    def format_analysis_result(analysis_result):
+        return "analysis-context"
+
+    @staticmethod
+    def build_answer_context(**kwargs):
+        return "reference-context"
+
+
 class InterviewQuestionPolicyTestCase(unittest.TestCase):
     def setUp(self):
         if backend_app_module is None:
@@ -111,6 +139,30 @@ class InterviewQuestionPolicyTestCase(unittest.TestCase):
         text = "这个点先到这里，我们换一个方向。\n\n请你讲讲线程池的拒绝策略有哪些？"
         extracted = backend_app_module._extract_runtime_question_core(text)
         self.assertEqual(extracted, "请你讲讲线程池的拒绝策略有哪些？")
+
+    def test_extract_runtime_question_core_prefers_last_question_clause(self):
+        text = "你刚才对线程池参数说得比较概括，可以补充一下阻塞队列如何影响拒绝策略吗？"
+        extracted = backend_app_module._extract_runtime_question_core(text)
+        self.assertEqual(extracted, "可以补充一下阻塞队列如何影响拒绝策略吗？")
+
+    def test_answer_rag_context_analyzes_by_question_text_without_plan_id(self):
+        fake_rag = _FakeRAGForQuestionTextAnalysis()
+
+        with patch.object(backend_app_module, "rag_service", fake_rag):
+            context, analysis = backend_app_module._build_answer_rag_context(
+                position="java_backend",
+                round_type="technical",
+                current_question="请解释一下线程池参数怎么配置？",
+                user_answer="核心线程数和队列会影响并发与拒绝策略。",
+                interview_state={"target_round_type": "technical"},
+                question_plan=None,
+            )
+
+        self.assertIn("analysis-context", context)
+        self.assertIn("reference-context", context)
+        self.assertEqual(analysis.get("matched_rubric_id"), "q_by_text")
+        self.assertIsNone(fake_rag.analyze_kwargs.get("question_id"))
+        self.assertEqual(fake_rag.analyze_kwargs.get("current_question"), "请解释一下线程池参数怎么配置？")
 
 
 if __name__ == "__main__":

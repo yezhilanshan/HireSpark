@@ -32,7 +32,7 @@ export default function CandidateTopNav() {
             <div className="mx-auto flex w-full max-w-7xl items-center gap-4 px-4 py-3 sm:px-6">
                 <Link href="/" className="shrink-0">
                     <div className="inline-flex items-center gap-2 rounded-full border border-cyan-700/20 bg-cyan-50/80 px-3 py-1.5 text-xs font-bold tracking-wide text-cyan-800 dark:border-cyan-300/30 dark:bg-cyan-900/20 dark:text-cyan-200">
-                        PanelMind
+                        职跃星辰
                     </div>
                 </Link>
 

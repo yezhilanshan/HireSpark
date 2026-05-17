@@ -61,7 +61,8 @@ INTERVIEW_ROUNDS = {
 - 语言专业但不生硬
 - 每次输出都必须以明确问题结尾，且只能提问或极短提示后追问
 - 不要直接解释概念，不要给标准答案，不要写示例代码
-- 如果候选人回答不理想，只能重述、缩小问题或继续追问，不能切换成讲课模式"""
+- 如果候选人回答不理想，只能重述、缩小问题或继续追问，不能切换成讲课模式
+- 切换话题时，先简要点评上一题回答，再自然引出新问题，避免机械过渡"""
     },
     'project': {
         'name': '项目深度面',
@@ -84,7 +85,8 @@ INTERVIEW_ROUNDS = {
 - 每次只提一个问题，问题要具体
 - 字数控制在 200 字以内
 - 对于模糊的回答要追问细节
-- 关注候选人的技术深度和思考能力"""
+- 关注候选人的技术深度和思考能力
+- 切换话题时，先简要点评上一题回答，再自然引出新问题，避免机械过渡"""
     },
     'system_design': {
         'name': '系统设计面',
@@ -107,7 +109,8 @@ INTERVIEW_ROUNDS = {
 - 问题要描述清晰的场景和需求
 - 字数控制在 300 字以内
 - 引导候选人思考扩展性问题
-- 关注设计思路而非标准答案"""
+- 关注设计思路而非标准答案
+- 切换话题时，先简要点评上一题回答，再自然引出新问题，避免机械过渡"""
     },
     'hr': {
         'name': 'HR 综合面',
@@ -131,7 +134,8 @@ INTERVIEW_ROUNDS = {
 - 问题要开放但有边界
 - 字数控制在 200 字以内
 - 语言友好但保持专业性
-- 给予候选人充分表达空间"""
+- 给予候选人充分表达空间
+- 切换话题时，先简要点评上一题回答，再自然引出新问题，避免机械过渡"""
     }
 }
 
@@ -160,8 +164,16 @@ class LLMManager:
     def __init__(self):
         """初始化 LLM 管理器"""
         self.enabled = config.get('llm.enabled', False)
-        self.provider = config.get('llm.provider', 'qwen')
-        self.model = config.get('llm.model', 'qwen-max')
+        self.provider = (
+            str(os.environ.get('LLM_PROVIDER', '')).strip().lower()
+            or config.get('llm.provider', 'qwen')
+            or 'qwen'
+        )
+        self.model = (
+            str(os.environ.get('LLM_MODEL', '')).strip()
+            or config.get('llm.model', 'qwen-max')
+            or 'qwen-max'
+        )
         self.api_key = self._resolve_api_key(config.get('llm.api_key'))
         self.timeout = config.get('llm.timeout', 30)
         self.current_round = 'technical'
@@ -193,7 +205,8 @@ class LLMManager:
 - 语言专业但不生硬，要体现面试官的专业性
 - 输出必须是面试官口吻，最终落在一个明确问题上
 - 不要直接解释概念、不要给标准答案、不要写示例代码
-- 如果候选人回答不理想，可以缩小范围继续追问，但不要变成教学讲解""")
+- 如果候选人回答不理想，可以缩小范围继续追问，但不要变成教学讲解
+- 切换话题时，先用一句话简要点评候选人刚才的回答，再自然引出新问题，像真人面试官一样自然衔接""")
 
     @staticmethod
     def _resolve_api_key(config_value: Optional[str]) -> Optional[str]:
@@ -239,6 +252,39 @@ class LLMManager:
             if len(results) >= limit:
                 break
         return results
+
+    @staticmethod
+    def _parse_json_object_from_text(text: str) -> Dict[str, Any]:
+        """从模型输出中提取第一个完整 JSON 对象，避免贪婪正则吞入多余文本。"""
+        source = str(text or "").strip()
+        if source.startswith("```"):
+            source = re.sub(r"^```(?:json)?\s*", "", source, flags=re.IGNORECASE)
+            source = re.sub(r"\s*```$", "", source)
+
+        decoder = json.JSONDecoder()
+        for index, char in enumerate(source):
+            if char != "{":
+                continue
+            try:
+                parsed, _ = decoder.raw_decode(source[index:])
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+
+        # 常见模型小错误：对象/数组尾逗号。
+        compact = re.sub(r",\s*([}\]])", r"\1", source)
+        for index, char in enumerate(compact):
+            if char != "{":
+                continue
+            try:
+                parsed, _ = decoder.raw_decode(compact[index:])
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+
+        raise ValueError("未找到可解析的完整 JSON 对象")
 
     @classmethod
     def _extract_question_from_context(cls, text: Optional[str]) -> str:
@@ -780,12 +826,13 @@ class LLMManager:
 
         system_prompt = (
             "You are an interview grading assistant. "
-            "Return valid JSON only. "
+            "Return valid compact JSON only. "
             "Your dimension scores must be text-semantic base scores derived from the answer content, rubric, and layer1 evidence. "
             "For every dimension, you must also return structured evidence. "
             "Do not apply speech weighting inside dimension scores or overall_score. "
             "If speech_context is present, you may reference it only in reasons and summary wording. "
             "Keep scores calibrated to 0-100 and ensure reasons are concise, evidence is concrete, and quotes come from the candidate answer. "
+            "When `scoring_rubric.atomic_points` is present, treat the LLM task as point-level evidence judgement: classify every point independently before giving narrative dimension comments. "
             "For `job_match`, score role alignment instead of repeating technical correctness: judge whether the answer reflects the target role's core competency, engineering context, and scenario relevance. "
             "For HR round `confidence`, score professional confidence from the semantics of the answer: whether the candidate shows stable judgment, clear ownership, and appropriately bounded self-belief. "
             "Do not confuse confidence with extroversion, speaking volume, aggression, or refusal to admit uncertainty."
@@ -807,12 +854,16 @@ class LLMManager:
             "4. `summary` can mention speaking strengths/weaknesses only if supported by speech_context.\n"
             "5. Every dimension must include `evidence.hit_rubric_points`, `evidence.missed_rubric_points`, `evidence.source_quotes`, and `evidence.deduction_rationale`.\n"
             "6. `source_quotes` must quote the candidate answer verbatim when possible; use short excerpts only.\n\n"
-            "7. When scoring `job_match`, prioritize these signals in order:\n"
+            "7. If `scoring_rubric.atomic_points` exists, return one `point_judgements` item for every atomic point id. "
+            "`status` must be one of `hit`, `partial`, `miss`, or `contradict`; for `hit`, `partial`, and `contradict`, `quote` must be a short exact excerpt copied from candidate_answer. "
+            "Use `contradict` when the answer states something opposite to a core rubric point, not merely when it omits the point.\n"
+            "8. Dimension scores may be semantic baselines, but final deterministic scoring will be computed by the rules layer from `point_judgements`.\n\n"
+            "9. When scoring `job_match`, prioritize these signals in order:\n"
             "   - whether the answer reflects role-specific competency from `position_profile.target_competency`\n"
             "   - whether the answer uses role-relevant scenarios / technologies / engineering trade-offs\n"
             "   - whether the answer goes beyond generic correctness and shows practical fit for the target role\n"
             "   - do not simply mirror `technical_accuracy`; a technically correct but generic answer can have only moderate `job_match`\n"
-            "8. When scoring HR `confidence`, prioritize these signals in order:\n"
+            "10. When scoring HR `confidence`, prioritize these signals in order:\n"
             "   - whether the candidate expresses clear judgments, choices, and reasons instead of repeated hedging\n"
             "   - whether the candidate shows stable ownership of actions, outcomes, strengths, and weaknesses\n"
             "   - whether the answer stays composed and coherent when discussing pressure, failure, trade-offs, or self-evaluation\n"
@@ -828,6 +879,9 @@ class LLMManager:
             '    "confidence": 0.0,\n'
             '    "reason": "..."\n'
             "  },\n"
+            '  "point_judgements": [\n'
+            '    {"point_id": "...", "status": "hit|partial|miss|contradict", "confidence": 0.0, "quote": "...", "reason": "..."}\n'
+            "  ],\n"
             '  "dimension_scores": {\n'
             f"    {dim_schema}\n"
             "  },\n"
@@ -851,7 +905,7 @@ class LLMManager:
                 top_p=0.5,
                 top_k=50,
                 temperature=0.2,
-                max_tokens=1200,
+                max_tokens=2200,
                 timeout=self.timeout
             )
 
@@ -859,13 +913,16 @@ class LLMManager:
                 return {"error": "API_ERROR", "message": response.message}
 
             raw_text = str(response.output.text or "").strip()
-            import re
-            json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-            if not json_match:
-                return {"error": "INVALID_JSON", "message": "未找到有效 JSON", "raw_text": raw_text}
-
-            parsed = json.loads(json_match.group())
+            try:
+                parsed = self._parse_json_object_from_text(raw_text)
+            except Exception as parse_error:
+                return {
+                    "error": "INVALID_JSON",
+                    "message": str(parse_error),
+                    "raw_text": raw_text[:4000],
+                }
             rubric_eval = parsed.get("rubric_eval", {}) or {}
+            point_judgements = parsed.get("point_judgements", []) or []
             dimension_scores = parsed.get("dimension_scores", {}) or {}
             summary = parsed.get("summary", {}) or {}
 
@@ -885,6 +942,29 @@ class LLMManager:
             }
             if normalized_rubric_eval["final_level"] not in {"basic", "good", "excellent"}:
                 normalized_rubric_eval["final_level"] = "basic"
+
+            normalized_point_judgements = []
+            raw_point_items = point_judgements.values() if isinstance(point_judgements, dict) else point_judgements
+            for item in raw_point_items or []:
+                if not isinstance(item, dict):
+                    continue
+                point_id = str(item.get("point_id") or item.get("id") or "").strip()
+                if not point_id:
+                    continue
+                status = str(item.get("status") or item.get("judgement") or "miss").strip().lower()
+                if status not in {"hit", "partial", "miss", "contradict"}:
+                    status = "miss"
+                try:
+                    point_confidence = round(max(0.0, min(1.0, float(item.get("confidence", 0.65)))), 4)
+                except Exception:
+                    point_confidence = 0.65
+                normalized_point_judgements.append({
+                    "point_id": point_id,
+                    "status": status,
+                    "confidence": point_confidence,
+                    "quote": str(item.get("quote") or item.get("source_quote") or "").strip()[:160],
+                    "reason": str(item.get("reason") or item.get("rationale") or "").strip()[:240],
+                })
 
             normalized_dimensions = {}
             normalized_dimension_evidence = {}
@@ -911,6 +991,7 @@ class LLMManager:
 
             normalized = {
                 "rubric_eval": normalized_rubric_eval,
+                "point_judgements": normalized_point_judgements,
                 "dimension_scores": normalized_dimensions,
                 "dimension_evidence": normalized_dimension_evidence,
                 "overall_score": _clamp_100(overall_score),
@@ -1164,6 +1245,59 @@ class LLMManager:
         except Exception as e:
             logger.error(f"✗ 生成追问失败：{e}")
         return fallback_question
+
+    def generate_natural_transition(
+        self,
+        *,
+        previous_question: str,
+        user_answer: str,
+        next_question: str,
+        transition_type: str,
+        position: str,
+        round_type: str,
+        chat_history: Optional[list] = None,
+    ) -> str:
+        """生成自然过渡语：简要点评上一题回答，再自然引出下一题。"""
+        fallback = next_question
+        if not self.check_enabled():
+            return fallback
+
+        resume_data = self.resume_data if isinstance(self.resume_data, dict) else None
+        self.set_interview_round(round_type, resume_data)
+        transition_hint = "候选人回答得不错，需要提升难度" if transition_type == 'raise_difficulty' else "需要切换到新的话题"
+        prompt = (
+            "你现在是一位经验丰富的中文技术面试官。候选人刚刚回答完一个问题，你现在要过渡到下一个问题。\n"
+            "请用 1-2 句话自然衔接，要求：\n"
+            "1. 先用一句话简要点评候选人刚才的回答（可以是肯定、总结或指出不足）\n"
+            "2. 然后自然引出下一个问题，不要说'我们换一个方向'这类机械表达\n"
+            "3. 整体要像真人面试官的口头表达，自然、专业、不生硬\n"
+            "4. 直接输出面试官的发言文本，包含下一题的完整内容，不要分段输出\n\n"
+            f"目标岗位：{position}\n"
+            f"面试轮次：{round_type}\n"
+            f"过渡原因：{transition_hint}\n"
+            f"上一个问题是：{previous_question}\n"
+            f"候选人的回答：{user_answer}\n"
+            f"下一个问题是：{next_question}\n"
+        )
+        messages = [{"role": "system", "content": self.system_prompt}, {"role": "user", "content": prompt}]
+        try:
+            response = Generation.call(
+                model=self.model,
+                messages=messages,
+                top_p=0.7,
+                top_k=40,
+                temperature=0.6,
+                max_tokens=250,
+                timeout=self.timeout,
+            )
+            if response.status_code == 200:
+                text = str(response.output.text or "").strip()
+                if text and len(text) > 10:
+                    logger.info("✓ 生成自然过渡成功")
+                    return text
+        except Exception as e:
+            logger.error(f"✗ 生成自然过渡失败：{e}")
+        return fallback
 
     def generate_coach_followup(
         self,

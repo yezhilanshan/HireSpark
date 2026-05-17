@@ -4,6 +4,7 @@ from backend.utils.answer_session import (
     build_live_answer_text,
     dedupe_answer_text,
     merge_answer_text,
+    normalize_answer_text,
     stabilize_realtime_asr_text,
 )
 
@@ -50,6 +51,20 @@ class AnswerSessionMergeTestCase(unittest.TestCase):
     def test_stabilize_realtime_asr_text_collapses_long_single_char_runs(self):
         self.assertEqual(stabilize_realtime_asr_text("我我我我再再试试"), "我再再试试")
         self.assertEqual(stabilize_realtime_asr_text("轻轻试试"), "轻轻试试")
+
+    def test_normalize_answer_text_collapses_common_cjk_asr_double_echoes(self):
+        text = "希希望望，厚厚糯糯和，大大家乡相相处处中。和睦睦邻相相处，携手共进。"
+
+        normalized = normalize_answer_text(text)
+
+        self.assertEqual(normalized, "希望，厚糯和，大家乡相处中。和睦邻相处，携手共进。")
+
+    def test_normalize_answer_text_preserves_common_legitimate_reduplication(self):
+        text = "谢谢，我想想再轻轻试试，也会清清楚楚说明。"
+
+        normalized = normalize_answer_text(text)
+
+        self.assertEqual(normalized, text)
 
     def test_build_live_answer_text_ignores_tiny_partial_after_final(self):
         draft = "我已经说完这句话。"

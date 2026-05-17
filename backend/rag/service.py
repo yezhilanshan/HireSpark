@@ -7,6 +7,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import os
 import random
 import re
 from pathlib import Path
@@ -26,7 +27,10 @@ except ImportError:  # pragma: no cover - compatibility for root-level scripts
 
 logger = get_logger(__name__)
 
-DEFAULT_EMBEDDING_MODEL = "shibing624/text2vec-base-chinese"
+DEFAULT_EMBEDDING_MODEL = (
+    str(os.environ.get('EMBEDDING_MODEL', '')).strip()
+    or "shibing624/text2vec-base-chinese"
+)
 OPENAI_EMBEDDING_MODELS = {
     "text-embedding-3-small",
     "text-embedding-3-large",
