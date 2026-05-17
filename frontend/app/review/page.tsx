@@ -11,7 +11,7 @@ const BACKEND_API_BASE = getBackendBaseUrl()
 
 type GrowthReport = {
     summary: {
-        overall_score: number
+        overall_score: number | null
         interview_count: number
         duration_seconds: number
         dominant_round: string
@@ -35,6 +35,9 @@ type ApiResult = {
 type ImmediateReportApiResult = {
     success: boolean
     report?: {
+        final_score?: {
+            overall_score?: number | null
+        }
         structured_evaluation?: {
             overall_score?: number | null
             round_aggregation?: {
@@ -59,6 +62,9 @@ function toNullableScore(value: unknown): number | null {
 function resolveImmediateReportOverallScore(payload: ImmediateReportApiResult | null | undefined): number | null {
     const reportPayload = payload?.report
     if (!reportPayload) return null
+
+    const finalScore = toNullableScore(reportPayload.final_score?.overall_score)
+    if (finalScore != null) return finalScore
 
     const stableScore = toNullableScore(
         reportPayload.structured_evaluation?.round_aggregation?.interview_stability?.overall_score_stable,
@@ -299,7 +305,7 @@ function ReviewPageContent() {
                 )}
 
                 <div className="mt-6 grid gap-4 sm:grid-cols-3">
-                    <StatCard title="综合得分" value={report.summary.overall_score.toFixed(1)} icon={Radar} />
+                    <StatCard title="综合得分" value={report.summary.overall_score == null ? '--' : report.summary.overall_score.toFixed(1)} icon={Radar} />
                     <StatCard title="主面试轮次" value={roundNameMap[report.summary.dominant_round] || report.summary.dominant_round} icon={FileText} />
                     <StatCard title="会话时长" value={formatDuration(report.summary.duration_seconds)} icon={Clock3} />
                 </div>

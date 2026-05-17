@@ -347,6 +347,16 @@ try:
                 logger.warning("[ASR] ASR 未启用")
                 return False
 
+            # 复用已有的活跃会话（如预热阶段创建的），仅更新回调
+            with self._lock:
+                existing = self._streams.get(stream_id)
+            if existing and existing.is_running and existing.callback and existing.callback.is_open:
+                existing.callback.on_final_callback = on_result
+                existing.callback.on_partial_callback = on_partial
+                existing.callback.on_error_callback = on_error or (lambda _e: None)
+                logger.info(f"[ASR] 复用已有会话 - stream={stream_id}")
+                return True
+
             self.stop_session(stream_id)
 
             state = AsrStreamState(stream_id=stream_id)
@@ -413,6 +423,21 @@ try:
                         pass
                 logger.error(f"[ASR] 启动失败 - stream={stream_id}: {e}")
                 return False
+
+        def prewarm_session(self, stream_id: str) -> bool:
+            """预创建 ASR 会话并建立连接，避免首次识别时冷启动延迟。"""
+            if not self.enabled:
+                return False
+            with self._lock:
+                existing = self._streams.get(stream_id)
+            if existing and existing.is_running and existing.callback and existing.callback.is_open:
+                return True
+            return self.start_session(
+                stream_id,
+                on_result=lambda _text: None,
+                on_partial=lambda _text: None,
+                on_error=lambda _error: None,
+            )
 
         def send_audio(self, stream_id: str, audio_data: bytes) -> bool:
             if not audio_data:

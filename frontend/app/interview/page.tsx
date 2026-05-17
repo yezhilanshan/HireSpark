@@ -27,8 +27,9 @@ const SERVER_ASR_ACTIVE_COOLDOWN_MS = parseNumberEnv(process.env.NEXT_PUBLIC_SER
 const SERVER_ASR_FALLBACK_DELAY_MS = 3200
 const SERVER_ASR_STALL_WINDOW_MS = 3200
 const SERVER_ASR_RECHECK_DELAY_MS = 1100
+const CLIENT_ASR_TRANSCRIPT_STALL_END_MS = parseNumberEnv(process.env.NEXT_PUBLIC_CLIENT_ASR_TRANSCRIPT_STALL_END_MS, 2600)
 const ENABLE_BROWSER_ASR_STALL_FALLBACK = false
-const ASR_DEBUG_PANEL_ENABLED = false
+const ASR_DEBUG_PANEL_ENABLED = parseBooleanEnv(process.env.NEXT_PUBLIC_ASR_DEBUG_PANEL, false)
 const ASR_DEBUG_MAX_ITEMS = 120
 const KNOWLEDGE_GRAPH_REFRESH_KEY = 'zhiyuexingchen:knowledge-graph:refresh'
 const DEFAULT_SHORT_PAUSE_MS = 900
@@ -40,18 +41,22 @@ const MIN_ADAPTIVE_SILENCE_MS = 1650
 const MAX_ADAPTIVE_SILENCE_MS = 2600
 const ASR_NOISE_FLOOR_MIN = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_NOISE_FLOOR_MIN, 0.001)
 const ASR_NOISE_FLOOR_MAX = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_NOISE_FLOOR_MAX, 0.03)
-const ASR_ACTIVATION_MULTIPLIER = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_ACTIVATION_MULTIPLIER, 2.35)
-const ASR_ACTIVATION_MIN = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_ACTIVATION_MIN, 0.008)
-const ASR_ACTIVATION_MAX = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_ACTIVATION_MAX, 0.04)
-const ASR_FAST_START_WINDOW_MS = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_FAST_START_WINDOW_MS, 2000)
-const ASR_FAST_START_ACTIVATION_MULTIPLIER = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_FAST_START_ACTIVATION_MULTIPLIER, 1.55)
-const ASR_FAST_START_ACTIVATION_MIN = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_FAST_START_ACTIVATION_MIN, 0.0045)
-const ASR_FAST_START_STRONG_MULTIPLIER = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_FAST_START_STRONG_MULTIPLIER, 1.08)
-const ASR_HOLD_MULTIPLIER = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_HOLD_MULTIPLIER, 1.65)
-const ASR_HOLD_MIN = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_HOLD_MIN, 0.005)
+const ASR_ACTIVATION_MULTIPLIER = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_ACTIVATION_MULTIPLIER, 1.7)
+const ASR_ACTIVATION_MIN = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_ACTIVATION_MIN, 0.002)
+const ASR_ACTIVATION_MAX = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_ACTIVATION_MAX, 0.035)
+const ASR_FAST_START_WINDOW_MS = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_FAST_START_WINDOW_MS, 8000)
+const ASR_FAST_START_ACTIVATION_MULTIPLIER = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_FAST_START_ACTIVATION_MULTIPLIER, 1.15)
+const ASR_FAST_START_ACTIVATION_MIN = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_FAST_START_ACTIVATION_MIN, 0.0015)
+const ASR_FAST_START_STRONG_MULTIPLIER = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_FAST_START_STRONG_MULTIPLIER, 1.05)
+const ASR_HOLD_MULTIPLIER = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_HOLD_MULTIPLIER, 2.6)
+const ASR_HOLD_MIN = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_HOLD_MIN, 0.006)
 const ASR_HOLD_MAX = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_HOLD_MAX, 0.028)
-const ASR_STRONG_SPEECH_MULTIPLIER = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_STRONG_SPEECH_MULTIPLIER, 1.22)
+const ASR_STRONG_SPEECH_MULTIPLIER = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_STRONG_SPEECH_MULTIPLIER, 1.08)
 const ASR_AUDIO_CHUNK_MS = 100
+const ASR_INPUT_CALIBRATION_CHUNKS = Math.max(
+    0,
+    Math.round(parseNumberEnv(process.env.NEXT_PUBLIC_ASR_INPUT_CALIBRATION_MS, 0) / ASR_AUDIO_CHUNK_MS)
+)
 const ASR_PREBUFFER_TARGET_MS = parseNumberEnv(process.env.NEXT_PUBLIC_ASR_PREBUFFER_TARGET_MS, 2200)
 const ASR_PREBUFFER_MAX_CHUNKS = Math.max(
     8,
@@ -230,7 +235,6 @@ export default function InterviewPage() {
     const interruptEpochRef = useRef(0)
     const activeTtsJobIdRef = useRef('')
     const autoEndingRef = useRef(false)
-    const autoStartTriggeredRef = useRef(false)
     const pendingTtsTextRef = useRef('')
     const answerSessionIdRef = useRef('')
     const committedAnswerSessionIdsRef = useRef<Set<string>>(new Set())
@@ -238,6 +242,7 @@ export default function InterviewPage() {
     const speechActiveRef = useRef(false)
     const consecutiveSpeechFramesRef = useRef(0)
     const lastSpeechAtRef = useRef(0)
+    const lastClientMicLevelDebugAtRef = useRef(0)
     const fastStartUntilRef = useRef(0)
     const clientSpeechEpochRef = useRef(0)
     const activeSpeechEpochRef = useRef(0)
@@ -261,7 +266,8 @@ export default function InterviewPage() {
     const lastServerTranscriptAtRef = useRef(0)
     const serverAsrMuteUntilRef = useRef(0)
     const asrChannelRef = useRef<'none' | 'server' | 'browser'>('none')
-    const noiseFloorRef = useRef(0.004)
+    const noiseFloorRef = useRef(0.0015)
+    const inputCalibrationChunksRef = useRef(ASR_INPUT_CALIBRATION_CHUNKS)
     const answerSessionStatusRef = useRef('idle')
     const asrLockedRef = useRef(false)
     const socketRef = useRef<SocketClient | null>(null)
@@ -546,8 +552,51 @@ export default function InterviewPage() {
         return value.replace(/\s+/g, ' ').trim()
     }
 
+    // 常见的合法中文叠词（不应被去重）
+    const LEGITIMATE_CJK_REDOUBLES = new Set([
+        '谢谢', '哈哈', '呵呵', '嘿嘿', '嗯嗯', '对对', '是是', '好好',
+        '慢慢', '天天', '人人', '看看', '试试', '想想', '说说', '问问',
+        '聊聊', '稍稍', '刚刚', '明明', '往往', '常常', '渐渐', '偏偏',
+        '恰恰', '仅仅', '多多', '少少', '远远', '满满', '轻轻', '悄悄',
+        '稳稳', '再再',
+    ])
+
+    const collapseCjkStutter = (text: string): string => {
+        if (!text) return ''
+        // 先折叠 3 个以上连续重复的中文字符
+        let result = text.replace(/([一-鿿])\1{2,}/g, '$1')
+        // 再处理连续重复的双字（AA BB 模式）
+        const doubleStutterRe = /([一-鿿])\1/g
+        const matches: Array<{ pair: string; index: number }> = []
+        let m: RegExpExecArray | null
+        while ((m = doubleStutterRe.exec(result)) !== null) {
+            matches.push({ pair: m[0], index: m.index })
+        }
+        if (matches.length === 0) return result
+        const collapseStarts = new Set<number>()
+        for (let i = 0; i < matches.length; i++) {
+            const { pair, index } = matches[i]
+            if (!LEGITIMATE_CJK_REDOUBLES.has(pair)) {
+                collapseStarts.add(index)
+                continue
+            }
+            // 合法叠词但如果紧邻非法叠词，也折叠
+            const prev = matches[i - 1]
+            const next = matches[i + 1]
+            const nearBadPrev = prev && index - prev.index <= 3 && !LEGITIMATE_CJK_REDOUBLES.has(prev.pair)
+            const nearBadNext = next && next.index - index <= 3 && !LEGITIMATE_CJK_REDOUBLES.has(next.pair)
+            if (nearBadPrev || nearBadNext) {
+                collapseStarts.add(index)
+            }
+        }
+        if (collapseStarts.size === 0) return result
+        return result.replace(doubleStutterRe, (pair, char, offset) => {
+            return collapseStarts.has(offset) ? char : pair
+        })
+    }
+
     const squashStutterText = (value: string) => {
-        return normalizeTranscript(value)
+        return collapseCjkStutter(normalizeTranscript(value))
     }
 
     const mergeTranscriptWithDedup = (existingText: string, incomingText: string) => {
@@ -570,7 +619,7 @@ export default function InterviewPage() {
             return existing
         }
 
-        const maxOverlap = Math.min(32, existing.length, incoming.length)
+        const maxOverlap = Math.min(64, existing.length, incoming.length)
         for (let overlap = maxOverlap; overlap >= 3; overlap--) {
             if (existing.slice(-overlap) === incoming.slice(0, overlap)) {
                 return `${existing}${incoming.slice(overlap)}`.trim()
@@ -593,6 +642,12 @@ export default function InterviewPage() {
         if (speechPrebufferRef.current.length > maxChunks) {
             speechPrebufferRef.current.splice(0, speechPrebufferRef.current.length - maxChunks)
         }
+    }
+
+    const resetAsrInputCalibration = () => {
+        inputCalibrationChunksRef.current = ASR_INPUT_CALIBRATION_CHUNKS
+        consecutiveSpeechFramesRef.current = 0
+        speechActiveRef.current = false
     }
 
     const setServerAsrAvailability = (available: boolean, message = '') => {
@@ -969,6 +1024,104 @@ export default function InterviewPage() {
     useEffect(() => {
         const supported = Boolean(getSpeechRecognitionCtor())
         setBrowserAsrAvailability(supported)
+
+        // 只预创建实例，不主动 start。主动启动浏览器识别会抢占麦克风/语音服务，
+        // 容易影响项目自己的服务端 ASR 首次采集链路。
+        if (supported) {
+            const RecognitionCtor = getSpeechRecognitionCtor()!
+            try {
+                const recognition = new RecognitionCtor()
+                recognition.continuous = true
+                recognition.interimResults = true
+                recognition.lang = 'zh-CN'
+
+                recognition.onstart = () => {
+                    browserAsrActiveRef.current = true
+                    browserAsrStopRequestedRef.current = false
+                    asrChannelRef.current = 'browser'
+                    console.warn('[ASR] 已切换到浏览器语音识别')
+                }
+                recognition.onresult = (event: SpeechRecognitionEventLike) => {
+                    let nextFinal = browserAsrFinalTextRef.current
+                    let nextInterim = ''
+
+                    for (let i = event.resultIndex; i < event.results.length; i++) {
+                        const result = event.results[i]
+                        const transcript = result?.[0]?.transcript?.trim() || ''
+                        if (!transcript) {
+                            continue
+                        }
+                        if (result.isFinal) {
+                            nextFinal = mergeTranscriptWithDedup(nextFinal, transcript)
+                        } else {
+                            nextInterim = mergeTranscriptWithDedup(nextInterim, transcript)
+                        }
+                    }
+
+                    browserAsrFinalTextRef.current = nextFinal
+                    browserAsrInterimTextRef.current = nextInterim
+                    const mergedText = mergeTranscriptWithDedup(nextFinal, nextInterim)
+                    if (!mergedText) {
+                        return
+                    }
+
+                    setUserAnswer(mergedText)
+                    setAnswerSessionStatus(nextInterim ? 'recording' : 'paused_short')
+                }
+                recognition.onerror = (event: SpeechRecognitionErrorEventLike) => {
+                    console.error('[ASR] 浏览器识别失败:', event.error, event.message || '')
+                    browserAsrActiveRef.current = false
+                    if (event.error !== 'aborted') {
+                        const fatalBrowserAsrErrors = new Set([
+                            'network',
+                            'not-allowed',
+                            'service-not-allowed',
+                            'audio-capture',
+                        ])
+                        const fallbackMessage = event.error === 'network'
+                            ? '浏览器语音识别网络不可达，请使用文字回答。'
+                            : '浏览器语音识别不可用，请改用文字回答。'
+                        if (fatalBrowserAsrErrors.has(event.error)) {
+                            browserAsrStopRequestedRef.current = true
+                            setBrowserAsrAvailability(false, fallbackMessage)
+                            if (!isServerAsrAvailableRef.current) {
+                                stopAudioRecording()
+                            }
+                        } else {
+                            setAsrStatusMessage(fallbackMessage)
+                        }
+                    }
+                }
+                recognition.onend = () => {
+                    browserAsrActiveRef.current = false
+                    if (
+                        !browserAsrStopRequestedRef.current
+                        && interviewStartedRef.current
+                        && isRecordingRef.current
+                        && !isAiSpeakingRef.current
+                        && (!isServerAsrAvailableRef.current || Date.now() >= serverAsrMuteUntilRef.current)
+                    ) {
+                        setTimeout(() => {
+                            startBrowserSpeechRecognition()
+                        }, 150)
+                    }
+                }
+
+                browserAsrRecognitionRef.current = recognition
+            } catch {
+                // 预创建失败不影响正常使用，startBrowserSpeechRecognition 会兜底创建
+            }
+        }
+
+        return () => {
+            try {
+                const r = browserAsrRecognitionRef.current
+                if (r) {
+                    r.stop()
+                }
+            } catch {}
+            browserAsrRecognitionRef.current = null
+        }
     }, [])
 
     useEffect(() => {
@@ -1237,13 +1390,7 @@ export default function InterviewPage() {
                     const pcmData = (event.data.audio as ArrayBuffer).slice(0)
                     const rms = Number(event.data.rms || 0)
                     const now = performance.now()
-                    if (!speechActiveRef.current) {
-                        noiseFloorRef.current = clamp(
-                            noiseFloorRef.current * 0.92 + rms * 0.08,
-                            ASR_NOISE_FLOOR_MIN,
-                            ASR_NOISE_FLOOR_MAX
-                        )
-                    }
+                    enqueueSpeechPrebuffer(pcmData)
 
                     const activationThreshold = clamp(
                         noiseFloorRef.current * ASR_ACTIVATION_MULTIPLIER,
@@ -1268,10 +1415,36 @@ export default function InterviewPage() {
                         : activationThreshold
                     const speechThreshold = speechActiveRef.current ? holdThreshold : startThreshold
                     const isSpeechChunk = rms >= speechThreshold
+                    if (now - lastClientMicLevelDebugAtRef.current >= 1000) {
+                        lastClientMicLevelDebugAtRef.current = now
+                        pushLocalAsrDebugEvent('client_mic_level', {
+                            details: `rms=${rms.toFixed(5)} threshold=${speechThreshold.toFixed(5)} noise_floor=${noiseFloorRef.current.toFixed(5)} active=${String(speechActiveRef.current)} fast=${String(isFastStartWindow)}`,
+                        })
+                    }
+
+                    if (!speechActiveRef.current && inputCalibrationChunksRef.current > 0) {
+                        if (!isSpeechChunk) {
+                            inputCalibrationChunksRef.current -= 1
+                            consecutiveSpeechFramesRef.current = 0
+                            noiseFloorRef.current = clamp(
+                                noiseFloorRef.current * 0.92 + rms * 0.08,
+                                ASR_NOISE_FLOOR_MIN,
+                                ASR_NOISE_FLOOR_MAX
+                            )
+                            pushLocalAsrDebugEvent('client_input_calibrating', {
+                                details: `rms=${rms.toFixed(4)} noise_floor=${noiseFloorRef.current.toFixed(4)} remaining=${inputCalibrationChunksRef.current}`,
+                            })
+                            return
+                        }
+                        inputCalibrationChunksRef.current = 0
+                        pushLocalAsrDebugEvent('client_input_calibration_bypassed', {
+                            details: `rms=${rms.toFixed(4)} threshold=${speechThreshold.toFixed(4)} noise_floor=${noiseFloorRef.current.toFixed(4)}`,
+                        })
+                    }
+
                     const requiredSpeechFrames = isFastStartWindow
-                        ? (rms >= startThreshold * ASR_FAST_START_STRONG_MULTIPLIER ? 1 : 2)
-                        : (rms >= activationThreshold * ASR_STRONG_SPEECH_MULTIPLIER ? 2 : 3)
-                    enqueueSpeechPrebuffer(pcmData)
+                        ? 1
+                        : (rms >= activationThreshold * ASR_STRONG_SPEECH_MULTIPLIER ? 1 : 2)
 
                     if (isSpeechChunk) {
                         consecutiveSpeechFramesRef.current += 1
@@ -1314,6 +1487,13 @@ export default function InterviewPage() {
                         }
                     } else {
                         consecutiveSpeechFramesRef.current = 0
+                        if (!speechActiveRef.current) {
+                            noiseFloorRef.current = clamp(
+                                noiseFloorRef.current * 0.92 + rms * 0.08,
+                                ASR_NOISE_FLOOR_MIN,
+                                ASR_NOISE_FLOOR_MAX
+                            )
+                        }
                     }
 
                     const adaptiveSilenceMs = clamp(
@@ -1323,12 +1503,21 @@ export default function InterviewPage() {
                         MIN_ADAPTIVE_SILENCE_MS,
                         MAX_ADAPTIVE_SILENCE_MS
                     )
-                    if (speechActiveRef.current && now - lastSpeechAtRef.current >= adaptiveSilenceMs) {
+                    const transcriptStallMs = speechActiveRef.current && asrChannelRef.current === 'server'
+                        ? Date.now() - lastServerTranscriptAtRef.current
+                        : 0
+                    const silenceMs = now - lastSpeechAtRef.current
+                    const shouldEndForEnergySilence = speechActiveRef.current && silenceMs >= adaptiveSilenceMs
+                    const shouldEndForTranscriptStall = speechActiveRef.current
+                        && asrChannelRef.current === 'server'
+                        && transcriptStallMs >= CLIENT_ASR_TRANSCRIPT_STALL_END_MS
+
+                    if (shouldEndForEnergySilence || shouldEndForTranscriptStall) {
                         speechActiveRef.current = false
                         if (isServerAsrAvailableRef.current && asrChannelRef.current === 'server' && activeSpeechEpochRef.current > 0) {
                             pushLocalAsrDebugEvent('client_speech_end_emit', {
                                 speech_epoch: activeSpeechEpochRef.current,
-                                details: `silence_ms=${Math.round(now - lastSpeechAtRef.current)} channel=server`,
+                                details: `reason=${shouldEndForTranscriptStall ? 'transcript_stall' : 'energy_silence'} silence_ms=${Math.round(silenceMs)} transcript_stall_ms=${Math.round(transcriptStallMs)} channel=server`,
                             })
                             socketRef.current.emit('speech_end', {
                                 session_id: sessionIdRef.current,
@@ -1392,10 +1581,16 @@ export default function InterviewPage() {
         }
         if (!audioWorkletNodeRef.current) {
             console.warn('[ASR] audioWorkletNodeRef 为空')
+            pushLocalAsrDebugEvent('client_recording_start_blocked', {
+                details: 'audioWorkletNodeRef is empty',
+            })
             return
         }
         if (!interviewStartedRef.current) {
             console.warn('[ASR] interviewStartedRef 为 false')
+            pushLocalAsrDebugEvent('client_recording_start_blocked', {
+                details: 'interviewStartedRef is false',
+            })
             return
         }
 
@@ -1405,6 +1600,8 @@ export default function InterviewPage() {
 
         isRecordingRef.current = true
         asrChannelRef.current = 'none'
+        lastClientMicLevelDebugAtRef.current = 0
+        resetAsrInputCalibration()
         setIsRecording(true)
         setIsListening(true)
         pushLocalAsrDebugEvent('client_recording_started', {
@@ -1457,6 +1654,7 @@ export default function InterviewPage() {
         consecutiveSpeechFramesRef.current = 0
         activeSpeechEpochRef.current = 0
         fastStartUntilRef.current = 0
+        inputCalibrationChunksRef.current = ASR_INPUT_CALIBRATION_CHUNKS
         asrChannelRef.current = 'none'
         clearSpeechPrebuffer()
         isRecordingRef.current = false
@@ -1501,6 +1699,10 @@ export default function InterviewPage() {
             socketClient.off('tts_chunk')
             socketClient.off('tts_done')
             socketClient.off('tts_stop')
+            socketClient.off('connect')
+            socketClient.off('disconnect')
+            socketClient.off('session_resumed')
+            socketClient.off('session_resume_failed')
             socketClient.off('session_control_notice')
             socketClient.off('pipeline_error')
             socketClient.off('error')
@@ -1563,6 +1765,50 @@ export default function InterviewPage() {
                     stopCurrentTts()
                     stopAudioRecording()
                 }
+            })
+
+            socketClient.on('connect', () => {
+                if (!interviewStartedRef.current || !sessionIdRef.current) {
+                    return
+                }
+                socketClient.emit('session_resume', {
+                    session_id: sessionIdRef.current,
+                })
+            })
+
+            socketClient.on('disconnect', (reason: any) => {
+                console.warn('[Interview] Socket disconnected:', reason)
+                if (!interviewStartedRef.current) return
+                setIsProcessing(true)
+                stopAudioRecording()
+            })
+
+            socketClient.on('session_resumed', (data: any) => {
+                if (!data?.session_id || data.session_id !== sessionIdRef.current) return
+                if (data?.turn_id) {
+                    currentTurnIdRef.current = data.turn_id
+                }
+                if (typeof data?.interrupt_epoch === 'number') {
+                    interruptEpochRef.current = data.interrupt_epoch
+                }
+                if (data?.current_question) {
+                    setCurrentQuestion(String(data.current_question))
+                }
+                interviewStartedRef.current = true
+                setInterviewStarted(true)
+                setIsProcessing(false)
+            })
+
+            socketClient.on('session_resume_failed', (data: any) => {
+                if (data?.session_id && data.session_id !== sessionIdRef.current) return
+                console.warn('[Interview] Session resume failed:', data)
+                setIsProcessing(false)
+                setInterviewStarted(false)
+                interviewStartedRef.current = false
+                sessionIdRef.current = ''
+                currentTurnIdRef.current = ''
+                stopCurrentTts()
+                stopAudioRecording()
             })
 
             socketClient.on('dialog_reply', (data: any) => {
@@ -1637,7 +1883,7 @@ export default function InterviewPage() {
 
                 const displayText = data?.display_text || data?.final_text || data?.live_text || data?.merged_text_draft || ''
                 if (typeof displayText === 'string' && asrChannelRef.current !== 'browser') {
-                    setUserAnswer(displayText)
+                    setUserAnswer(squashStutterText(displayText))
                 }
 
                 if (['finalizing', 'finalized'].includes(data?.status || '')) {
@@ -1675,7 +1921,7 @@ export default function InterviewPage() {
                 }
                 const partialDisplayText = data?.full_text || data?.text || ''
                 if (!answerSessionIdRef.current && partialDisplayText && asrChannelRef.current !== 'browser') {
-                    setUserAnswer(normalizeTranscript(partialDisplayText))
+                    setUserAnswer(squashStutterText(partialDisplayText))
                 }
             })
 
@@ -1691,7 +1937,7 @@ export default function InterviewPage() {
                 }
                 const finalDisplayText = data?.full_text || data?.preview_text || data?.text || ''
                 if (!answerSessionIdRef.current && finalDisplayText && asrChannelRef.current !== 'browser') {
-                    setUserAnswer(normalizeTranscript(finalDisplayText))
+                    setUserAnswer(squashStutterText(finalDisplayText))
                 }
             })
 
@@ -1816,6 +2062,7 @@ export default function InterviewPage() {
                 setIsProcessing(false)
                 setIsEndingInterview(false)
                 if (data?.code === 'TTS_SYNTH_FAIL') {
+                    ttsDoneSignaledRef.current = true
                     const shouldFallbackToBrowser =
                         pendingTtsTextRef.current
                         && !receivedServerChunkForCurrentSpeakRef.current
@@ -1826,6 +2073,9 @@ export default function InterviewPage() {
                         playBrowserTts(pendingTtsTextRef.current)
                     } else {
                         console.warn('[TTS] 服务端已开始输出，禁止浏览器语音兜底以避免重复播报')
+                        if (!currentTtsAudioRef.current && ttsAudioQueueRef.current.length === 0) {
+                            finalizeCurrentTtsPlayback()
+                        }
                     }
                 } else {
                     stopCurrentTts()
@@ -1917,7 +2167,8 @@ export default function InterviewPage() {
         activeSpeechEpochRef.current = 0
         speechActiveRef.current = false
         asrChannelRef.current = 'none'
-        noiseFloorRef.current = 0.004
+        noiseFloorRef.current = 0.0015
+        inputCalibrationChunksRef.current = ASR_INPUT_CALIBRATION_CHUNKS
         serverAsrMuteUntilRef.current = 0
         clearSpeechPrebuffer()
         setServerAsrAvailability(true)
@@ -1956,18 +2207,9 @@ export default function InterviewPage() {
     }
 
     const handleStartInterview = () => {
-        if (!socket) return
+        if (!socket || !cameraReady || interviewStartedRef.current) return
         startInterviewSession(socket)
     }
-
-    useEffect(() => {
-        if (!cameraReady || !socket || interviewStarted || showCompletionModal || autoStartTriggeredRef.current) {
-            return
-        }
-
-        autoStartTriggeredRef.current = true
-        startInterviewSession(socket)
-    }, [cameraReady, socket, interviewStarted, showCompletionModal])
 
     const requestSessionEnd = async (socketClient: SocketClient, endedSessionId: string) => {
         clearLlmTimeout()
@@ -2670,11 +2912,19 @@ export default function InterviewPage() {
             <div className="mx-auto flex h-full max-w-3xl items-center justify-center">
                 <section className="w-full rounded-2xl border border-[#E5E5E5] bg-white p-5 shadow-sm sm:p-6">
                     <div className="mb-4 flex items-center gap-3 text-[#111111]">
-                        <Loader2 className="h-5 w-5 animate-spin" />
-                        <h2 className="text-lg font-semibold">正在进入面试场景</h2>
+                        {cameraReady && socket ? (
+                            <ArrowRight className="h-5 w-5" />
+                        ) : (
+                            <Loader2 className="h-5 w-5 animate-spin" />
+                        )}
+                        <h2 className="text-lg font-semibold">
+                            {cameraReady && socket ? '准备开始面试' : '正在准备面试场景'}
+                        </h2>
                     </div>
                     <p className="text-sm leading-6 text-[#666666]">
-                        系统正在连接面试会话与实时识别通道，请稍候。
+                        {cameraReady && socket
+                            ? '摄像头与实时通道已就绪。点击开始后，面试官才会开场提问。'
+                            : '系统正在连接实时通道并申请摄像头权限，请稍候。'}
                     </p>
                     <div className="mt-4 grid gap-2 rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] p-3 text-xs text-[#666666] sm:grid-cols-3">
                         <div>面试轮次：<span className="font-medium text-[#111111]">{interviewConfig.roundName}</span></div>
@@ -2693,7 +2943,7 @@ export default function InterviewPage() {
                             disabled={!cameraReady || !socket}
                             className="inline-flex items-center gap-2 rounded-lg bg-[#111111] px-4 py-2 text-sm font-medium text-white hover:bg-[#222222] disabled:cursor-not-allowed disabled:bg-[#cbc5b9]"
                         >
-                            立即重试连接
+                            开始面试
                             <ArrowRight className="h-4 w-4" />
                         </button>
                     </div>

@@ -185,7 +185,7 @@ export default function InterviewSetupPage() {
                     }, 1200)
                 } else {
                     setServiceWarmupStatus('warming')
-                    setServiceWarmupText('服务仍在后台预热中，可直接开始面试。')
+                    setServiceWarmupText('服务仍在后台预热中，请稍候...')
                 }
             } catch (error) {
                 if (cancelled) {
@@ -243,7 +243,7 @@ export default function InterviewSetupPage() {
         }
     }, [])
 
-    const isReady = cameraStatus === 'ok'
+    const isReady = cameraStatus === 'ok' && serviceWarmupStatus !== 'idle' && serviceWarmupStatus !== 'warming'
 
     const handleStartInterview = () => {
         if (!isReady || isStarting) {

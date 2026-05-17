@@ -89,7 +89,7 @@ function LoginPageContent() {
     return (
         <div className="min-h-screen bg-[var(--background)] lg:grid lg:grid-cols-[1.05fr_0.95fr]">
             <section className="hidden border-r border-[var(--border)] bg-[var(--surface)] lg:flex lg:flex-col lg:justify-between lg:p-12">
-                <div className="text-xl font-serif italic font-medium text-[var(--ink)]">PanelMind</div>
+                <div className="text-xl font-serif italic font-medium text-[var(--ink)]">职跃星辰</div>
 
                 <div className="max-w-xl space-y-6">
                     <h1 className="font-serif text-5xl leading-[1.08] tracking-tight text-[var(--ink)]">
@@ -98,18 +98,18 @@ function LoginPageContent() {
                         进入真实面试状态。
                     </h1>
                     <p className="max-w-lg text-lg leading-8 text-[var(--ink-muted)]">
-                        PanelMind 为候选人提供结构化模拟面试、即时评分报告与逐题复盘，
+                        职跃星辰 为候选人提供结构化模拟面试、即时评分报告与逐题复盘，
                         帮你把每一轮练习都沉淀成可追踪的提升。
                     </p>
                 </div>
 
-                <div className="text-sm text-[var(--ink-lighter)]">© 2026 PanelMind</div>
+                <div className="text-sm text-[var(--ink-lighter)]">© 2026 职跃星辰</div>
             </section>
 
             <section className="flex items-center justify-center px-6 py-10 sm:px-8 lg:px-12">
                 <div className="w-full max-w-md rounded-[32px] border border-[var(--border)] bg-[var(--surface)] p-8 shadow-[0_24px_80px_rgba(17,17,17,0.06)] sm:p-10">
                     <div className="space-y-4">
-                        <div className="text-xl font-serif italic font-medium text-[var(--ink)] lg:hidden">PanelMind</div>
+                        <div className="text-xl font-serif italic font-medium text-[var(--ink)] lg:hidden">职跃星辰</div>
 
                         <div className="inline-flex rounded-xl border border-[var(--border)] bg-[var(--background)] p-1">
                             <button
@@ -130,7 +130,7 @@ function LoginPageContent() {
 
                         <div className="space-y-2">
                             <h2 className="text-3xl font-semibold tracking-tight text-[var(--ink)]">
-                                {mode === 'register' ? '注册 PanelMind 账号' : '登录 PanelMind'}
+                                {mode === 'register' ? '注册 职跃星辰 账号' : '登录 职跃星辰'}
                             </h2>
                             <p className="text-sm leading-6 text-[var(--ink-muted)]">
                                 {mode === 'register' ? '注册后可直接进入你的工作台与面试训练空间。' : '登录后继续进入你的工作台与面试训练空间。'}
@@ -138,7 +138,7 @@ function LoginPageContent() {
                             {mode === 'login' ? (
                                 <div className="rounded-xl border border-[var(--accent)]/30 bg-[var(--accent)]/5 px-4 py-3 text-xs text-[var(--ink-muted)]">
                                     <span className="font-medium text-[var(--ink)]">演示账号：</span>
-                                    <span className="tabular-nums">admin@panelmind.cn / PanelMind123</span>
+                                    <span className="tabular-nums">admin@zhiyuexingchen.cn / 职跃星辰123</span>
                                 </div>
                             ) : null}
                         </div>

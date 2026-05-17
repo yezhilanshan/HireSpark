@@ -30,3 +30,17 @@ export const getBackendBaseUrl = (): string => {
 
     return `http://${DEFAULT_SERVER_BACKEND_HOST}:${DEFAULT_BACKEND_PORT}`
 }
+
+export function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = 10000): Promise<Response> {
+    const controller = new AbortController()
+    const setTimeoutFn = typeof window !== 'undefined' ? window.setTimeout : setTimeout
+    const clearTimeoutFn = typeof window !== 'undefined' ? window.clearTimeout : clearTimeout
+    const timer = setTimeoutFn(() => controller.abort(), Math.max(1000, timeoutMs))
+
+    return fetch(input, {
+        ...init,
+        signal: init.signal || controller.signal,
+    }).finally(() => {
+        clearTimeoutFn(timer)
+    })
+}

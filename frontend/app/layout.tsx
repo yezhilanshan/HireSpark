@@ -28,13 +28,13 @@ export const viewport: Viewport = {
 }
 
 export const metadata: Metadata = {
-    title: 'PanelMind',
+    title: '职跃星辰',
     description: '岗位化 AI 模拟面试与能力提升平台',
     manifest: '/manifest.json',
     appleWebApp: {
         capable: true,
         statusBarStyle: 'black-translucent',
-        title: 'PanelMind',
+        title: '职跃星辰',
     },
     icons: {
         icon: '/icons/icon-192.png',

@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
-import { Bot, Loader2, Send, Sparkles, X } from 'lucide-react'
+import { Bot, Loader2, MessageCircle, Send, X } from 'lucide-react'
 import { usePathname } from 'next/navigation'
 import { getBackendBaseUrl } from '@/lib/backend'
 import MarkdownMessage from '@/components/MarkdownMessage'
@@ -39,6 +39,7 @@ export default function AssistantFloatingChat() {
     const [sending, setSending] = useState(false)
     const [error, setError] = useState('')
     const listBottomRef = useRef<HTMLDivElement | null>(null)
+    const textareaRef = useRef<HTMLTextAreaElement | null>(null)
 
     const loadAuth = async () => {
         const response = await fetch('/api/auth/me', { cache: 'no-store' })
@@ -71,50 +72,6 @@ export default function AssistantFloatingChat() {
         const currentConversationId = await createConversation(currentUserId)
         return { currentUserId, currentConversationId }
     }
-
-    const sendMessageLegacy = async () => {
-        const content = input.trim()
-        if (!content || sending) return
-
-        setSending(true)
-        setError('')
-
-        const optimisticId = `local_${Date.now()}`
-        setMessages((prev) => [...prev, { id: optimisticId, role: 'user', content }])
-        setInput('')
-
-        try {
-            const { currentUserId, currentConversationId } = await ensureConversation()
-            const response = await fetch(
-                `${BACKEND_API_BASE}/api/assistant/conversations/${encodeURIComponent(currentConversationId)}/messages`,
-                {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        user_id: currentUserId,
-                        message: content,
-                        temperature: 0.25,
-                    }),
-                }
-            )
-            const data = await response.json().catch(() => ({}))
-            if (!response.ok || !data?.success) {
-                throw new Error(data?.message || data?.error || '发送失败。')
-            }
-
-            const assistantContent = String(data?.assistant_message?.content || '').trim()
-            if (assistantContent) {
-                setMessages((prev) => [...prev, { id: `assistant_${Date.now()}`, role: 'assistant', content: assistantContent }])
-            }
-        } catch (sendError) {
-            setError(sendError instanceof Error ? sendError.message : '发送失败。')
-            setMessages((prev) => prev.filter((item) => item.id !== optimisticId))
-        } finally {
-            setSending(false)
-        }
-    }
-
-    void sendMessageLegacy
 
     const patchPendingMessageContent = (pendingMessageId: string, content: string) => {
         setMessages((prev) =>
@@ -359,6 +316,13 @@ export default function AssistantFloatingChat() {
         }
     }
 
+    const adjustTextareaHeight = () => {
+        const textarea = textareaRef.current
+        if (!textarea) return
+        textarea.style.height = 'auto'
+        textarea.style.height = `${Math.min(textarea.scrollHeight, 120)}px`
+    }
+
     useEffect(() => {
         if (isAssistantPage) return
         void loadAuth().catch(() => setUserId('default'))
@@ -368,6 +332,10 @@ export default function AssistantFloatingChat() {
         listBottomRef.current?.scrollIntoView({ behavior: 'smooth' })
     }, [messages, sending, open])
 
+    useEffect(() => {
+        adjustTextareaHeight()
+    }, [input])
+
     if (isAssistantPage) {
         return null
     }
@@ -375,63 +343,87 @@ export default function AssistantFloatingChat() {
     return (
         <>
             {open ? (
-                <section className="fixed bottom-20 right-4 z-50 flex h-[760px] max-h-[86vh] w-[min(380px,calc(100vw-2rem))] flex-col overflow-hidden rounded-2xl border border-[#D8E6DE] bg-white shadow-2xl">
-                    <header className="flex items-center justify-between border-b border-[#EAE7DD] bg-[#F6FBF8] px-4 py-3">
-                        <div className="flex items-center gap-2">
-                            <span className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-emerald-200 bg-emerald-50 text-emerald-700">
-                                <Bot className="h-4 w-4" />
-                            </span>
+                <section className="fixed bottom-20 right-4 z-50 flex h-[600px] max-h-[80vh] w-[min(400px,calc(100vw-2rem))] flex-col overflow-hidden rounded-2xl border border-gray-200 bg-white shadow-2xl dark:border-gray-700 dark:bg-[#0f0f0f]">
+                    {/* Header */}
+                    <header className="flex shrink-0 items-center justify-between border-b border-gray-200 px-4 py-3 dark:border-gray-800">
+                        <div className="flex items-center gap-2.5">
+                            <div className="flex h-8 w-8 items-center justify-center rounded-full bg-gradient-to-br from-emerald-400 to-teal-600">
+                                <Bot className="h-4 w-4 text-white" />
+                            </div>
                             <div>
-                                <p className="text-sm font-semibold text-[#111111]">AI 小助手</p>
+                                <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">AI 助手</p>
+                                <p className="text-[11px] text-gray-400 dark:text-gray-500">随时为你解答</p>
                             </div>
                         </div>
                         <button
                             type="button"
                             onClick={() => setOpen(false)}
-                            className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-[#E5E5E5] text-[#666666] transition hover:bg-white hover:text-[#111111]"
-                            aria-label="关闭小助手"
+                            className="inline-flex h-8 w-8 items-center justify-center rounded-lg text-gray-400 transition hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-300"
+                            aria-label="关闭"
                         >
                             <X className="h-4 w-4" />
                         </button>
                     </header>
 
-                    <div className="flex-1 min-h-0 space-y-3 overflow-y-auto bg-[#FCFCFA] px-4 py-4">
+                    {/* Messages */}
+                    <div className="flex-1 min-h-0 overflow-y-auto px-4 py-4">
                         {messages.length === 0 ? (
-                            <div className="rounded-xl border border-dashed border-[#D8D4CA] bg-white px-4 py-3 text-sm leading-6 text-[#666666]">
-                                你可以随时提问，使用 PanelMind 中的问题也可以直接提问哦！
+                            <div className="flex h-full flex-col items-center justify-center text-center">
+                                <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-gradient-to-br from-emerald-400 to-teal-600">
+                                    <Bot className="h-6 w-6 text-white" />
+                                </div>
+                                <p className="text-sm font-medium text-gray-700 dark:text-gray-300">有什么可以帮你的？</p>
+                                <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">输入问题即可开始对话</p>
                             </div>
                         ) : (
-                            messages.map((message) => (
-                                <div key={message.id} className={`flex ${message.role === 'assistant' ? 'justify-start' : 'justify-end'}`}>
-                                    <div
-                                        className={`max-w-[88%] rounded-2xl px-3 py-2 text-sm leading-6 ${message.role === 'assistant'
-                                            ? 'border border-[#E5E5E5] bg-white text-[#1A1A1A]'
-                                            : 'bg-[#111111] text-white'
-                                            }`}
-                                    >
+                            <div className="space-y-4">
+                                {messages.map((message) => (
+                                    <div key={message.id} className={`flex gap-2.5 ${message.role === 'user' ? 'flex-row-reverse' : ''}`}>
                                         {message.role === 'assistant' ? (
-                                            <MarkdownMessage content={message.content} className="text-inherit" />
-                                        ) : (
-                                            <div className="whitespace-pre-wrap">{message.content}</div>
-                                        )}
-                                    </div>
-                                </div>
-                            ))
-                        )}
+                                            <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-emerald-400 to-teal-600">
+                                                <Bot className="h-3.5 w-3.5 text-white" />
+                                            </div>
+                                        ) : null}
 
-                        {sending ? (
-                            <div className="flex items-center gap-2 text-xs text-[#666666]">
-                                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                                助手正在思考...
+                                        <div className={`max-w-[85%] rounded-2xl px-3.5 py-2.5 text-sm leading-6 ${
+                                            message.role === 'assistant'
+                                                ? 'bg-gray-100 text-gray-900 dark:bg-[#1e1e1e] dark:text-gray-100'
+                                                : 'bg-gray-900 text-white dark:bg-gray-700'
+                                        }`}>
+                                            {message.role === 'assistant' ? (
+                                                <MarkdownMessage content={message.content} className="text-inherit" />
+                                            ) : (
+                                                <div className="whitespace-pre-wrap">{message.content}</div>
+                                            )}
+                                        </div>
+                                    </div>
+                                ))}
+
+                                {sending ? (
+                                    <div className="flex gap-2.5">
+                                        <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-gradient-to-br from-emerald-400 to-teal-600">
+                                            <Bot className="h-3.5 w-3.5 text-white" />
+                                        </div>
+                                        <div className="inline-flex items-center gap-1.5 rounded-2xl bg-gray-100 px-3.5 py-2.5 dark:bg-[#1e1e1e]">
+                                            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-gray-400 [animation-delay:-0.3s] dark:bg-gray-500" />
+                                            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-gray-400 [animation-delay:-0.15s] dark:bg-gray-500" />
+                                            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-gray-400 dark:bg-gray-500" />
+                                        </div>
+                                    </div>
+                                ) : null}
+                                <div ref={listBottomRef} />
                             </div>
-                        ) : null}
-                        <div ref={listBottomRef} />
+                        )}
                     </div>
 
-                    <div className="border-t border-[#EAE7DD] bg-white p-3">
-                        {error ? <p className="mb-2 text-xs text-red-600">{error}</p> : null}
-                        <div className="flex items-center gap-2">
+                    {/* Input */}
+                    <div className="shrink-0 border-t border-gray-200 bg-white px-3 py-3 dark:border-gray-800 dark:bg-[#0f0f0f]">
+                        {error ? (
+                            <p className="mb-2 rounded-lg bg-red-50 px-2.5 py-1.5 text-xs text-red-600 dark:bg-red-900/20 dark:text-red-400">{error}</p>
+                        ) : null}
+                        <div className="flex items-end gap-2 rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 focus-within:border-gray-400 dark:border-gray-700 dark:bg-[#1a1a1a] dark:focus-within:border-gray-500">
                             <textarea
+                                ref={textareaRef}
                                 value={input}
                                 onChange={(event) => setInput(event.target.value)}
                                 onKeyDown={(event) => {
@@ -441,31 +433,35 @@ export default function AssistantFloatingChat() {
                                     }
                                 }}
                                 rows={1}
-                                placeholder="输入问题，回车发送"
-                                className="h-[48px] min-h-[48px] max-h-[48px] flex-1 resize-none rounded-xl border border-[#E5E5E5] bg-[#FAF9F6] px-3 py-2 text-sm text-[#111111] outline-none transition focus:border-[#111111]"
+                                placeholder="输入问题..."
+                                className="max-h-[120px] min-h-[20px] flex-1 resize-none bg-transparent text-sm leading-5 text-gray-900 outline-none placeholder:text-gray-400 dark:text-gray-100 dark:placeholder:text-gray-500"
                             />
                             <button
                                 type="button"
                                 onClick={() => void sendMessage()}
                                 disabled={!input.trim() || sending}
-                                className="inline-flex h-10 w-10 items-center justify-center rounded-xl bg-[#111111] text-white transition hover:bg-[#222222] disabled:cursor-not-allowed disabled:bg-[#B6B1A4]"
-                                aria-label="发送消息"
+                                className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-gray-900 text-white transition hover:bg-gray-700 disabled:cursor-not-allowed disabled:bg-gray-300 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-gray-200 dark:disabled:bg-gray-700"
+                                aria-label="发送"
                             >
-                                <Send className="h-4 w-4" />
+                                {sending ? (
+                                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                                ) : (
+                                    <Send className="h-3.5 w-3.5" />
+                                )}
                             </button>
                         </div>
                     </div>
                 </section>
             ) : null}
 
+            {/* Toggle button */}
             <button
                 type="button"
                 onClick={() => setOpen((prev) => !prev)}
-                className="fixed bottom-6 right-4 z-50 inline-flex items-center gap-2 rounded-xl border border-emerald-300/80 bg-white/90 px-4 py-2 text-sm font-semibold text-emerald-800 shadow-xl backdrop-blur transition hover:-translate-y-0.5 hover:bg-white"
-                aria-label="打开 AI 小助手"
+                className="fixed bottom-6 right-4 z-50 flex h-14 w-14 items-center justify-center rounded-full bg-gradient-to-br from-emerald-400 to-teal-600 text-white shadow-lg shadow-emerald-500/25 transition hover:scale-105 hover:shadow-xl hover:shadow-emerald-500/30"
+                aria-label="打开 AI 助手"
             >
-                <Sparkles className="h-4 w-4" />
-                AI 助手
+                <MessageCircle className="h-6 w-6" />
             </button>
         </>
     )

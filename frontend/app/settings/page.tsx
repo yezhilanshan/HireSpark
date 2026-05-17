@@ -46,7 +46,7 @@ export default function SettingsPage() {
                     <section className="rounded-3xl border border-[#E5E5E5] bg-[#FAF9F6] p-8 shadow-sm dark:border-[#2d3542] dark:bg-[#101217]">
                         <p className="text-xs font-medium uppercase tracking-[0.18em] text-[#999999] dark:text-[#8e98aa]">系统设置</p>
                         <h1 className="mt-2 text-3xl font-semibold tracking-tight text-[#111111] dark:text-[#f4f7fb] sm:text-4xl">
-                            PanelMind 系统设置
+                            职跃星辰 系统设置
                         </h1>
                     </section>
 

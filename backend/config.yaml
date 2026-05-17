@@ -167,7 +167,7 @@ tts:
   enabled: true
   mode: "remote"
   service_url: "http://127.0.0.1:5001"
-  timeout: 45
+  timeout: 60
 
 # ====================================
 # RAG 配置

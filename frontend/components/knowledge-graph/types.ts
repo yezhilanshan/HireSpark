@@ -27,7 +27,9 @@ export type RecentInterview = {
 
 export type GraphSummary = {
     user_name?: string
+    user_id?: string
     target_position?: string
+    graph_node_count?: number
     capability_count?: number
     strength_count?: number
     risk_count?: number

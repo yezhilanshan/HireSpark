@@ -42,10 +42,8 @@ export default function KnowledgeGraphPage() {
     const graphStats = useMemo(
         () => [
             {
-                label: '知识点总量',
-                value:
-                    summary.capability_count ??
-                    graphVisibleNodes.filter((node) => node.type === 'knowledge').length,
+                label: '图谱节点',
+                value: summary.graph_node_count ?? graphVisibleNodes.length,
                 icon: Brain,
             },
             {
@@ -68,10 +66,11 @@ export default function KnowledgeGraphPage() {
     )
 
     const graphLegend = [
-        { label: '知识点', color: 'bg-[#5B8BF7] dark:bg-[#B4BEFE]' },
+        { label: '知识/能力', color: 'bg-[#5B8BF7] dark:bg-[#B4BEFE]' },
         { label: '项目经验', color: 'bg-[#E6956F] dark:bg-[#F5C2E7]' },
         { label: '风险项', color: 'bg-[#E57A51] dark:bg-[#F38BA8]' },
         { label: '训练任务', color: 'bg-[#73A16E] dark:bg-[#94E2D5]' },
+        { label: '用户/简历', color: 'bg-[#96A2B4] dark:bg-[#A6ADC8]' },
     ]
 
     return (

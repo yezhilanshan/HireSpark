@@ -5,7 +5,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { ArrowRight, CalendarDays, FileText, Filter, Search, Tag, Timer, TrendingUp } from 'lucide-react'
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 import PersistentSidebar from '@/components/PersistentSidebar'
-import { getBackendBaseUrl } from '@/lib/backend'
+import { fetchWithTimeout, getBackendBaseUrl } from '@/lib/backend'
 import { readPageCache, writePageCache } from '@/lib/page-cache'
 
 const BACKEND_API_BASE = getBackendBaseUrl()
@@ -124,7 +124,7 @@ function formatTrendLabel(value?: string): string {
 }
 
 function deriveScore(record: InterviewRecord): number | null {
-    if (record.score_source !== 'structured_evaluation') return null
+    if (record.score_source === 'not_available' || record.score_source === 'pending') return null
     const raw = Number(record.overall_score)
     if (!Number.isFinite(raw)) return null
     return Math.max(0, Math.min(100, Number(raw.toFixed(1))))
@@ -168,7 +168,7 @@ export default function HistoryPage() {
                 }
                 setError('')
 
-                const res = await fetch(`${BACKEND_API_BASE}/api/interviews?limit=80`, { cache: 'no-store' })
+                const res = await fetchWithTimeout(`${BACKEND_API_BASE}/api/interviews?limit=80`, { cache: 'no-store' }, 10000)
                 const data: InterviewApiResult = await res.json()
                 if (!res.ok || !data.success) {
                     throw new Error(data.error || '加载历史记录失败')

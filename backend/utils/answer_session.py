@@ -19,8 +19,59 @@ _DUPLICATE_PUNCT_RE = re.compile(r"([，。！？；,.!?])\1+")
 _PUNCT_ENDINGS = "。！？!?；;"
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 _CJK_STUTTER_RUN_RE = re.compile(r"([\u4e00-\u9fff])\1{2,}")
+_CJK_DOUBLE_STUTTER_RE = re.compile(r"([\u4e00-\u9fff])\1")
 _EN_WORD_RE = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
 _DIGIT_RE = re.compile(r"\d+")
+_LEGITIMATE_CJK_REDOUBLES = {
+    "谢谢",
+    "哈哈",
+    "呵呵",
+    "嘿嘿",
+    "嗯嗯",
+    "对对",
+    "是是",
+    "好好",
+    "慢慢",
+    "天天",
+    "人人",
+    "看看",
+    "试试",
+    "想想",
+    "说说",
+    "问问",
+    "聊聊",
+    "稍稍",
+    "刚刚",
+    "明明",
+    "往往",
+    "常常",
+    "渐渐",
+    "偏偏",
+    "恰恰",
+    "仅仅",
+    "多多",
+    "少少",
+    "远远",
+    "满满",
+    "轻轻",
+    "悄悄",
+    "稳稳",
+    "再再",
+}
+_LEGITIMATE_CJK_REDOUBLE_PHRASES = (
+    "兢兢业业",
+    "勤勤恳恳",
+    "踏踏实实",
+    "清清楚楚",
+    "明明白白",
+    "方方面面",
+    "密密麻麻",
+    "条条框框",
+    "环环相扣",
+    "面面俱到",
+    "步步推进",
+    "层层递进",
+)
 _CONTINUATION_PREFIXES = (
     "然后",
     "接着",
@@ -45,10 +96,67 @@ _CONTINUATION_PREFIXES = (
 )
 
 
+def _collapse_cjk_asr_stutter(text: str) -> str:
+    """Collapse common adjacent CJK character echoes produced by streaming ASR."""
+    if not text:
+        return ""
+
+    collapsed = _CJK_STUTTER_RUN_RE.sub(r"\1", text)
+    matches = list(_CJK_DOUBLE_STUTTER_RE.finditer(collapsed))
+    if not matches:
+        return collapsed
+
+    protected_starts: set[int] = set()
+    for phrase in _LEGITIMATE_CJK_REDOUBLE_PHRASES:
+        start = collapsed.find(phrase)
+        while start >= 0:
+            end = start + len(phrase)
+            protected_starts.update(
+                match.start()
+                for match in _CJK_DOUBLE_STUTTER_RE.finditer(collapsed, start, end)
+            )
+            start = collapsed.find(phrase, start + 1)
+
+    collapse_starts: set[int] = set()
+    for index, match in enumerate(matches):
+        if match.start() in protected_starts:
+            continue
+        pair = match.group(0)
+        if pair not in _LEGITIMATE_CJK_REDOUBLES:
+            collapse_starts.add(match.start())
+            continue
+
+        prev_match = matches[index - 1] if index > 0 else None
+        next_match = matches[index + 1] if index + 1 < len(matches) else None
+        near_bad_prev = (
+            prev_match is not None
+            and match.start() - prev_match.start() <= 3
+            and prev_match.group(0) not in _LEGITIMATE_CJK_REDOUBLES
+        )
+        near_bad_next = (
+            next_match is not None
+            and next_match.start() - match.start() <= 3
+            and next_match.group(0) not in _LEGITIMATE_CJK_REDOUBLES
+        )
+        if near_bad_prev or near_bad_next:
+            collapse_starts.add(match.start())
+
+    if not collapse_starts:
+        return collapsed
+
+    def replace(match: re.Match[str]) -> str:
+        if match.start() in collapse_starts:
+            return match.group(1)
+        return match.group(0)
+
+    return _CJK_DOUBLE_STUTTER_RE.sub(replace, collapsed)
+
+
 def normalize_answer_text(text: str) -> str:
     normalized = _SPACE_RE.sub(" ", str(text or "").strip())
     normalized = normalized.replace(" ,", ",").replace(" .", ".")
     normalized = _DUPLICATE_PUNCT_RE.sub(r"\1", normalized)
+    normalized = _collapse_cjk_asr_stutter(normalized)
     return normalized.strip()
 
 
@@ -56,8 +164,7 @@ def stabilize_realtime_asr_text(text: str) -> str:
     normalized = normalize_answer_text(text)
     if not normalized:
         return ""
-    stabilized = _CJK_STUTTER_RUN_RE.sub(r"\1", normalized)
-    return normalize_answer_text(stabilized)
+    return normalize_answer_text(normalized)
 
 
 def dedupe_answer_text(text: str) -> str:
@@ -78,11 +185,17 @@ def dedupe_answer_text(text: str) -> str:
             collapsed.append(sentence)
             continue
 
-        previous = collapsed[-1]
-        if _looks_like_sentence_duplicate(previous, sentence):
-            collapsed[-1] = _prefer_more_complete_sentence(previous, sentence)
-            continue
-        collapsed.append(sentence)
+        # Check against recent sentences for duplicates (bounded scan to avoid O(n²) on long answers)
+        is_duplicate = False
+        scan_start = max(0, len(collapsed) - 20)
+        for i in range(scan_start, len(collapsed)):
+            if _looks_like_sentence_duplicate(collapsed[i], sentence):
+                collapsed[i] = _prefer_more_complete_sentence(collapsed[i], sentence)
+                is_duplicate = True
+                break
+
+        if not is_duplicate:
+            collapsed.append(sentence)
 
     return normalize_answer_text("".join(collapsed))
 
@@ -121,7 +234,7 @@ def merge_answer_text(existing_text: str, incoming_text: str) -> str:
 
 
 def _find_overlap(existing: str, incoming: str) -> int:
-    max_len = min(len(existing), len(incoming), 24)
+    max_len = min(len(existing), len(incoming), 48)
     for length in range(max_len, 1, -1):
         if existing[-length:] == incoming[:length]:
             return length
@@ -178,7 +291,7 @@ def _looks_like_sentence_duplicate(existing: str, incoming: str) -> bool:
         return True
     if left in right or right in left:
         min_len = min(len(left), len(right))
-        return min_len >= 10
+        return min_len >= 6  # 降低阈值，更容易检测短句重复
     return _looks_like_revision(left, right)
 
 
@@ -190,7 +303,7 @@ def _looks_like_revision(existing: str, incoming: str) -> bool:
 
     min_len = min(len(existing), len(incoming))
     max_len = max(len(existing), len(incoming))
-    if min_len < 12:
+    if min_len < 8:  # 降低阈值，更容易检测短句相似性
         return False
 
     prefix_len = _common_prefix_length(existing, incoming)
@@ -200,9 +313,9 @@ def _looks_like_revision(existing: str, incoming: str) -> bool:
     length_ratio = float(min_len) / float(max_len or 1)
 
     return (
-        length_ratio >= 0.58
-        and similarity >= 0.72
-        and shared_edge >= max(6, int(min_len * 0.28))
+        length_ratio >= 0.55  # 稍微降低长度比例要求
+        and similarity >= 0.68  # 稍微降低相似度要求
+        and shared_edge >= max(4, int(min_len * 0.25))  # 降低共享边要求
     )
 
 
@@ -383,7 +496,11 @@ class AnswerSession:
         return build_live_answer_text(self.merged_text_draft, self.current_partial)
 
     def to_payload(self) -> Dict[str, Any]:
-        display_text = self.final_text or self.live_text or self.merged_text_draft
+        if self.current_partial:
+            live_merged = merge_answer_text(self.merged_text_draft, self.current_partial)
+        else:
+            live_merged = self.merged_text_draft
+        display_text = self.final_text or live_merged or self.live_text or self.merged_text_draft
         return {
             "answer_session_id": self.answer_session_id,
             "question_id": self.question_id,

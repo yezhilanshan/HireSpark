@@ -214,7 +214,7 @@ export default function PersistentSidebar() {
             <div className="flex h-full flex-col">
                 <div className="flex h-16 items-center justify-between border-b border-[#E5E5E5] px-4">
                     <Link href="/dashboard" className="text-lg font-serif italic font-medium text-[#111111]">
-                        PanelMind
+                        职跃星辰
                     </Link>
                     <button
                         type="button"

@@ -99,11 +99,10 @@ class CosyVoiceProvider:
 
     def __init__(self):
         import dashscope
-        from dashscope.audio.tts_v2 import AudioFormat, SpeechSynthesizer
+        from dashscope.audio.tts_v2 import AudioFormat
 
         self.dashscope = dashscope
         self.audio_format_enum = AudioFormat
-        self.speech_synthesizer = SpeechSynthesizer
         self.model = _first_env(
             "TTS_COSYVOICE_MODEL",
             "TTS_MODEL",
@@ -114,8 +113,9 @@ class CosyVoiceProvider:
             "TTS_VOICE",
             default="Chinese_dramatic_storyteller_vv1",
         )
-        self.timeout = float(os.environ.get("TTS_COSYVOICE_TIMEOUT", "30"))
-        self.retry_count = max(int(os.environ.get("TTS_COSYVOICE_RETRIES", "1")), 0)
+        self.timeout = float(os.environ.get("TTS_COSYVOICE_TIMEOUT", "45"))
+        self.retry_count = max(int(os.environ.get("TTS_COSYVOICE_RETRIES", "2")), 0)
+        self.pool_size = max(1, min(int(os.environ.get("TTS_COSYVOICE_POOL_SIZE", "3")), 20))
         self.audio_format_name = (
             os.environ.get("TTS_COSYVOICE_FORMAT", "MP3_22050HZ_MONO_256KBPS").strip()
             or "MP3_22050HZ_MONO_256KBPS"
@@ -133,6 +133,14 @@ class CosyVoiceProvider:
         if not api_key:
             raise RuntimeError("Missing DASHSCOPE_API_KEY or BAILIAN_API_KEY for CosyVoice")
         self.dashscope.api_key = api_key
+
+        # 使用 DashScope SDK 提供的连接池，复用 WebSocket 连接，避免每次合成 ~15s 的连接开销
+        from dashscope.audio.tts_v2 import SpeechSynthesizerObjectPool
+        self._pool = SpeechSynthesizerObjectPool(max_size=self.pool_size)
+        logger.info(
+            "[TTS Service] CosyVoice connection pool initialized: size=%s, model=%s, voice=%s",
+            self.pool_size, self.model, self.voice,
+        )
 
     def _resolve_audio_format(self, format_name: str):
         candidate = format_name.strip().upper()
@@ -183,32 +191,40 @@ class CosyVoiceProvider:
             timeout_millis = None
 
         def _invoke_synthesizer() -> Any:
-            synthesizer = cast(Any, self.speech_synthesizer)(
-                model=self.model,
-                voice=selected_voice,
-                format=self.audio_format,
-            )
-            return synthesizer.call(req.text, timeout_millis=timeout_millis)
+            # 从连接池借出已建立 WebSocket 连接的 synthesizer，省去 ~15s 连接开销
+            synthesizer = self._pool.borrow_synthesizer()
+            try:
+                # 连接池返回的 synthesizer 默认 voice 可能与请求不同，需重新设置
+                synthesizer.voice = selected_voice
+                synthesizer.request.voice = selected_voice
+                return synthesizer.call(req.text, timeout_millis=timeout_millis)
+            except Exception:
+                # 出错时归还连接，让连接池自动重建
+                raise
 
+        # 总超时 = SDK 超时 + 线程调度余量，确保 asyncio 不会提前取消
+        overall_timeout = max(self.timeout + 10.0, 20.0)
         last_error: Optional[Exception] = None
         for attempt in range(self.retry_count + 1):
             try:
                 response = await asyncio.wait_for(
                     asyncio.to_thread(_invoke_synthesizer),
-                    timeout=max(self.timeout + 5.0, 10.0),
+                    timeout=overall_timeout,
                 )
                 return self._validate_audio_payload(response)
             except Exception as exc:
                 last_error = exc
                 if attempt >= self.retry_count:
                     raise
+                backoff = min(1.0 * (2 ** attempt), 5.0)
                 logger.warning(
-                    "[TTS Service] CosyVoice synthesis attempt %s/%s failed, retrying: %s",
+                    "[TTS Service] CosyVoice attempt %s/%s failed, retrying in %.1fs: %s",
                     attempt + 1,
                     self.retry_count + 1,
+                    backoff,
                     str(exc)[:180],
                 )
-                await asyncio.sleep(0.2 * (attempt + 1))
+                await asyncio.sleep(backoff)
 
         if last_error is not None:
             raise last_error
@@ -222,6 +238,7 @@ class CosyVoiceProvider:
             "format": self.audio_format.name,
             "timeout": self.timeout,
             "retries": self.retry_count,
+            "pool_size": self.pool_size,
             "media_type": self.media_type,
         }
 

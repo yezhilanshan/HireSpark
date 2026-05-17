@@ -97,6 +97,105 @@ class _StubLLMScored:
         }
 
 
+class _StubLLMAtomic:
+    enabled = True
+    model = "mock-atomic"
+
+    def evaluate_answer_with_rubric(self, **kwargs):
+        atomic_points = ((kwargs.get("scoring_rubric") or {}).get("atomic_points") or [])
+        statuses = ["hit", "partial", "miss"]
+        point_judgements = []
+        for index, point in enumerate(atomic_points):
+            point_judgements.append({
+                "point_id": point.get("id"),
+                "status": statuses[index % len(statuses)],
+                "confidence": 0.9,
+                "quote": "底层是数组+链表+红黑树",
+                "reason": "atomic judgement",
+            })
+
+        return {
+            "rubric_eval": {
+                "basic_match": 100,
+                "good_match": 100,
+                "excellent_match": 100,
+                "final_level": "excellent",
+                "confidence": 0.9,
+                "reason": "semantic baseline only",
+            },
+            "point_judgements": point_judgements,
+            "dimension_scores": {
+                "technical_accuracy": {"score": 99, "reason": "over-optimistic semantic score"},
+                "knowledge_depth": {"score": 99, "reason": "over-optimistic semantic score"},
+                "completeness": {"score": 99, "reason": "over-optimistic semantic score"},
+                "logic": {"score": 99, "reason": "semantic fallback dimension"},
+                "job_match": {"score": 99, "reason": "semantic fallback dimension"},
+            },
+            "overall_score": 99,
+            "summary": {"strengths": [], "weaknesses": [], "next_actions": []},
+        }
+
+
+class _StubLLMAtomicInvalidQuote:
+    enabled = True
+    model = "mock-atomic-invalid-quote"
+
+    def evaluate_answer_with_rubric(self, **kwargs):
+        atomic_points = ((kwargs.get("scoring_rubric") or {}).get("atomic_points") or [])
+        return {
+            "rubric_eval": {"basic_match": 100, "good_match": 0, "excellent_match": 0, "final_level": "basic", "confidence": 0.9, "reason": ""},
+            "point_judgements": [
+                {
+                    "point_id": point.get("id"),
+                    "status": "hit",
+                    "confidence": 0.9,
+                    "quote": "这句话不在回答里",
+                    "reason": "invalid quote fixture",
+                }
+                for point in atomic_points
+            ],
+            "dimension_scores": {
+                "technical_accuracy": {"score": 95, "reason": "semantic baseline"},
+                "knowledge_depth": {"score": 95, "reason": "semantic baseline"},
+                "completeness": {"score": 95, "reason": "semantic baseline"},
+                "logic": {"score": 95, "reason": "semantic baseline"},
+                "job_match": {"score": 95, "reason": "semantic baseline"},
+            },
+            "overall_score": 95,
+            "summary": {"strengths": [], "weaknesses": [], "next_actions": []},
+        }
+
+
+class _StubLLMAtomicCoreContradict:
+    enabled = True
+    model = "mock-atomic-core-contradict"
+
+    def evaluate_answer_with_rubric(self, **kwargs):
+        atomic_points = ((kwargs.get("scoring_rubric") or {}).get("atomic_points") or [])
+        point_judgements = []
+        for index, point in enumerate(atomic_points):
+            point_judgements.append({
+                "point_id": point.get("id"),
+                "status": "contradict" if index == 0 else "hit",
+                "confidence": 0.95,
+                "quote": "HashMap 是线程安全的" if index == 0 else "底层是数组",
+                "reason": "core contradiction fixture",
+            })
+        return {
+            "rubric_eval": {"basic_match": 100, "good_match": 100, "excellent_match": 100, "final_level": "excellent", "confidence": 0.95, "reason": ""},
+            "point_judgements": point_judgements,
+            "dimension_scores": {
+                "technical_accuracy": {"score": 99, "reason": "semantic baseline"},
+                "knowledge_depth": {"score": 99, "reason": "semantic baseline"},
+                "completeness": {"score": 99, "reason": "semantic baseline"},
+                "logic": {"score": 99, "reason": "semantic baseline"},
+                "job_match": {"score": 99, "reason": "semantic baseline"},
+            },
+            "overall_score": 99,
+            "summary": {"strengths": [], "weaknesses": [], "next_actions": []},
+        }
+
+
 class _StubRAGSkipped:
     enabled = True
 
@@ -410,6 +509,130 @@ class EvaluationServiceTestCase(unittest.TestCase):
             self.assertEqual(evaluation_v2.get("schema_version"), "evaluation_v2.1")
             self.assertIn("fusion", evaluation_v2)
             self.assertIsNotNone((evaluation_v2.get("fusion") or {}).get("overall_score"))
+        finally:
+            eval_service.shutdown()
+
+    def test_atomic_rubric_points_are_built_from_legacy_rubric(self):
+        eval_service = EvaluationService(
+            db_manager=self.db,
+            rag_service=_StubRAG(),
+            llm_manager=_StubLLMDisabled(),
+        )
+        try:
+            points = eval_service.build_atomic_rubric_points(
+                scoring_rubric={"basic": ["基础点"], "good": ["完整覆盖边界"], "excellent": ["深入原理和权衡"]},
+                layer1_result={},
+                round_type="technical",
+            )
+            self.assertEqual(len(points), 3)
+            self.assertEqual(points[0]["level"], "basic")
+            self.assertEqual(points[0]["dimension"], "technical_accuracy")
+            self.assertEqual(points[1]["dimension"], "completeness")
+            self.assertEqual(points[2]["dimension"], "knowledge_depth")
+            self.assertTrue(all(point.get("id") for point in points))
+            self.assertTrue(all(float(point.get("weight") or 0.0) > 0.0 for point in points))
+        finally:
+            eval_service.shutdown()
+
+    def test_layer2_uses_atomic_rule_scores_when_point_judgements_exist(self):
+        eval_service = EvaluationService(
+            db_manager=self.db,
+            rag_service=_StubRAG(),
+            llm_manager=_StubLLMAtomic(),
+        )
+        try:
+            payload = {
+                "interview_id": "i_atomic_001",
+                "turn_id": "turn_1",
+                "question_id": "q_atomic_1",
+                "round_type": "technical",
+                "position": "java_backend",
+                "question": "HashMap 原理？",
+                "answer": "底层是数组+链表+红黑树。",
+                "prompt_version": "v1",
+            }
+            layer1 = _StubRAG().evaluate_layer1(question_id="q_atomic_1")
+            layer2 = eval_service.evaluate_layer2(payload, layer1)
+
+            self.assertEqual((layer2.get("rubric_scoring") or {}).get("mode"), "atomic_rubric_rules_v1")
+            self.assertEqual(len(layer2.get("atomic_rubric_points") or []), 3)
+            self.assertEqual(len(layer2.get("point_judgements") or []), 3)
+
+            self.assertAlmostEqual(layer2["final_dimension_scores"]["technical_accuracy"]["score"], 100.0, places=2)
+            self.assertAlmostEqual(layer2["final_dimension_scores"]["completeness"]["score"], 55.0, places=2)
+            self.assertAlmostEqual(layer2["final_dimension_scores"]["knowledge_depth"]["score"], 0.0, places=2)
+            self.assertAlmostEqual(layer2["final_dimension_scores"]["logic"]["score"], 99.0, places=2)
+            self.assertAlmostEqual(layer2["overall_score_final"], 70.6, places=2)
+
+            rubric_eval = layer2.get("rubric_eval") or {}
+            self.assertAlmostEqual(float(rubric_eval.get("basic_match") or 0.0), 100.0, places=2)
+            self.assertAlmostEqual(float(rubric_eval.get("good_match") or 0.0), 55.0, places=2)
+            self.assertAlmostEqual(float(rubric_eval.get("excellent_match") or 0.0), 0.0, places=2)
+            self.assertEqual(rubric_eval.get("final_level"), "basic")
+        finally:
+            eval_service.shutdown()
+
+    def test_atomic_quote_validation_marks_invalid_quotes_and_lowers_confidence(self):
+        eval_service = EvaluationService(
+            db_manager=self.db,
+            rag_service=_StubRAG(),
+            llm_manager=_StubLLMAtomicInvalidQuote(),
+        )
+        try:
+            payload = {
+                "interview_id": "i_atomic_quote_001",
+                "turn_id": "turn_1",
+                "question_id": "q_atomic_quote_1",
+                "round_type": "technical",
+                "position": "java_backend",
+                "question": "HashMap 原理？",
+                "answer": "底层是数组+链表+红黑树。",
+                "prompt_version": "v1",
+            }
+            layer2 = eval_service.evaluate_layer2(payload, _StubRAG().evaluate_layer1(question_id="q_atomic_quote_1"))
+            scoring = layer2.get("rubric_scoring") or {}
+            quote_validation = scoring.get("quote_validation") or {}
+
+            self.assertEqual(quote_validation.get("checked"), 3)
+            self.assertEqual(quote_validation.get("invalid"), 3)
+            self.assertEqual(quote_validation.get("valid"), 0)
+            self.assertLess(float((layer2.get("rubric_eval") or {}).get("confidence") or 1.0), 0.6)
+            first_judgement = (layer2.get("point_judgements") or [])[0]
+            self.assertFalse(first_judgement.get("quote_valid"))
+            self.assertAlmostEqual(float(first_judgement.get("confidence") or 0.0), 0.495, places=3)
+            tech_evidence = ((layer2.get("final_dimension_scores") or {}).get("technical_accuracy") or {}).get("evidence") or {}
+            self.assertEqual(tech_evidence.get("source_quotes"), [])
+        finally:
+            eval_service.shutdown()
+
+    def test_atomic_core_contradiction_applies_score_caps(self):
+        eval_service = EvaluationService(
+            db_manager=self.db,
+            rag_service=_StubRAG(),
+            llm_manager=_StubLLMAtomicCoreContradict(),
+        )
+        try:
+            payload = {
+                "interview_id": "i_atomic_cap_001",
+                "turn_id": "turn_1",
+                "question_id": "q_atomic_cap_1",
+                "round_type": "technical",
+                "position": "java_backend",
+                "question": "HashMap 是否线程安全？",
+                "answer": "HashMap 是线程安全的，底层是数组。",
+                "prompt_version": "v1",
+            }
+            layer2 = eval_service.evaluate_layer2(payload, _StubRAG().evaluate_layer1(question_id="q_atomic_cap_1"))
+            scoring = layer2.get("rubric_scoring") or {}
+            caps = scoring.get("core_error_caps") or {}
+
+            self.assertTrue(caps.get("applied"))
+            self.assertEqual(caps.get("overall_cap"), 65.0)
+            self.assertLessEqual(float(layer2.get("overall_score_final") or 0.0), 65.0)
+            self.assertLessEqual(float(layer2["final_dimension_scores"]["technical_accuracy"]["score"]), 55.0)
+            score_cap = ((layer2["final_dimension_scores"]["technical_accuracy"].get("evidence") or {}).get("score_cap") or {})
+            self.assertTrue(score_cap.get("applied"))
+            self.assertEqual(score_cap.get("reason"), "core_point_contradiction")
         finally:
             eval_service.shutdown()
 

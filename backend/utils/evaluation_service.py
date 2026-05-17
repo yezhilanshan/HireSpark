@@ -130,6 +130,7 @@ class EvaluationService:
         )
         self._inflight_lock = threading.Lock()
         self._inflight_task_keys = set()
+        self._completion_callbacks: list = []
 
     @staticmethod
     def _json_dumps(value: Any) -> str:
@@ -330,6 +331,7 @@ class EvaluationService:
             "axis_weights": dict(self.AXIS_WEIGHTS),
             "layer_weights": dict(self.LAYER_WEIGHTS),
             "shortboard_rule": shortboard_rule,
+            "rubric_scoring_version": "atomic_rubric_rules_v1",
             "speech_gate": {
                 "min_audio_ms": self.SPEECH_GATE_MIN_AUDIO_MS,
                 "min_tokens": self.SPEECH_GATE_MIN_TOKENS,
@@ -362,6 +364,7 @@ class EvaluationService:
             evidence = dim_payload.get("evidence") if isinstance(dim_payload.get("evidence"), dict) else {}
             normalized[dim_key] = {
                 "score": self._clamp_score(dim_payload.get("score", 0.0)),
+                "confidence": self._clamp_unit(dim_payload.get("confidence"), default=0.0),
                 "reason": reason,
                 "evidence": {
                     "hit_rubric_points": list(evidence.get("hit_rubric_points") or []),
@@ -371,6 +374,415 @@ class EvaluationService:
                 },
             }
         return normalized
+
+    def _quote_matches_answer(self, quote: str, answer_text: str) -> bool:
+        quote_text = self._sanitize_text(quote)
+        answer = self._sanitize_text(answer_text)
+        if not quote_text or not answer:
+            return False
+        if quote_text in answer:
+            return True
+        compact_quote = re.sub(r"\s+", "", quote_text).lower()
+        compact_answer = re.sub(r"\s+", "", answer).lower()
+        return bool(compact_quote and compact_quote in compact_answer)
+
+    @staticmethod
+    def _slugify_point_id(text: str, fallback: str) -> str:
+        raw = str(text or "").strip().lower()
+        tokens = re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", raw)
+        if not tokens:
+            return fallback
+        compact = "_".join(tokens)[:48].strip("_")
+        return compact or fallback
+
+    def _infer_atomic_dimension(self, text: str, round_type: str, level: str, index: int) -> str:
+        dimensions = self.ROUND_DIMENSIONS.get(round_type, self.ROUND_DIMENSIONS["technical"])
+        content = self._sanitize_text(text)
+        if not dimensions:
+            return "technical_accuracy"
+
+        keyword_map = {
+            "technical": [
+                ("job_match", ["岗位", "业务", "场景", "工程实践", "落地", "生产", "经验"]),
+                ("logic", ["逻辑", "步骤", "链路", "流程", "因果", "推理", "分析路径"]),
+                ("completeness", ["完整", "覆盖", "遗漏", "边界", "异常", "兜底", "方案"]),
+                ("knowledge_depth", ["原理", "底层", "权衡", "复杂度", "性能", "优化", "源码", "深入"]),
+            ],
+            "project": [
+                ("authenticity", ["真实", "细节", "数据", "背景", "复盘"]),
+                ("ownership", ["负责", "主导", "推进", "协作", "决策"]),
+                ("technical_depth", ["架构", "技术", "原理", "性能", "难点"]),
+                ("reflection", ["反思", "复盘", "改进", "教训"]),
+            ],
+            "system_design": [
+                ("tradeoff_awareness", ["权衡", "取舍", "成本", "一致性", "可用性"]),
+                ("scalability", ["扩展", "容量", "高并发", "吞吐", "分片"]),
+                ("logic", ["步骤", "链路", "逻辑", "推理"]),
+            ],
+            "hr": [
+                ("self_awareness", ["反思", "不足", "成长", "优势", "劣势"]),
+                ("communication", ["沟通", "协作", "冲突", "表达"]),
+                ("confidence", ["信心", "判断", "压力", "稳定"]),
+                ("relevance", ["岗位", "匹配", "动机", "经历"]),
+            ],
+        }
+        for dim, keywords in keyword_map.get(round_type, []):
+            if dim in dimensions and any(keyword in content for keyword in keywords):
+                return dim
+
+        if round_type == "technical":
+            if level == "excellent" and "knowledge_depth" in dimensions:
+                return "knowledge_depth"
+            if level == "good" and "completeness" in dimensions:
+                return "completeness"
+            return "technical_accuracy" if "technical_accuracy" in dimensions else dimensions[index % len(dimensions)]
+        return dimensions[index % len(dimensions)]
+
+    @staticmethod
+    def _default_atomic_weight(level: str) -> float:
+        return {
+            "basic": 1.0,
+            "good": 1.25,
+            "excellent": 1.5,
+        }.get(str(level or "").strip().lower(), 1.0)
+
+    def build_atomic_rubric_points(
+        self,
+        scoring_rubric: Optional[Dict[str, Any]],
+        layer1_result: Optional[Dict[str, Any]],
+        round_type: str,
+    ) -> list[Dict[str, Any]]:
+        """Convert legacy rubric buckets into deterministic, weighted scoring points."""
+        dimensions = self.ROUND_DIMENSIONS.get(round_type, self.ROUND_DIMENSIONS["technical"])
+        source = scoring_rubric if isinstance(scoring_rubric, dict) else {}
+        explicit_points = source.get("atomic_points") or source.get("atomic_rubric_points")
+        atomic_points: list[Dict[str, Any]] = []
+
+        def append_point(raw_item: Any, level: str, index: int) -> None:
+            if isinstance(raw_item, dict):
+                expected = self._sanitize_text(
+                    raw_item.get("expected")
+                    or raw_item.get("point")
+                    or raw_item.get("text")
+                    or raw_item.get("label")
+                    or raw_item.get("description")
+                )
+                raw_id = self._sanitize_text(raw_item.get("id") or raw_item.get("point_id"))
+                raw_dimension = self._sanitize_text(raw_item.get("dimension"))
+                raw_weight = self._safe_float(raw_item.get("weight"))
+                core = bool(raw_item.get("core", level == "basic"))
+            else:
+                expected = self._sanitize_text(raw_item)
+                raw_id = ""
+                raw_dimension = ""
+                raw_weight = None
+                core = level == "basic"
+
+            if not expected:
+                return
+            normalized_level = str(level or "basic").strip().lower()
+            if normalized_level not in {"basic", "good", "excellent"}:
+                normalized_level = "basic"
+            dimension = raw_dimension if raw_dimension in dimensions else self._infer_atomic_dimension(expected, round_type, normalized_level, index)
+            point_id = raw_id or self._slugify_point_id(expected, f"{normalized_level}_{index + 1}")
+            if any(item.get("id") == point_id for item in atomic_points):
+                point_id = f"{point_id}_{index + 1}"
+            atomic_points.append({
+                "id": point_id,
+                "level": normalized_level,
+                "dimension": dimension,
+                "weight": round(float(raw_weight if raw_weight is not None and raw_weight > 0 else self._default_atomic_weight(normalized_level)), 4),
+                "expected": expected,
+                "core": bool(core),
+                "source": "explicit" if isinstance(raw_item, dict) else "legacy_rubric",
+            })
+
+        if isinstance(explicit_points, list):
+            for idx, item in enumerate(explicit_points):
+                append_point(item, str((item or {}).get("level", "basic")) if isinstance(item, dict) else "basic", idx)
+
+        if not atomic_points:
+            idx = 0
+            for level in ("basic", "good", "excellent"):
+                for item in source.get(level, []) or []:
+                    append_point(item, level, idx)
+                    idx += 1
+
+        if not atomic_points:
+            key_points = (layer1_result or {}).get("key_points") if isinstance((layer1_result or {}).get("key_points"), dict) else {}
+            idx = 0
+            for item in key_points.get("covered", []) or []:
+                point = item.get("point") if isinstance(item, dict) else item
+                append_point(point, "basic", idx)
+                idx += 1
+            for item in key_points.get("missing", []) or []:
+                append_point(item, "good", idx)
+                idx += 1
+
+        return atomic_points[:30]
+
+    def _normalize_point_judgements(
+        self,
+        point_judgements: Any,
+        atomic_points: list[Dict[str, Any]],
+        answer_text: str = "",
+    ) -> Dict[str, Dict[str, Any]]:
+        if isinstance(point_judgements, dict):
+            raw_items = [
+                {"point_id": key, **(value if isinstance(value, dict) else {"status": value})}
+                for key, value in point_judgements.items()
+            ]
+        elif isinstance(point_judgements, list):
+            raw_items = point_judgements
+        else:
+            raw_items = []
+
+        valid_ids = {str(item.get("id") or "") for item in atomic_points}
+        status_aliases = {
+            "hit": "hit",
+            "covered": "hit",
+            "yes": "hit",
+            "true": "hit",
+            "partial": "partial",
+            "partially_hit": "partial",
+            "partially_covered": "partial",
+            "miss": "miss",
+            "missing": "miss",
+            "no": "miss",
+            "false": "miss",
+            "contradict": "contradict",
+            "contradiction": "contradict",
+            "wrong": "contradict",
+            "incorrect": "contradict",
+        }
+        normalized: Dict[str, Dict[str, Any]] = {}
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            point_id = self._sanitize_text(raw.get("point_id") or raw.get("id"))
+            if point_id not in valid_ids:
+                continue
+            raw_status = self._sanitize_text(raw.get("status") or raw.get("judgement") or raw.get("result")).lower()
+            status = status_aliases.get(raw_status, "miss")
+            quote = self._sanitize_text(raw.get("quote") or raw.get("source_quote"))[:160]
+            quote_valid = self._quote_matches_answer(quote, answer_text)
+            quote_required = status in {"hit", "partial", "contradict"}
+            raw_confidence = self._clamp_unit(raw.get("confidence"), default=0.65)
+            confidence = raw_confidence
+            if quote_required and not quote_valid:
+                confidence = self._clamp_unit(confidence * 0.55, default=0.35)
+            normalized[point_id] = {
+                "point_id": point_id,
+                "status": status,
+                "confidence": confidence,
+                "raw_confidence": raw_confidence,
+                "quote": quote,
+                "quote_valid": bool(quote_valid),
+                "quote_required": bool(quote_required),
+                "reason": self._sanitize_text(raw.get("reason") or raw.get("rationale"))[:240],
+            }
+        return normalized
+
+    def _apply_atomic_rubric_rules(
+        self,
+        layer2_result: Dict[str, Any],
+        atomic_points: list[Dict[str, Any]],
+        round_type: str,
+        answer_text: str = "",
+    ) -> Dict[str, Any]:
+        if not atomic_points:
+            return layer2_result
+        judgement_map = self._normalize_point_judgements(
+            layer2_result.get("point_judgements"),
+            atomic_points,
+            answer_text=answer_text,
+        )
+        if not judgement_map:
+            return layer2_result
+
+        dimensions = self.ROUND_DIMENSIONS.get(round_type, self.ROUND_DIMENSIONS["technical"])
+        fallback_dimensions = layer2_result.get("dimension_scores") if isinstance(layer2_result.get("dimension_scores"), dict) else {}
+        ratio_map = {"hit": 1.0, "partial": 0.55, "miss": 0.0, "contradict": 0.0}
+
+        dimension_buckets: Dict[str, list[Tuple[Dict[str, Any], Dict[str, Any]]]] = {dim: [] for dim in dimensions}
+        level_buckets: Dict[str, list[Tuple[Dict[str, Any], Dict[str, Any]]]] = {"basic": [], "good": [], "excellent": []}
+        normalized_judgements = []
+        quote_validation = {
+            "checked": 0,
+            "valid": 0,
+            "invalid": 0,
+            "invalid_items": [],
+        }
+        core_contradictions = []
+        for point in atomic_points:
+            point_id = str(point.get("id") or "")
+            judgement = judgement_map.get(point_id)
+            if not judgement:
+                continue
+            dim = str(point.get("dimension") or "").strip()
+            if dim not in dimension_buckets:
+                continue
+            dimension_buckets[dim].append((point, judgement))
+            level = str(point.get("level") or "basic").strip().lower()
+            if level in level_buckets:
+                level_buckets[level].append((point, judgement))
+            if judgement.get("quote_required"):
+                quote_validation["checked"] += 1
+                if judgement.get("quote_valid"):
+                    quote_validation["valid"] += 1
+                else:
+                    quote_validation["invalid"] += 1
+                    quote_validation["invalid_items"].append({
+                        "point_id": point_id,
+                        "status": judgement.get("status"),
+                        "quote": judgement.get("quote", ""),
+                    })
+            if bool(point.get("core")) and judgement.get("status") == "contradict":
+                core_contradictions.append({
+                    "point_id": point_id,
+                    "dimension": dim,
+                    "expected": point.get("expected", ""),
+                    "quote": judgement.get("quote", ""),
+                    "quote_valid": bool(judgement.get("quote_valid")),
+                })
+            normalized_judgements.append({
+                **judgement,
+                "expected": point.get("expected", ""),
+                "dimension": dim,
+                "level": level,
+                "weight": point.get("weight", 1.0),
+                "core": bool(point.get("core")),
+            })
+
+        if not normalized_judgements:
+            return layer2_result
+        quote_validation["invalid_items"] = quote_validation["invalid_items"][:10]
+
+        final_dimensions: Dict[str, Dict[str, Any]] = {}
+        dimension_caps: Dict[str, float] = {}
+        for item in core_contradictions:
+            dimension = str(item.get("dimension") or "").strip()
+            if dimension:
+                dimension_caps[dimension] = min(float(dimension_caps.get(dimension, 100.0)), 55.0)
+
+        for dim in dimensions:
+            bucket = dimension_buckets.get(dim) or []
+            if not bucket:
+                fallback = fallback_dimensions.get(dim) if isinstance(fallback_dimensions.get(dim), dict) else {}
+                final_dimensions[dim] = {
+                    "score": self._clamp_score(fallback.get("score", 60.0)),
+                    "confidence": self._clamp_unit(fallback.get("confidence"), default=0.45),
+                    "reason": self._sanitize_text(fallback.get("reason")) or "该维度未覆盖原子评分点，保留语义基线分。",
+                    "evidence": fallback.get("evidence") if isinstance(fallback.get("evidence"), dict) else {
+                        "scoring_source": "semantic_fallback",
+                    },
+                }
+                continue
+
+            total_weight = sum(float(point.get("weight") or 1.0) for point, _ in bucket)
+            earned = sum(
+                float(point.get("weight") or 1.0) * ratio_map.get(judgement.get("status"), 0.0)
+                for point, judgement in bucket
+            )
+            score = self._clamp_score((earned / total_weight) * 100.0 if total_weight > 0 else 0.0)
+            cap = dimension_caps.get(dim)
+            cap_applied = cap is not None
+            if cap is not None and score > cap:
+                score = self._clamp_score(cap)
+            confidence_numerator = sum(
+                float(point.get("weight") or 1.0) * float(judgement.get("confidence") or 0.0)
+                for point, judgement in bucket
+            )
+            dimension_confidence = self._clamp_unit(
+                confidence_numerator / total_weight if total_weight > 0 else 0.0,
+                default=0.0,
+            )
+            hit_points = [str(point.get("expected") or "") for point, judgement in bucket if judgement.get("status") == "hit"]
+            partial_points = [str(point.get("expected") or "") for point, judgement in bucket if judgement.get("status") == "partial"]
+            missed_points = [str(point.get("expected") or "") for point, judgement in bucket if judgement.get("status") in {"miss", "contradict"}]
+            quotes = [judgement.get("quote", "") for _, judgement in bucket if judgement.get("quote") and judgement.get("quote_valid")]
+            final_dimensions[dim] = {
+                "score": score,
+                "confidence": dimension_confidence,
+                "reason": f"由 {len(bucket)} 个原子评分点按权重确定性计算。",
+                "evidence": {
+                    "scoring_source": "atomic_rubric_rules_v1",
+                    "hit_rubric_points": hit_points[:5],
+                    "partial_rubric_points": partial_points[:5],
+                    "missed_rubric_points": missed_points[:5],
+                    "source_quotes": quotes[:3],
+                    "quote_validation": {
+                        "checked": len([1 for _, judgement in bucket if judgement.get("quote_required")]),
+                        "invalid": len([1 for _, judgement in bucket if judgement.get("quote_required") and not judgement.get("quote_valid")]),
+                    },
+                    "score_cap": {
+                        "applied": cap_applied,
+                        "max_score": cap,
+                        "reason": "core_point_contradiction" if cap_applied else "",
+                    },
+                    "deduction_rationale": "未命中或答错的原子评分点按权重扣分。",
+                },
+            }
+
+        def level_match(level: str) -> float:
+            bucket = level_buckets.get(level) or []
+            if not bucket:
+                return 0.0
+            total_weight = sum(float(point.get("weight") or 1.0) for point, _ in bucket)
+            earned = sum(float(point.get("weight") or 1.0) * ratio_map.get(judgement.get("status"), 0.0) for point, judgement in bucket)
+            return self._clamp_score((earned / total_weight) * 100.0 if total_weight > 0 else 0.0)
+
+        basic_match = level_match("basic")
+        good_match = level_match("good")
+        excellent_match = level_match("excellent")
+        if excellent_match >= 70.0 and good_match >= 70.0 and basic_match >= 70.0:
+            final_level = "excellent"
+        elif good_match >= 60.0 and basic_match >= 70.0:
+            final_level = "good"
+        else:
+            final_level = "basic"
+
+        pre_cap_overall_score = round(sum(item["score"] for item in final_dimensions.values()) / len(final_dimensions), 2) if final_dimensions else 0.0
+        overall_cap = 65.0 if core_contradictions else None
+        overall_score = pre_cap_overall_score
+        if overall_cap is not None and overall_score > overall_cap:
+            overall_score = overall_cap
+        confidence = self._clamp_unit(
+            sum(float(item.get("confidence") or 0.0) for item in final_dimensions.values()) / len(final_dimensions),
+            default=0.65,
+        ) if final_dimensions else self._clamp_unit(0.0)
+
+        updated = dict(layer2_result or {})
+        updated["atomic_rubric_points"] = atomic_points
+        updated["point_judgements"] = normalized_judgements
+        updated["rubric_scoring"] = {
+            "mode": "atomic_rubric_rules_v1",
+            "point_count": len(atomic_points),
+            "judged_count": len(normalized_judgements),
+            "status_weights": ratio_map,
+            "pre_cap_overall_score": pre_cap_overall_score,
+            "overall_score": overall_score,
+            "confidence": confidence,
+            "quote_validation": quote_validation,
+            "core_error_caps": {
+                "applied": bool(core_contradictions),
+                "dimension_caps": dimension_caps,
+                "overall_cap": overall_cap,
+                "core_contradictions": core_contradictions[:10],
+            },
+        }
+        updated["rubric_eval"] = {
+            **(updated.get("rubric_eval") if isinstance(updated.get("rubric_eval"), dict) else {}),
+            "basic_match": basic_match,
+            "good_match": good_match,
+            "excellent_match": excellent_match,
+            "final_level": final_level,
+            "confidence": confidence,
+            "reason": "基于原子评分点命中状态确定性计算。",
+        }
+        updated["dimension_scores"] = final_dimensions
+        updated["overall_score"] = overall_score
+        return updated
 
     def _build_video_penalties(self, video_context: Dict[str, Any]) -> list[Dict[str, Any]]:
         penalties = []
@@ -456,6 +868,13 @@ class EvaluationService:
             2,
         ) if text_base_dimension_scores else 0.0
 
+        overall_score_before_atomic_caps = overall_score_base
+        rubric_scoring = layer2_result.get("rubric_scoring") if isinstance(layer2_result.get("rubric_scoring"), dict) else {}
+        core_error_caps = rubric_scoring.get("core_error_caps") if isinstance(rubric_scoring.get("core_error_caps"), dict) else {}
+        overall_cap = self._safe_float(core_error_caps.get("overall_cap")) if core_error_caps.get("applied") else None
+        if overall_cap is not None and overall_score_base > overall_cap:
+            overall_score_base = self._clamp_score(overall_cap)
+
         overall_score_final = overall_score_base
 
         layer2_result.update({
@@ -467,6 +886,7 @@ class EvaluationService:
             "final_dimension_scores": final_dimension_scores,
             "overall_score_base": overall_score_base,
             "overall_score_final": overall_score_final,
+            "overall_score_before_atomic_caps": overall_score_before_atomic_caps,
             "speech_used": bool(speech_context and speech_context.get("speech_used")),
             "video_used": bool(video_context and video_context.get("status") == "ready"),
             "speech_fusion_version": self.SPEECH_FUSION_VERSION,
@@ -1467,6 +1887,12 @@ class EvaluationService:
             "relevance_score": self._safe_float(payload.get("relevance_score")),
             "self_awareness_score": self._safe_float(payload.get("self_awareness_score")),
             "communication_score": self._safe_float(payload.get("communication_score")),
+            "confidence_score": self._safe_float(payload.get("confidence_score")),
+            "gaze_focus_score": self._safe_float(payload.get("gaze_focus_score")),
+            "posture_compliance_score": self._safe_float(payload.get("posture_compliance_score")),
+            "physiology_stability_score": self._safe_float(payload.get("physiology_stability_score")),
+            "expression_naturalness_score": self._safe_float(payload.get("expression_naturalness_score")),
+            "engagement_level_score": self._safe_float(payload.get("engagement_level_score")),
             "retry_count_layer1": int(payload.get("retry_count_layer1", 0) or 0),
             "retry_count_layer2": int(payload.get("retry_count_layer2", 0) or 0),
             "retry_count_persist": int(payload.get("retry_count_persist", 0) or 0),
@@ -1540,6 +1966,15 @@ class EvaluationService:
         if not scoring_rubric:
             scoring_rubric = payload.get("scoring_rubric", {})
 
+        atomic_points = self.build_atomic_rubric_points(
+            scoring_rubric=scoring_rubric,
+            layer1_result=layer1_result,
+            round_type=str(payload.get("round_type", "technical") or "technical").strip() or "technical",
+        )
+        augmented_rubric = dict(scoring_rubric or {}) if isinstance(scoring_rubric, dict) else {}
+        if atomic_points:
+            augmented_rubric["atomic_points"] = atomic_points
+
         speech_context = self.build_speech_context(payload)
         video_context = self.evaluate_video_layer(payload)
 
@@ -1548,13 +1983,22 @@ class EvaluationService:
             question=payload.get("question", ""),
             position=payload.get("position", ""),
             round_type=payload.get("round_type", "technical"),
-            scoring_rubric=scoring_rubric,
+            scoring_rubric=augmented_rubric,
             layer1_result=layer1_result,
             prompt_version=payload.get("prompt_version", self.prompt_version),
             speech_context=speech_context if speech_context.get("speech_used") else {},
         )
         if layer2_result.get("error"):
             return layer2_result
+
+        if atomic_points:
+            layer2_result.setdefault("atomic_rubric_points", atomic_points)
+            layer2_result = self._apply_atomic_rubric_rules(
+                layer2_result=layer2_result,
+                atomic_points=atomic_points,
+                round_type=str(payload.get("round_type", "technical") or "technical").strip() or "technical",
+                answer_text=str(payload.get("answer", "") or ""),
+            )
 
         return self.fuse_speech_with_dimension_scores(
             round_type=payload.get("round_type", "technical"),
@@ -1636,7 +2080,8 @@ class EvaluationService:
         units = len(re.findall(r"[\u4e00-\u9fff]|[A-Za-z0-9]+", text))
         punct = len(re.findall(r"[。！？.!?；;，,]", text))
         score = 30.0 + min(45.0, float(units) * 1.1) + min(8.0, float(punct) * 1.2)
-        return round(max(20.0, min(85.0, score)), 1)
+        # 回退评分只用于 LLM/RAG 异常时保持报告可用，不能给出优秀档语义结论。
+        return round(max(20.0, min(70.0, score)), 1)
 
     def _build_partial_layer2_from_layer1(
         self,
@@ -1668,6 +2113,8 @@ class EvaluationService:
         }
 
         return {
+            "evaluation_mode": "heuristic_text_fallback",
+            "fallback_reason": reason,
             "rubric_eval": {
                 "basic_match": float(rubric_match.get("basic", 0.0) or 0.0) * 100.0,
                 "good_match": float(rubric_match.get("good", 0.0) or 0.0) * 100.0,
@@ -2109,6 +2556,22 @@ class EvaluationService:
 
             with self._inflight_lock:
                 self._inflight_task_keys.discard(payload.get("eval_task_key", ""))
+
+            self._fire_completion_callbacks(payload, final_status)
+
+    def register_completion_callback(self, callback) -> None:
+        """注册评估完成回调，签名: callback(interview_id, turn_id, status)"""
+        if callable(callback):
+            self._completion_callbacks.append(callback)
+
+    def _fire_completion_callbacks(self, payload: dict, status: str) -> None:
+        interview_id = str(payload.get("interview_id") or "").strip()
+        turn_id = str(payload.get("turn_id") or "").strip()
+        for cb in self._completion_callbacks:
+            try:
+                cb(interview_id, turn_id, status)
+            except Exception as exc:
+                self.logger.warning(f"评估完成回调异常: {exc}")
 
     def shutdown(self) -> None:
         try:

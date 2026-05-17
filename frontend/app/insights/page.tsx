@@ -34,7 +34,7 @@ import {
     YAxis,
 } from 'recharts'
 import PersistentSidebar from '@/components/PersistentSidebar'
-import { getBackendBaseUrl } from '@/lib/backend'
+import { fetchWithTimeout, getBackendBaseUrl } from '@/lib/backend'
 import { readPageCache, writePageCache } from '@/lib/page-cache'
 
 const BACKEND_API_BASE = getBackendBaseUrl()
@@ -144,6 +144,11 @@ type InsightsSummaryPayload = {
         }
         primary_gap?: PrimaryGap
         growth_advice?: GrowthAdviceItem[]
+    }
+    ai_summary_meta?: {
+        status?: string
+        required?: boolean
+        timeout_seconds?: number
     }
     error?: string
 }
@@ -290,9 +295,10 @@ function shouldShowMarkResult(status: string): boolean {
 
 export default function InsightsPage() {
     const router = useRouter()
-    const initialCache = typeof window === 'undefined'
+    const cachedSummary = typeof window === 'undefined'
         ? null
         : readPageCache<InsightsSummaryPayload>(INSIGHTS_CACHE_KEY, INSIGHTS_CACHE_TTL_MS)
+    const initialCache = cachedSummary?.ai_summary_meta?.status === 'generated' ? cachedSummary : null
     const hasCachedSummary = Boolean(initialCache)
 
     const [loading, setLoading] = useState(!initialCache)
@@ -308,7 +314,7 @@ export default function InsightsPage() {
         try {
             setWeeklyPlanLoading(true)
             setWeeklyPlanError('')
-            const res = await fetch(`${BACKEND_API_BASE}/api/training/weekly-plan?user_id=default`, { cache: 'no-store' })
+            const res = await fetchWithTimeout(`${BACKEND_API_BASE}/api/training/weekly-plan?user_id=default`, { cache: 'no-store' }, 8000)
             const data = await safeReadJson<WeeklyTrainingPlanPayload>(res)
             if (!res.ok || !data?.success) {
                 throw new Error(data?.error || '获取本周训练计划失败')
@@ -328,7 +334,7 @@ export default function InsightsPage() {
                     setLoading(true)
                 }
                 setError('')
-                const res = await fetch(`${BACKEND_API_BASE}/api/insights/summary`, { cache: 'no-store' })
+                const res = await fetchWithTimeout(`${BACKEND_API_BASE}/api/insights/summary`, { cache: 'no-store' }, 45000)
                 const data = await safeReadJson<InsightsSummaryPayload>(res)
                 if (!res.ok || !data?.success) {
                     throw new Error(data?.error || '获取最近面试总览失败')
@@ -509,7 +515,7 @@ export default function InsightsPage() {
                 <main className="flex-1 p-8">
                     <section className="rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-10 text-center shadow-sm">
                         <div className="mx-auto mb-3 h-8 w-8 animate-spin rounded-full border-2 border-[#111111] border-t-transparent" />
-                        <p className="text-sm text-[#666666] dark:text-[#bcc5d3]">正在汇总最近面试表现...</p>
+                        <p className="text-sm text-[#666666] dark:text-[#bcc5d3]">正在生成 AI 综合总结，请稍候...</p>
                     </section>
                 </main>
             </div>

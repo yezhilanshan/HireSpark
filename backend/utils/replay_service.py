@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import threading
 import time
 from collections import defaultdict
@@ -87,7 +88,11 @@ class ReplayService:
         self.rag_service = rag_service
         self.logger = logger
         self.review_llm_enabled = bool(config.get("replay.llm.enabled", True))
-        self.review_model = str(config.get("replay.llm.model", "gemma-4-27b-it") or "").strip() or "gemma-4-27b-it"
+        self.review_model = (
+            str(os.environ.get("REPLAY_LLM_MODEL", "")).strip()
+            or str(config.get("replay.llm.model", "gemma-4-27b-it") or "").strip()
+            or "gemma-4-27b-it"
+        )
         self.review_timeout = float(config.get("replay.llm.timeout", 45))
         self.review_max_turns = max(4, int(config.get("replay.llm.max_turns", 14)))
         self.review_version = str(config.get("replay.version", "v2_gemma_fallback") or "v2_gemma_fallback")
@@ -123,20 +128,82 @@ class ReplayService:
         existing: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         """构建回合时间线，包含问答时间戳和延迟信息。"""
+        def normalize_existing(row: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "interview_id": interview_id,
+                "turn_id": str(row.get("turn_id") or "").strip(),
+                "question_start_ms": _safe_float(row.get("question_start_ms"), 0.0),
+                "question_end_ms": _safe_float(row.get("question_end_ms"), 0.0),
+                "answer_start_ms": _safe_float(row.get("answer_start_ms"), 0.0),
+                "answer_end_ms": _safe_float(row.get("answer_end_ms"), 0.0),
+                "latency_ms": _safe_float(row.get("latency_ms"), 0.0),
+                "source": row.get("source") or "runtime",
+            }
+
+        def speech_answer_duration_ms(speech_item: Optional[Dict[str, Any]]) -> float:
+            if not speech_item:
+                return 2200.0
+            words = speech_item.get("word_timestamps") or []
+            if words:
+                try:
+                    return max(
+                        300.0,
+                        _safe_float(words[-1].get("end_ms"), 0.0) - _safe_float(words[0].get("start_ms"), 0.0),
+                    )
+                except Exception:
+                    return 2200.0
+            metrics = speech_item.get("speech_metrics_final") or {}
+            return max(600.0, _safe_float((metrics or {}).get("audio_duration_ms"), 2200.0))
+
+        def merge_existing_with_estimate(existing_row: Optional[Dict[str, Any]], estimated: Dict[str, Any]) -> Dict[str, Any]:
+            if not existing_row:
+                return estimated
+
+            question_start_ms = (
+                _safe_float(existing_row.get("question_start_ms"), 0.0)
+                if _safe_float(existing_row.get("question_end_ms"), 0.0) > 0
+                else _safe_float(estimated.get("question_start_ms"), 0.0)
+            )
+            question_end_ms = _safe_float(existing_row.get("question_end_ms"), 0.0)
+            if question_end_ms <= question_start_ms:
+                question_end_ms = _safe_float(estimated.get("question_end_ms"), question_start_ms)
+
+            answer_start_ms = _safe_float(existing_row.get("answer_start_ms"), 0.0)
+            if answer_start_ms <= 0:
+                latency_ms = _safe_float(existing_row.get("latency_ms"), 0.0)
+                answer_start_ms = question_end_ms + latency_ms if latency_ms > 0 else _safe_float(estimated.get("answer_start_ms"), question_end_ms)
+
+            answer_end_ms = _safe_float(existing_row.get("answer_end_ms"), 0.0)
+            if answer_end_ms <= answer_start_ms:
+                answer_end_ms = _safe_float(estimated.get("answer_end_ms"), answer_start_ms)
+                if answer_end_ms <= answer_start_ms:
+                    answer_end_ms = answer_start_ms + 600.0
+
+            latency_ms = _safe_float(existing_row.get("latency_ms"), -1.0)
+            if latency_ms <= 0 and answer_start_ms > question_end_ms:
+                latency_ms = max(0.0, answer_start_ms - question_end_ms)
+
+            return {
+                "interview_id": interview_id,
+                "turn_id": str(estimated.get("turn_id") or existing_row.get("turn_id") or "").strip(),
+                "question_start_ms": round(question_start_ms, 2),
+                "question_end_ms": round(question_end_ms, 2),
+                "answer_start_ms": round(answer_start_ms, 2),
+                "answer_end_ms": round(answer_end_ms, 2),
+                "latency_ms": round(max(0.0, latency_ms), 2),
+                "source": existing_row.get("source") or "runtime",
+            }
+
+        existing_rows = [normalize_existing(row) for row in (existing or [])]
+        existing_by_turn = {
+            str(row.get("turn_id") or "").strip(): row
+            for row in existing_rows
+            if str(row.get("turn_id") or "").strip()
+        }
+
         if existing:
-            normalized = []
-            for row in existing:
-                normalized.append({
-                    "interview_id": interview_id,
-                    "turn_id": str(row.get("turn_id") or "").strip(),
-                    "question_start_ms": _safe_float(row.get("question_start_ms"), 0.0),
-                    "question_end_ms": _safe_float(row.get("question_end_ms"), 0.0),
-                    "answer_start_ms": _safe_float(row.get("answer_start_ms"), 0.0),
-                    "answer_end_ms": _safe_float(row.get("answer_end_ms"), 0.0),
-                    "latency_ms": _safe_float(row.get("latency_ms"), 0.0),
-                    "source": row.get("source") or "runtime",
-                })
-            return normalized
+            if not dialogues:
+                return existing_rows
 
         timeline: List[Dict[str, Any]] = []
         cursor_ms = 0.0
@@ -161,22 +228,10 @@ class ReplayService:
 
             speech_item = speech_by_turn.get(turn_id)
             answer_start_ms = question_end_ms + 450.0
-            answer_end_ms = answer_start_ms + 2200.0
-            if speech_item:
-                words = speech_item.get("word_timestamps") or []
-                if words:
-                    try:
-                        answer_duration = max(300.0, _safe_float(words[-1].get("end_ms"), 0.0) - _safe_float(words[0].get("start_ms"), 0.0))
-                    except Exception:
-                        answer_duration = 2200.0
-                else:
-                    metrics = speech_item.get("speech_metrics_final") or {}
-                    answer_duration = max(600.0, _safe_float((metrics or {}).get("audio_duration_ms"), 2200.0))
-                answer_end_ms = answer_start_ms + answer_duration
+            answer_end_ms = answer_start_ms + speech_answer_duration_ms(speech_item)
 
             latency_ms = max(0.0, answer_start_ms - question_end_ms)
-            cursor_ms = answer_end_ms + 900.0
-            timeline.append({
+            estimated = {
                 "interview_id": interview_id,
                 "turn_id": turn_id,
                 "question_start_ms": round(question_start_ms, 2),
@@ -185,9 +240,12 @@ class ReplayService:
                 "answer_end_ms": round(answer_end_ms, 2),
                 "latency_ms": round(latency_ms, 2),
                 "source": "heuristic_backfill",
-            })
+            }
+            merged = merge_existing_with_estimate(existing_by_turn.get(turn_id), estimated)
+            cursor_ms = max(answer_end_ms, _safe_float(merged.get("answer_end_ms"), 0.0)) + 900.0
+            timeline.append(merged)
 
-        return timeline
+        return sorted(timeline, key=lambda item: (_safe_float(item.get("question_start_ms"), 0.0), _safe_float(item.get("answer_start_ms"), 0.0)))
 
     def _build_highlight_tags(
         self,
@@ -812,6 +870,10 @@ class ReplayService:
         dialogues = self.db_manager.get_interview_dialogues(interview_id) if hasattr(self.db_manager, "get_interview_dialogues") else []
         evaluation_rows = self.db_manager.get_interview_evaluations(interview_id=interview_id) if hasattr(self.db_manager, "get_interview_evaluations") else []
         timeline_rows = self.db_manager.get_interview_turn_timelines(interview_id) if hasattr(self.db_manager, "get_interview_turn_timelines") else []
+        speech_rows = self._decode_speech_rows(
+            self.db_manager.get_speech_evaluations(interview_id) if hasattr(self.db_manager, "get_speech_evaluations") else []
+        )
+        timeline_rows = self._build_turn_timeline(interview_id, dialogues, speech_rows, timeline_rows)
         tags = self.db_manager.get_timeline_tags(interview_id) if hasattr(self.db_manager, "get_timeline_tags") else []
         deep_audit = self.db_manager.get_deep_audit(interview_id) if hasattr(self.db_manager, "get_deep_audit") else None
         latest_version = str((deep_audit or {}).get("version") or "").strip()
@@ -821,13 +883,13 @@ class ReplayService:
             shadow_answers = []
         visual_metrics = self.db_manager.get_visual_metrics(interview_id) if hasattr(self.db_manager, "get_visual_metrics") else None
 
-        dialogue_by_turn = {
-            str(item.get("turn_id") or "").strip(): item
-            for item in dialogues
-            if str(item.get("turn_id") or "").strip()
-        }
+        dialogue_by_turn: Dict[str, Dict[str, Any]] = {}
+        for idx, item in enumerate(sorted(dialogues or [], key=lambda x: str(x.get("created_at") or "")), start=1):
+            turn_id = str(item.get("turn_id") or "").strip() or f"turn_legacy_{idx}"
+            dialogue_by_turn[turn_id] = item
         evaluation_by_turn: Dict[str, Dict[str, Any]] = {}
-        for row in self._decode_evaluations(evaluation_rows):
+        decoded_evaluations = self._decode_evaluations(evaluation_rows)
+        for row in decoded_evaluations:
             turn_id = str(row.get("turn_id") or "").strip()
             if not turn_id:
                 continue
@@ -863,6 +925,17 @@ class ReplayService:
                 "score": round(_safe_float(score), 1) if score is not None else None,
             })
 
+        parsed_visual_metrics = {
+            "latency_matrix": _safe_json_loads((visual_metrics or {}).get("latency_matrix_json"), {}),
+            "keyword_coverage": _safe_json_loads((visual_metrics or {}).get("keyword_coverage_json"), {}),
+            "speech_tone": _safe_json_loads((visual_metrics or {}).get("speech_tone_json"), {}),
+            "radar": _safe_json_loads((visual_metrics or {}).get("radar_json"), []),
+            "heatmap": _safe_json_loads((visual_metrics or {}).get("heatmap_json"), []),
+        }
+        latency_items = ((parsed_visual_metrics.get("latency_matrix") or {}).get("items") or [])
+        if timeline_rows and len(latency_items) != len(timeline_rows):
+            parsed_visual_metrics = self._build_visual_metrics(timeline_rows, decoded_evaluations, speech_rows)
+
         payload = {
             "success": True,
             "interview_id": interview_id,
@@ -886,13 +959,7 @@ class ReplayService:
                 }
                 for item in (shadow_answers or [])
             ],
-            "visual_metrics": {
-                "latency_matrix": _safe_json_loads((visual_metrics or {}).get("latency_matrix_json"), {}),
-                "keyword_coverage": _safe_json_loads((visual_metrics or {}).get("keyword_coverage_json"), {}),
-                "speech_tone": _safe_json_loads((visual_metrics or {}).get("speech_tone_json"), {}),
-                "radar": _safe_json_loads((visual_metrics or {}).get("radar_json"), []),
-                "heatmap": _safe_json_loads((visual_metrics or {}).get("heatmap_json"), []),
-            },
+            "visual_metrics": parsed_visual_metrics,
             "meta": {
                 "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "has_timeline": bool(transcript_anchors),

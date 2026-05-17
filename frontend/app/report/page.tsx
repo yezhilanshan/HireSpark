@@ -8,6 +8,7 @@ import {
     ArrowRight,
     BarChart3,
     Camera,
+    ChevronDown,
     Clock3,
     Eye,
     Gauge,
@@ -21,7 +22,10 @@ import {
     Volume2,
 } from 'lucide-react'
 import {
+    Bar,
+    BarChart,
     CartesianGrid,
+    Cell,
     Line,
     LineChart,
     ResponsiveContainer,
@@ -31,9 +35,26 @@ import {
     ReferenceArea,
 } from 'recharts'
 import PersistentSidebar from '@/components/PersistentSidebar'
-import { getBackendBaseUrl } from '@/lib/backend'
+import { fetchWithTimeout, getBackendBaseUrl } from '@/lib/backend'
+import SocketClient from '@/lib/socket'
 
 const BACKEND_API_BASE = getBackendBaseUrl()
+
+const UI = {
+    content: '#4C6A8A',
+    delivery: '#8A6F3D',
+    presence: '#4F7A67',
+    success: '#2F6B45',
+    successAlt: '#3E7657',
+    warning: '#8B5E1A',
+    caution: '#C17C2D',
+    danger: '#9D3A2E',
+    dangerBg: '#FCEBE9',
+    muted: '#8E8A82',
+    grid: '#E8E3D8',
+    tickPrimary: '#555555',
+    tickSecondary: '#777777',
+}
 
 type StructuredDimension = {
     key: string
@@ -102,6 +123,20 @@ type ImmediateReport = {
         event_type_breakdown?: EventTypeCount[]
         top_risk_events?: RiskEvent[]
         statistics?: CameraStatistics
+    }
+    final_score?: {
+        overall_score: number | null
+        source: string
+        formula?: string
+        components?: {
+            fusion_overall_score?: number | null
+            stable_overall_score?: number | null
+            structured_overall_score?: number | null
+        }
+        weights?: {
+            stable?: number
+            fusion?: number
+        }
     }
     structured_evaluation: {
         status: string
@@ -269,10 +304,29 @@ type ContentPerformance = {
     status_message: string
     weak_dimensions: WeakDimension[]
     question_evidence: QuestionEvidence[]
+    excluded_questions?: Array<{
+        turn_id: string
+        round_type: string
+        question_excerpt: string
+        answer_excerpt: string
+        overall_score: number
+        exclude_reasons: string[]
+        coverage_ratio?: number
+        token_count?: number
+        error_code?: string
+        error_message?: string
+        trace_source?: string
+    }>
+    effective_sample_size?: number
+    excluded_sample_count?: number
+    fallback_sample_count?: number
     scoring_basis: {
         overall_formula: string
         question_formula: string
         sample_size: number
+        total_scored_samples?: number
+        excluded_sample_count?: number
+        fallback_sample_count?: number
     }
 }
 
@@ -323,14 +377,85 @@ type ApiResult = {
     error?: string
 }
 
+function isReportStillProcessing(report: ImmediateReport | null): boolean {
+    if (!report) return false
+    const structuredStatus = String(report.structured_evaluation?.status || '').toLowerCase()
+    const v2Status = String(report.evaluation_v2?.status || '').toLowerCase()
+    const total = Number(report.evaluation_v2?.total_questions ?? report.structured_evaluation?.total_questions ?? 0)
+    const evaluated = Number(report.evaluation_v2?.evaluated_questions ?? report.structured_evaluation?.evaluated_questions ?? 0)
+    return (
+        ['processing', 'partial', 'pending'].includes(structuredStatus)
+        || ['processing', 'partial', 'pending'].includes(v2Status)
+        || (total > 0 && evaluated < total)
+    )
+}
+
 type TurnDimensionEvidence = {
     score?: number
+    confidence?: number | null
     reason?: string
     evidence?: {
         hit_rubric_points?: string[]
+        partial_rubric_points?: string[]
         missed_rubric_points?: string[]
         source_quotes?: string[]
         deduction_rationale?: string
+        quote_validation?: {
+            checked?: number
+            invalid?: number
+        }
+        score_cap?: {
+            applied?: boolean
+            max_score?: number | null
+            reason?: string
+        }
+    }
+}
+
+type PointJudgement = {
+    point_id?: string
+    status?: 'hit' | 'partial' | 'miss' | 'contradict' | string
+    confidence?: number
+    raw_confidence?: number
+    quote?: string
+    quote_valid?: boolean
+    quote_required?: boolean
+    reason?: string
+    expected?: string
+    dimension?: string
+    level?: string
+    weight?: number
+    core?: boolean
+}
+
+type RubricScoring = {
+    mode?: string
+    point_count?: number
+    judged_count?: number
+    overall_score?: number | null
+    pre_cap_overall_score?: number | null
+    confidence?: number | null
+    quote_validation?: {
+        checked?: number
+        valid?: number
+        invalid?: number
+        invalid_items?: Array<{
+            point_id?: string
+            status?: string
+            quote?: string
+        }>
+    }
+    core_error_caps?: {
+        applied?: boolean
+        dimension_caps?: Record<string, number>
+        overall_cap?: number | null
+        core_contradictions?: Array<{
+            point_id?: string
+            dimension?: string
+            expected?: string
+            quote?: string
+            quote_valid?: boolean
+        }>
     }
 }
 
@@ -363,6 +488,8 @@ type TurnEvidenceService = {
     }>
 }
 
+type EvidencePanelKey = 'text' | 'speech' | 'video'
+
 type TurnScorecardEvaluation = {
     status?: string
     scoring_snapshot?: Record<string, unknown>
@@ -380,6 +507,8 @@ type TurnScorecardEvaluation = {
         dimension_evidence_json?: Record<string, TurnDimensionEvidence>
         final_dimension_scores?: Record<string, number | { score?: number }>
         dimension_scores?: Record<string, number | { score?: number }>
+        rubric_scoring?: RubricScoring
+        point_judgements?: PointJudgement[]
         summary?: {
             strengths?: string[]
             weaknesses?: string[]
@@ -417,11 +546,17 @@ type TraceApiResult = {
 type SafeDimensionEvidenceView = {
     key: string
     score: number | null
+    confidence: number | null
     reason: string
     hit: string[]
+    partial: string[]
     missed: string[]
     quotes: string[]
     rationale: string
+    quoteInvalidCount: number
+    quoteCheckedCount: number
+    scoreCapApplied: boolean
+    scoreCapReason: string
 }
 
 type ReadableDimensionNarrative = SafeDimensionEvidenceView & {
@@ -478,8 +613,9 @@ function riskTone(level: string) {
 
 function riskHeatColor(score: number) {
     const safeScore = Math.max(0, Math.min(100, Number.isFinite(score) ? score : 0))
-    const hue = 140 - (safeScore / 100) * 132
-    return `hsl(${hue.toFixed(1)} 58% 46%)`
+    if (safeScore >= 70) return UI.danger
+    if (safeScore >= 40) return UI.warning
+    return UI.success
 }
 
 function formatNum(value: unknown, digits = 1, fallback = '--') {
@@ -490,6 +626,46 @@ function formatNum(value: unknown, digits = 1, fallback = '--') {
 function formatConfidencePercent(value: unknown, digits = 0, fallback = '--') {
     const num = Number(value)
     return Number.isFinite(num) ? `${(num * 100).toFixed(digits)}%` : fallback
+}
+
+function scoreLevelLabel(score: unknown) {
+    const num = Number(score)
+    if (!Number.isFinite(num)) return '待评估'
+    if (num >= 90) return '优秀'
+    if (num >= 80) return '良好'
+    if (num >= 70) return '中等偏上'
+    if (num >= 60) return '基本达标'
+    return '需要重点提升'
+}
+
+function axisShortName(key: string) {
+    const normalized = String(key || '').trim().toLowerCase()
+    if (normalized === 'content') return '内容能力'
+    if (normalized === 'delivery') return '表达能力'
+    if (normalized === 'presence') return '镜头表现'
+    return confidenceAxisLabel(key)
+}
+
+function axisSummaryText(key: string, score: unknown) {
+    const num = Number(score)
+    const normalized = String(key || '').trim().toLowerCase()
+    if (!Number.isFinite(num)) return '当前样本不足，暂不做稳定判断。'
+    if (normalized === 'content') {
+        if (num >= 85) return '要点覆盖和技术判断较完整，可继续加强追问深度。'
+        if (num >= 70) return '主体回答成立，但技术细节和取舍解释仍可更充分。'
+        return '主要短板在内容展开，需要补足原理、方案和项目细节。'
+    }
+    if (normalized === 'delivery') {
+        if (num >= 85) return '表达节奏和清晰度较稳定，适合继续打磨结论先行。'
+        if (num >= 70) return '表达基本清楚，但部分回答还可以更短、更有层次。'
+        return '需要先稳定表达结构，减少绕行和无效停顿。'
+    }
+    if (normalized === 'presence') {
+        if (num >= 85) return '镜头状态较合规，风险对评分影响较小。'
+        if (num >= 70) return '镜头表现总体可用，仍需注意视线和姿态稳定。'
+        return '镜头风险会干扰可信度，需要优先改善环境和面试状态。'
+    }
+    return num >= 75 ? '整体表现可用，建议继续巩固。' : '这一项是当前可优先补强的方向。'
 }
 
 function confidenceAxisLabel(axis: string) {
@@ -519,12 +695,54 @@ function confidenceTone(value: number | null | undefined) {
     return 'bg-[#FDECEC] text-[#8A3B3B]'
 }
 
+function pointStatusLabel(status: string | undefined) {
+    const normalized = String(status || '').trim().toLowerCase()
+    if (normalized === 'hit') return '命中'
+    if (normalized === 'partial') return '部分命中'
+    if (normalized === 'miss') return '未覆盖'
+    if (normalized === 'contradict') return '核心冲突'
+    return normalized || '未知'
+}
+
+function pointStatusTone(status: string | undefined) {
+    const normalized = String(status || '').trim().toLowerCase()
+    if (normalized === 'hit') return 'bg-[#E7F3EA] text-[#2E6A45]'
+    if (normalized === 'partial') return 'bg-[#F3EFE4] text-[#6A5A2B]'
+    if (normalized === 'contradict') return 'bg-[#FDECEC] text-[#8A3B3B]'
+    if (normalized === 'miss') return 'bg-[#ECEBE8] text-[#565451]'
+    return 'bg-[#F2F2F0] text-[#666666] dark:text-[#bcc5d3]'
+}
+
+function pointStatusColor(status: string | undefined) {
+    const normalized = String(status || '').trim().toLowerCase()
+    if (normalized === 'hit') return UI.successAlt
+    if (normalized === 'partial') return UI.delivery
+    if (normalized === 'contradict') return UI.danger
+    if (normalized === 'miss') return UI.muted
+    return UI.tickSecondary
+}
+
+function scoreCapReasonLabel(reason: string) {
+    if (reason === 'core_point_contradiction') return '核心评分点答反，触发封顶'
+    return reason || '规则封顶'
+}
+
+function chartTickFormatter(value: unknown) {
+    return String(value || '').length > 8 ? `${String(value).slice(0, 8)}…` : String(value || '')
+}
+
 function evidenceSourceLabel(source: string | undefined) {
     const normalized = String(source || '').trim().toLowerCase()
     if (normalized === 'text') return '文本证据'
     if (normalized === 'speech') return '语音证据'
     if (normalized === 'video') return '镜头证据'
     return source || '--'
+}
+
+function evidencePanelDescription(key: EvidencePanelKey) {
+    if (key === 'text') return '回答文本、要点覆盖、rubric 命中与原文摘录。'
+    if (key === 'speech') return '语速、停顿、口头词、流畅度与清晰度信号。'
+    return '视线、姿态、人脸稳定与镜头风险信号。'
 }
 
 function evidenceFeatureLabel(key: string) {
@@ -589,6 +807,18 @@ function reasonTagTone(tag: string) {
     if (tag === '技术') return 'bg-[#E7F0FF] text-[#2C4A7A]'
     if (tag === '表达') return 'bg-[#FDEFE5] text-[#8A5425]'
     return 'bg-[#ECEBE8] text-[#565451]'
+}
+
+function excludedReasonLabel(reason: string) {
+    const map: Record<string, string> = {
+        answer_too_short: '回答过短',
+        non_answer_marker: '疑似未作答',
+        mostly_repeats_question: '主要复述题干',
+        zero_content_match: '未命中评分要点',
+        no_content_reason: '无实质内容',
+        fallback_scoring: '评分回退',
+    }
+    return map[reason] || reason
 }
 
 function fallbackDimensionLabel(key: string) {
@@ -798,6 +1028,7 @@ function buildDimensionNarrative(
     const scoreValue = hasScore ? Math.max(0, Math.min(100, Number(item.score))) : 0
     const narrator = DIMENSION_NARRATORS[item.key] || DEFAULT_DIMENSION_NARRATOR
     const hitText = joinReadableItems(item.hit, 2)
+    const partialText = joinReadableItems(item.partial, 2)
     const missedText = joinReadableItems(item.missed, 2)
     const quote = cleanNarrativeText(item.quotes[0] || '')
     const shortAnswerExcerpt = cleanNarrativeText(String(answerExcerpt || '').trim().slice(0, 90))
@@ -820,6 +1051,8 @@ function buildDimensionNarrative(
 
     const highlightText = hitText
         ? `${strengthLead}，像 ${hitText} 这些点已经被你明确讲到了。`
+        : partialText
+            ? `${strengthLead}，其中 ${partialText} 已经有雏形，但还没有讲完整。`
         : scoreValue >= 70
             ? `${strengthLead}，虽然系统没有提炼出特别具体的命中点，但整体表达仍然给出了较稳定的正向信号。`
             : `${strengthLead}，只是当前这题里还没有提炼出特别突出的强项证据。`
@@ -830,6 +1063,8 @@ function buildDimensionNarrative(
 
     const evidenceText = quote
         ? `${evidenceLead}。像“${quote}”这句，就是本维度判断时最直接的文本依据之一。`
+        : item.quoteInvalidCount > 0
+            ? `${evidenceLead}。但有 ${item.quoteInvalidCount} 条引用没有通过原文校验，所以这一维解释会更保守。`
         : shortAnswerExcerpt
             ? `${evidenceLead}。结合你当时的回答“${shortAnswerExcerpt}${shortAnswerExcerpt.length >= 90 ? '…' : ''}”，系统主要据此做出这一维判断。`
             : `${evidenceLead}。当前这题没有抽出更具体的原句，所以解释会相对保守。`
@@ -856,30 +1091,64 @@ function ReportPageContent() {
     const [activeScorecard, setActiveScorecard] = useState<TurnScorecard | null>(null)
     const [scorecardCache, setScorecardCache] = useState<Record<string, TurnScorecard>>({})
     const [scorecardRetryNonce, setScorecardRetryNonce] = useState(0)
+    const [openEvidencePanel, setOpenEvidencePanel] = useState<EvidencePanelKey | ''>('')
     const interviewId = (searchParams.get('interviewId') || '').trim()
 
     useEffect(() => {
-        const load = async () => {
+        let cancelled = false
+        let refreshTimer: ReturnType<typeof setTimeout> | undefined
+
+        const load = async (background = false) => {
             try {
-                setLoading(true)
+                if (!background) {
+                    setLoading(true)
+                }
                 setError('')
                 const endpoint = interviewId
                     ? `${BACKEND_API_BASE}/api/report/interview/${encodeURIComponent(interviewId)}`
                     : `${BACKEND_API_BASE}/api/report/latest`
-                const res = await fetch(endpoint, { cache: 'no-store' })
+                const res = await fetchWithTimeout(endpoint, { cache: 'no-store' })
                 const data: ApiResult = await res.json()
                 if (!res.ok || !data.success || !data.report) {
                     throw new Error(data.error || '获取报告失败')
                 }
+                if (cancelled) return
                 setReport(data.report)
+                if (isReportStillProcessing(data.report)) {
+                    refreshTimer = setTimeout(() => {
+                        void load(true)
+                    }, 3500)
+                }
             } catch (e) {
+                if (cancelled) return
                 setReport(null)
                 setError(e instanceof Error ? e.message : '获取报告失败')
             } finally {
-                setLoading(false)
+                if (!cancelled && !background) {
+                    setLoading(false)
+                }
             }
         }
         void load()
+
+        // 监听评估完成事件，立即刷新报告
+        const socket = SocketClient.getInstance()
+        void socket.connect()
+        const onEvaluationCompleted = (data: { interview_id?: string }) => {
+            if (cancelled) return
+            if (interviewId && data?.interview_id && data.interview_id !== interviewId) return
+            if (refreshTimer) clearTimeout(refreshTimer)
+            void load(true)
+        }
+        socket.on('evaluation_completed', onEvaluationCompleted)
+
+        return () => {
+            cancelled = true
+            if (refreshTimer) {
+                clearTimeout(refreshTimer)
+            }
+            socket.off('evaluation_completed', onEvaluationCompleted)
+        }
     }, [interviewId])
 
     const questionEvidenceList = report?.content_performance?.question_evidence || []
@@ -933,7 +1202,7 @@ function ReportPageContent() {
                 setScorecardError('')
 
                 const endpoint = `${BACKEND_API_BASE}/api/evaluation/trace/${encodeURIComponent(normalizedInterviewId)}/${encodeURIComponent(normalizedTurnId)}`
-                const res = await fetch(endpoint, { cache: 'no-store' })
+                const res = await fetchWithTimeout(endpoint, { cache: 'no-store' })
                 const data: TraceApiResult = await res.json()
                 if (!res.ok || !data.success || !data.scorecard) {
                     throw new Error(data.error || '获取单题证据链失败')
@@ -961,8 +1230,15 @@ function ReportPageContent() {
         }
     }, [activeTurnId, report?.interview_id, scorecardCache, scorecardRetryNonce, questionEvidenceList.length])
 
+    useEffect(() => {
+        setOpenEvidencePanel('')
+    }, [activeTurnId])
+
     const radarDimensions = useMemo(() => {
-        const weakSource = (report?.content_performance?.weak_dimensions || []).slice(0, 5)
+        const contentStatus = String(report?.content_performance?.status || '').toLowerCase()
+        const weakSource = contentStatus === 'ready'
+            ? (report?.content_performance?.weak_dimensions || []).slice(0, 5)
+            : []
         if (weakSource.length > 0) {
             return weakSource.map((item) => ({
                 key: item.key,
@@ -970,11 +1246,16 @@ function ReportPageContent() {
                 score: Number(item.avg_score || 0),
             }))
         }
-        return (report?.structured_evaluation?.dimension_scores || []).slice(0, 5).map((item) => ({
+        const structuredSource = (report?.structured_evaluation?.dimension_scores || []).slice(0, 5).map((item) => ({
             key: item.key,
             label: item.label,
             score: Number(item.score || 0),
         }))
+        const hasNonZeroScore = structuredSource.some((item) => Number(item.score) > 0)
+        if (contentStatus === 'no_effective_answer' || (!hasNonZeroScore && structuredSource.length > 0)) {
+            return []
+        }
+        return structuredSource
     }, [report])
 
     const speechRadarDimensions = useMemo(() => {
@@ -1039,6 +1320,9 @@ function ReportPageContent() {
             const hit = Array.isArray(evidenceObj.hit_rubric_points)
                 ? evidenceObj.hit_rubric_points.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
                 : []
+            const partial = Array.isArray(evidenceObj.partial_rubric_points)
+                ? evidenceObj.partial_rubric_points.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+                : []
             const missed = Array.isArray(evidenceObj.missed_rubric_points)
                 ? evidenceObj.missed_rubric_points.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
                 : []
@@ -1046,14 +1330,23 @@ function ReportPageContent() {
                 ? evidenceObj.source_quotes.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
                 : []
             const rationale = String(evidenceObj.deduction_rationale || reason).trim()
+            const confidenceNum = Number(payload.confidence)
+            const quoteValidation = evidenceObj.quote_validation || {}
+            const scoreCap = evidenceObj.score_cap || {}
             entries.push({
                 key,
                 score,
+                confidence: Number.isFinite(confidenceNum) ? confidenceNum : null,
                 reason,
                 hit,
+                partial,
                 missed,
                 quotes,
                 rationale,
+                quoteInvalidCount: Number(quoteValidation.invalid || 0),
+                quoteCheckedCount: Number(quoteValidation.checked || 0),
+                scoreCapApplied: Boolean(scoreCap.applied),
+                scoreCapReason: String(scoreCap.reason || ''),
             })
         }
         return entries
@@ -1076,6 +1369,58 @@ function ReportPageContent() {
     const activeLayer2Summary = useMemo(() => {
         return activeScorecard?.evaluation?.layer2?.summary || null
     }, [activeScorecard])
+
+    const activeRubricScoring = useMemo(() => {
+        return activeScorecard?.evaluation?.layer2?.rubric_scoring || null
+    }, [activeScorecard])
+
+    const activePointJudgements = useMemo(() => {
+        return activeScorecard?.evaluation?.layer2?.point_judgements || []
+    }, [activeScorecard])
+
+    const activePointStatusData = useMemo(() => {
+        const counts: Record<string, number> = { hit: 0, partial: 0, miss: 0, contradict: 0 }
+        activePointJudgements.forEach((item) => {
+            const status = String(item.status || '').trim().toLowerCase()
+            if (status in counts) counts[status] += 1
+        })
+        return [
+            { key: 'hit', label: '命中', count: counts.hit, color: pointStatusColor('hit') },
+            { key: 'partial', label: '部分', count: counts.partial, color: pointStatusColor('partial') },
+            { key: 'miss', label: '遗漏', count: counts.miss, color: pointStatusColor('miss') },
+            { key: 'contradict', label: '冲突', count: counts.contradict, color: pointStatusColor('contradict') },
+        ].filter((item) => item.count > 0)
+    }, [activePointJudgements])
+
+    const activeDimensionChartData = useMemo(() => {
+        return activeDimensionEvidenceList
+            .map((item) => ({
+                key: item.key,
+                label: dimensionLabelMap[item.key] || fallbackDimensionLabel(item.key),
+                score: Math.max(0, Math.min(100, Number(item.score ?? 0))),
+                confidence: item.confidence == null ? null : Math.max(0, Math.min(100, Number(item.confidence) * 100)),
+                invalidQuotes: item.quoteInvalidCount,
+                cap: item.scoreCapApplied,
+            }))
+            .sort((a, b) => a.score - b.score)
+            .slice(0, 6)
+    }, [activeDimensionEvidenceList, dimensionLabelMap])
+
+    const activeRuleAlerts = useMemo(() => {
+        const alerts: string[] = []
+        const quoteInvalid = Number(activeRubricScoring?.quote_validation?.invalid || 0)
+        const quoteChecked = Number(activeRubricScoring?.quote_validation?.checked || 0)
+        if (quoteChecked > 0 && quoteInvalid > 0) {
+            alerts.push(`${quoteInvalid}/${quoteChecked} 条引用未能匹配原回答，相关评分点已降低置信度。`)
+        }
+        if (activeRubricScoring?.core_error_caps?.applied) {
+            alerts.push(`存在核心评分点答反，总分最高按 ${formatNum(activeRubricScoring.core_error_caps.overall_cap)} 处理。`)
+        }
+        if (!alerts.length && activeRubricScoring?.mode) {
+            alerts.push('本题已启用原子评分点规则，分数由命中状态和权重计算。')
+        }
+        return alerts
+    }, [activeRubricScoring])
 
     const readableDimensionCards = useMemo<ReadableDimensionNarrative[]>(() => {
         return [...activeDimensionEvidenceList]
@@ -1103,14 +1448,33 @@ function ReportPageContent() {
         ].filter(Boolean)
     }, [activeQuestionEvidence, activeScorecard, activeLayer2Summary, readableDimensionCards, weakestDimensionLabel, primaryImprovementAdvice])
 
-    const activeEvidenceServices = useMemo(() => {
+    const activeEvidencePanels = useMemo<Array<{
+        key: EvidencePanelKey
+        label: string
+        description: string
+        service?: TurnEvidenceService
+    }>>(() => {
         const evaluation = activeScorecard?.evaluation
-        if (!evaluation) return []
         return [
-            evaluation.text_layer?.evidence_service,
-            evaluation.speech_layer?.evidence_service,
-            evaluation.video_layer?.evidence_service,
-        ].filter((item): item is TurnEvidenceService => Boolean(item?.source))
+            {
+                key: 'text',
+                label: '文本证据',
+                description: evidencePanelDescription('text'),
+                service: evaluation?.text_layer?.evidence_service,
+            },
+            {
+                key: 'speech',
+                label: '语音证据',
+                description: evidencePanelDescription('speech'),
+                service: evaluation?.speech_layer?.evidence_service,
+            },
+            {
+                key: 'video',
+                label: '镜头证据',
+                description: evidencePanelDescription('video'),
+                service: evaluation?.video_layer?.evidence_service,
+            },
+        ]
     }, [activeScorecard])
 
     const gazeTrendData = useMemo(() => {
@@ -1195,10 +1559,6 @@ function ReportPageContent() {
     const avgHeartRateText = Number.isFinite(avgHeartRateValue) && avgHeartRateValue > 0
         ? `${formatNum(avgHeartRateValue, 1)} bpm`
         : '--'
-    const cameraLandmarks = cameraInsights?.landmarks_3d
-    const cameraBlendshape = cameraInsights?.blendshapes
-    const cameraHeadPose = cameraInsights?.head_pose
-    const cameraIris = cameraInsights?.iris_tracking
     const cameraTopEvents = cameraPerf?.top_risk_events || report.anti_cheat.top_risk_events || []
     const cameraSampleCount = Number(cameraInsights?.sample_count || 0)
     const gazeTrendUnavailableReason = (() => {
@@ -1211,9 +1571,6 @@ function ReportPageContent() {
         }
         return '当前暂无可绘制的专注度曲线数据。'
     })()
-    const topBlendshapeAverages = Object.entries(cameraBlendshape?.blendshape_averages || {})
-        .sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0))
-        .slice(0, 8)
     const riskPeak = Number(report.anti_cheat.max_probability || 0)
     const riskAverage = Number(report.anti_cheat.avg_probability || 0)
     const riskHeatValue = Math.max(0, Math.min(100, riskPeak * 0.7 + riskAverage * 0.3))
@@ -1259,44 +1616,228 @@ function ReportPageContent() {
     const presenceConfidence = confidenceAxes.presence
     const hasConfidenceBreakdown = Boolean(contentConfidence || deliveryConfidence || presenceConfidence)
     const reportFusionOverallScore = evaluationV2?.fusion?.overall_score ?? report.structured_evaluation.overall_score
-    const displayOverallScore = interviewStability?.overall_score_stable ?? reportFusionOverallScore
+    const displayOverallScore = report.final_score?.overall_score ?? interviewStability?.overall_score_stable ?? reportFusionOverallScore
     const activeTurnOverallScore = activeScorecard?.evaluation?.fusion?.overall_score ?? activeQuestionEvidence?.overall_score
+    const axisScoreChartData = [
+        { key: 'content', label: '内容', score: Number(primaryRoundProfile?.round_content_score ?? evaluationV2?.layers?.text?.overall_score), color: UI.content },
+        { key: 'delivery', label: '表达', score: Number(primaryRoundProfile?.round_delivery_score ?? evaluationV2?.layers?.speech?.overall_score), color: UI.delivery },
+        { key: 'presence', label: '镜头', score: Number(primaryRoundProfile?.round_presence_score ?? evaluationV2?.layers?.video?.overall_score), color: UI.presence },
+    ].filter((item) => Number.isFinite(item.score))
+    const scoreLevel = scoreLevelLabel(displayOverallScore)
+    const weakestAxisName = primaryRoundWeakestAxis ? axisShortName(primaryRoundWeakestAxis.key) : weakestDimensionLabel
+    const mainDiagnosis = primaryRoundWeakestAxis
+        ? `本场面试综合表现${scoreLevel}，主要短板是${axisShortName(primaryRoundWeakestAxis.key)}，建议优先训练${primaryImprovementAdvice}`
+        : `本场面试综合表现${scoreLevel}，建议先从单题复盘里定位扣分维度，再按建议进行针对性训练。`
+    const riskLevel = String(report.anti_cheat.risk_level || 'LOW').toUpperCase()
+    const riskIsLow = riskLevel === 'LOW'
+    const diagnosisMetrics = [
+        {
+            title: '综合得分',
+            value: displayOverallScore == null ? '--' : displayOverallScore.toFixed(1),
+            description: `${scoreLevel}，${primaryRoundWeakestAxis ? `${axisShortName(primaryRoundWeakestAxis.key)}最需要补强` : '继续查看单题原因'}`,
+            icon: <Target className="h-3.5 w-3.5" />,
+        },
+        {
+            title: '内容能力',
+            value: formatNum(axisScoreChartData.find((item) => item.key === 'content')?.score),
+            description: axisSummaryText('content', axisScoreChartData.find((item) => item.key === 'content')?.score),
+            icon: <MessageSquare className="h-3.5 w-3.5" />,
+        },
+        {
+            title: '表达能力',
+            value: formatNum(axisScoreChartData.find((item) => item.key === 'delivery')?.score),
+            description: axisSummaryText('delivery', axisScoreChartData.find((item) => item.key === 'delivery')?.score),
+            icon: <Mic className="h-3.5 w-3.5" />,
+        },
+        {
+            title: '镜头表现',
+            value: formatNum(axisScoreChartData.find((item) => item.key === 'presence')?.score),
+            description: axisSummaryText('presence', axisScoreChartData.find((item) => item.key === 'presence')?.score),
+            icon: <Camera className="h-3.5 w-3.5" />,
+        },
+    ]
+    const trainingActions = [
+        {
+            title: primaryRoundWeakestAxis?.key === 'content' ? '项目深挖' : '优先短板补强',
+            problem: primaryRoundWeakestAxis ? `${axisShortName(primaryRoundWeakestAxis.key)}当前相对偏弱。` : '当前样本还不足以稳定识别唯一短板。',
+            advice: primaryImprovementAdvice,
+        },
+        {
+            title: '技术原理',
+            problem: '回答需要从“知道概念”进一步走到“能解释机制和限制”。',
+            advice: '每个技术点补充为什么、怎么实现、有什么取舍和边界条件。',
+        },
+        {
+            title: '表达节奏',
+            problem: '部分回答容易先铺背景，用户读报告时也更需要明确结论。',
+            advice: '训练先结论，再按背景、方案、取舍、结果展开。',
+        },
+    ]
+    const fusionLayerChartData = Object.entries(evaluationV2?.fusion?.axis_confidence_breakdowns || {})
+        .map(([key, value]) => ({
+            key,
+            label: confidenceAxisLabel(key),
+            confidence: Number(value?.overall_confidence || 0) * 100,
+        }))
+        .filter((item) => Number.isFinite(item.confidence))
 
     return (
         <div className="flex min-h-screen">
             <PersistentSidebar />
             <main className="flex-1 overflow-y-auto dark:bg-[#101217] bg-[#FAF9F6]">
-                <div className="mx-auto max-w-6xl px-6 py-8 space-y-6">
-                    <section className="rounded-3xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-6 shadow-sm sm:p-8">
-                        <div className="flex flex-wrap items-center justify-between gap-3">
-                            <span className="inline-flex items-center gap-2 rounded-full border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-4 py-2 text-sm text-[#111111] dark:text-[#f4f7fb]">
-                                <ShieldCheck className="h-4 w-4" /> 即时报告
-                            </span>
-                            <span className={`inline-flex rounded-full px-3 py-1 text-xs font-medium ${riskTone(report.anti_cheat.risk_level)}`}>
-                                风险 {(report.anti_cheat.risk_level || 'LOW').toUpperCase()}
-                            </span>
-                        </div>
-                        <h1 className="mt-4 text-3xl tracking-tight text-[#111111] dark:text-[#f4f7fb] sm:text-4xl">本场面试报告</h1>
+                <div className="mx-auto max-w-6xl space-y-6 px-4 pb-24 pt-6 sm:px-6 sm:py-8 lg:pb-8">
+                    <section className="rounded-3xl border border-[#E5E5E5] bg-gradient-to-br from-white to-[#F7F3EA] p-6 shadow-sm dark:border-[#2d3542] dark:from-[#181c24] dark:to-[#12151c] sm:p-8">
+                        <div className="flex flex-col gap-6 lg:flex-row lg:items-start lg:justify-between">
+                            <div className="min-w-0">
+                                <div className="flex flex-wrap items-center gap-2">
+                                    <span className="inline-flex rounded-full bg-[#EAF5ED] px-3 py-1 text-xs font-medium text-[#2F6B45]">
+                                        面试报告已生成
+                                    </span>
+                                    <span className={`inline-flex rounded-full px-3 py-1 text-xs font-medium ${riskTone(report.anti_cheat.risk_level)}`}>
+                                        风险 {riskLevel}
+                                    </span>
+                                    <span className="inline-flex rounded-full bg-white/70 px-3 py-1 text-xs text-[#666666] dark:bg-[#181c24] dark:text-[#bcc5d3]">
+                                        {roundLabel(dominantRound)} · {questionProgress} 题 · {formatDuration(report.summary.duration_seconds)}
+                                    </span>
+                                </div>
+                                <h1 className="mt-4 text-3xl font-semibold tracking-tight text-[#111111] dark:text-[#f4f7fb] sm:text-4xl">
+                                    本场面试综合表现：{scoreLevel}
+                                </h1>
+                                <p className="mt-3 max-w-3xl text-sm leading-7 text-[#555555] dark:text-[#bcc5d3]">
+                                    {mainDiagnosis}
+                                </p>
+                                <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                                    <div className="rounded-2xl border border-white/80 bg-white/70 p-4 dark:border-[#2d3542] dark:bg-[#181c24]">
+                                        <p className="text-xs text-[#888888] dark:text-[#8e98aa]">最主要短板</p>
+                                        <p className="mt-1 text-lg font-semibold text-[#111111] dark:text-[#f4f7fb]">{weakestAxisName || '--'}</p>
+                                    </div>
+                                    <div className="rounded-2xl border border-white/80 bg-white/70 p-4 dark:border-[#2d3542] dark:bg-[#181c24]">
+                                        <p className="text-xs text-[#888888] dark:text-[#8e98aa]">下一步建议</p>
+                                        <p className="mt-1 text-sm leading-6 text-[#444444] dark:text-[#bcc5d3]">{primaryImprovementAdvice}</p>
+                                    </div>
+                                </div>
+                            </div>
 
+                            <div className="shrink-0 rounded-3xl border border-white/80 bg-white/80 px-8 py-6 text-left shadow-sm dark:border-[#2d3542] dark:bg-[#181c24] lg:text-right">
+                                <div className="text-6xl font-semibold leading-none text-[#111111] dark:text-[#f4f7fb]">
+                                    {displayOverallScore == null ? '--' : displayOverallScore.toFixed(1)}
+                                </div>
+                                <div className="mt-2 text-sm text-[#888888] dark:text-[#8e98aa]">综合得分</div>
+                            </div>
+                        </div>
 
                         <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-                            <MetricCard title="综合得分" value={displayOverallScore == null ? '--' : displayOverallScore.toFixed(1)} icon={<Target className="h-3.5 w-3.5" />} />
-                            <MetricCard title="面试轮次" value={roundLabel(dominantRound)} icon={<Users className="h-3.5 w-3.5" />} />
-                            <MetricCard title="已评题数" value={questionProgress} icon={<BarChart3 className="h-3.5 w-3.5" />} />
-                            <MetricCard title="会话时长" value={formatDuration(report.summary.duration_seconds)} icon={<Clock3 className="h-3.5 w-3.5" />} />
+                            {diagnosisMetrics.map((item) => (
+                                <MetricCard key={`diagnosis-metric-${item.title}`} title={item.title} value={item.value} description={item.description} icon={item.icon} />
+                            ))}
                         </div>
 
-                        <div className="mt-5 rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
-                            <div className="flex items-center justify-between gap-2">
-                                <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">风险指数</p>
-                                <span className="text-sm text-[#666666] dark:text-[#bcc5d3]">{formatNum(riskHeatValue)}%</span>
+                        {riskIsLow ? (
+                            <div className="mt-5 rounded-2xl border border-[#DCEBDD] bg-[#F8FAF8] p-4 text-sm leading-6 text-[#2F6B45]">
+                                本场未发现明显异常行为，镜头与环境风险较低。风险信息已收起为辅助提示。
                             </div>
-                            <div className="mt-2 h-3 w-full overflow-hidden rounded-full bg-[var(--accent)]">
-                                <div
-                                    className="h-full rounded-full transition-[width,background] duration-500 ease-out"
-                                    style={riskHeatFillStyle}
-                                />
+                        ) : (
+                            <div className="mt-5 rounded-2xl border border-[#E5E5E5] bg-white/80 p-4 dark:border-[#2d3542] dark:bg-[#181c24]">
+                                <div className="flex items-center justify-between gap-2">
+                                    <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">风险指数</p>
+                                    <span className="text-sm text-[#666666] dark:text-[#bcc5d3]">{formatNum(riskHeatValue)}%</span>
+                                </div>
+                                <div className="mt-2 h-3 w-full overflow-hidden rounded-full bg-[var(--accent)]">
+                                    <div
+                                        className="h-full rounded-full transition-[width,background] duration-500 ease-out"
+                                        style={riskHeatFillStyle}
+                                    />
+                                </div>
                             </div>
+                        )}
+                    </section>
+
+                    <section className="rounded-3xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-6 shadow-sm">
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                            <div>
+                                <h2 className="text-xl font-semibold text-[#111111] dark:text-[#f4f7fb]">三大能力轴</h2>
+                                <p className="mt-2 text-sm text-[#666666] dark:text-[#bcc5d3]">先看主轴结论，再进入单题复盘查扣分原因。</p>
+                            </div>
+                            <span className="rounded-full bg-[var(--surface)] px-3 py-1 text-xs text-[#666666] dark:text-[#bcc5d3]">
+                                优先看 {weakestAxisName || '--'}
+                            </span>
+                        </div>
+                        <div className="mt-4 grid gap-4 lg:grid-cols-[minmax(0,1.1fr)_minmax(300px,0.9fr)]">
+                            <div className="grid gap-3 sm:grid-cols-3 lg:grid-cols-1">
+                                {axisScoreChartData.map((axis) => (
+                                    <div key={`axis-card-${axis.key}`} className="rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-[var(--surface)] p-4">
+                                        <div className="flex items-center justify-between gap-2">
+                                            <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">{axisShortName(axis.key)}</p>
+                                            <span className="text-lg font-semibold" style={{ color: axis.color }}>{formatNum(axis.score)}</span>
+                                        </div>
+                                        <p className="mt-2 text-xs leading-5 text-[#666666] dark:text-[#bcc5d3]">{axisSummaryText(axis.key, axis.score)}</p>
+                                    </div>
+                                ))}
+                            </div>
+                            {axisScoreChartData.length > 0 && (
+                                <div className="rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
+                                    <div className="flex flex-wrap items-center justify-between gap-2">
+                                        <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">能力轴对比</p>
+                                        <p className="text-xs text-[#888888] dark:text-[#8e98aa]">分值范围 0-100</p>
+                                    </div>
+                                    <div className="mt-3 h-[220px]">
+                                        <ResponsiveContainer width="100%" height="100%">
+                                            <BarChart data={axisScoreChartData} layout="vertical" margin={{ top: 8, right: 18, left: 8, bottom: 8 }}>
+                                                <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke={UI.grid} />
+                                                <XAxis type="number" domain={[0, 100]} tick={{ fontSize: 11, fill: UI.tickSecondary }} />
+                                                <YAxis type="category" dataKey="label" width={42} tick={{ fontSize: 12, fill: UI.tickPrimary }} />
+                                                <Tooltip formatter={(value) => formatNum(value)} />
+                                                <Bar dataKey="score" radius={[0, 8, 8, 0]}>
+                                                    {axisScoreChartData.map((entry) => (
+                                                        <Cell key={`axis-score-cell-${entry.key}`} fill={entry.color} />
+                                                    ))}
+                                                </Bar>
+                                            </BarChart>
+                                        </ResponsiveContainer>
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+                    </section>
+
+                    <section className="rounded-3xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-6 shadow-sm">
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                            <div>
+                                <h2 className="text-xl font-semibold text-[#111111] dark:text-[#f4f7fb]">下一步优先训练</h2>
+                                <p className="mt-2 text-sm text-[#666666] dark:text-[#bcc5d3]">把评分结果转成可执行训练任务。</p>
+                            </div>
+                            <Link href={replayUrl} className="hidden rounded-xl bg-[#111111] px-4 py-2.5 text-sm font-medium text-white hover:bg-[#222222] sm:inline-flex">
+                                查看复盘
+                            </Link>
+                        </div>
+                        <div className="mt-4 grid gap-4 md:grid-cols-3">
+                            {trainingActions.map((item, index) => (
+                                <div key={`training-action-${item.title}`} className="rounded-2xl bg-[#FAF9F6] p-5 dark:bg-[#12151c] border border-[#E5E5E5] dark:border-[#2d3542] transition hover:shadow-md">
+                                    <div className="text-sm text-[#888888] dark:text-[#8e98aa]">优先级 {index + 1}</div>
+                                    <h3 className="mt-2 text-lg font-medium text-[#111111] dark:text-[#f4f7fb]">{item.title}</h3>
+                                    <p className="mt-2 text-sm leading-6 text-[#666666] dark:text-[#bcc5d3]">当前问题：{item.problem}</p>
+                                    <p className="mt-2 text-sm leading-6 text-[#444444] dark:text-[#d7deea]">建议训练：{item.advice}</p>
+                                    {/* P2-2 优化: 训练建议可执行化 - 添加行动按钮和进度追踪 */}
+                                    <div className="mt-4 flex gap-2">
+                                        <button
+                                            type="button"
+                                            onClick={() => window.location.href = '/interview-setup'}
+                                            className="flex-1 rounded-lg bg-[#111111] px-3 py-2 text-xs font-medium text-white transition hover:bg-[#222222]"
+                                        >
+                                            开始训练
+                                        </button>
+                                        <Link
+                                            href={`${replayUrl}&focus=${encodeURIComponent(item.title)}`}
+                                            className="flex-1 rounded-lg border border-[#D8D4CA] bg-white px-3 py-2 text-xs font-medium text-[#333333] transition hover:bg-[#F5F3EE] dark:border-[#2d3542] dark:bg-[#181c24] dark:text-[#f4f7fb] dark:hover:bg-[#1f2530]"
+                                        >
+                                            查看实例
+                                        </Link>
+                                    </div>
+                                    <div className="mt-3 text-xs text-[#999999] dark:text-[#6b7684]">
+                                        ✓ 可通过复盘查看具体扣分点 
+                                    </div>
+                                </div>
+                            ))}
                         </div>
                     </section>
 
@@ -1323,7 +1864,12 @@ function ReportPageContent() {
                                             />
                                         </div>
 
-                                        <div className="grid gap-3 xl:grid-cols-1">
+                                        <details className="group" open>
+                                            <summary className="flex cursor-pointer items-center gap-2 text-sm font-medium text-[#111111] dark:text-[#f4f7fb] lg:hidden">
+                                                <ChevronDown className="h-4 w-4 transition-transform group-open:rotate-180" />
+                                                查看轮次详情
+                                            </summary>
+                                            <div className="mt-3 grid gap-3 xl:grid-cols-1">
                                             {roundProfiles.map((item) => (
                                                 <div key={`round-profile-${item.round_type}`} className="rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
                                                     <div className="flex flex-wrap items-start justify-between gap-2">
@@ -1373,7 +1919,8 @@ function ReportPageContent() {
                                                     </div>
                                                 </div>
                                             ))}
-                                        </div>
+                                            </div>
+                                        </details>
                                     </div>
 
                                     <aside className="rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4 shadow-sm">
@@ -1462,7 +2009,32 @@ function ReportPageContent() {
                                     />
                                 </div>
 
-                                <div className="mt-4 grid gap-3 xl:grid-cols-3">
+                                {fusionLayerChartData.length > 0 && (
+                                    <div className="mt-4 rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
+                                        <div className="flex flex-wrap items-center justify-between gap-2">
+                                            <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">可信度分布</p>
+                                            <p className="text-xs text-[#888888] dark:text-[#8e98aa]">用于判断哪些轴需要谨慎解读</p>
+                                        </div>
+                                        <div className="mt-3 h-[180px]">
+                                            <ResponsiveContainer width="100%" height="100%">
+                                                <BarChart data={fusionLayerChartData} margin={{ top: 8, right: 16, left: 0, bottom: 8 }}>
+                                                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke={UI.grid} />
+                                                    <XAxis dataKey="label" tick={{ fontSize: 12, fill: UI.tickPrimary }} />
+                                                    <YAxis domain={[0, 100]} tickFormatter={(value) => `${value}%`} tick={{ fontSize: 11, fill: UI.tickSecondary }} />
+                                                    <Tooltip formatter={(value) => `${formatNum(value, 0)}%`} />
+                                                    <Bar dataKey="confidence" fill={UI.content} radius={[8, 8, 0, 0]} />
+                                                </BarChart>
+                                            </ResponsiveContainer>
+                                        </div>
+                                    </div>
+                                )}
+
+                                <details className="group mt-4" open>
+                                    <summary className="flex cursor-pointer items-center gap-2 text-sm font-medium text-[#111111] dark:text-[#f4f7fb] lg:hidden">
+                                        <ChevronDown className="h-4 w-4 transition-transform group-open:rotate-180" />
+                                        查看每轴可信度详情
+                                    </summary>
+                                    <div className="mt-3 grid gap-3 xl:grid-cols-3">
                                     {Object.entries(confidenceAxes).map(([axisKey, breakdown]) => (
                                         <div key={`confidence-${axisKey}`} className="rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
                                             <div className="flex items-start justify-between gap-2">
@@ -1503,7 +2075,8 @@ function ReportPageContent() {
                                             ) : null}
                                         </div>
                                     ))}
-                                </div>
+                                    </div>
+                                </details>
                             </>
                         ) : (
                             <div className="mt-4 rounded-2xl border border-dashed border-[#D8D4CA] bg-[var(--surface)] p-4 text-sm text-[#666666] dark:text-[#bcc5d3]">
@@ -1557,347 +2130,397 @@ function ReportPageContent() {
                                         </div>
                                     ))}
                                 </div>
-
-                                <div className="mt-5 rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
-                                    <div className="flex items-center gap-2">
-                                        <BarChart3 className="h-4 w-4 text-[#666666] dark:text-[#bcc5d3]" />
-                                        <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">证据时间轴</p>
-                                    </div>
-                                    <div className="mt-3 hidden">
-                                        {(contentPerf.question_evidence || []).slice(0, 6).map((item, index, arr) => (
-                                            <div key={`${item.turn_id}-${item.round_type}`} className="relative pb-4 pl-9">
-                                                {index < arr.length - 1 && (
-                                                    <span className="absolute left-[13px] top-7 h-[calc(100%-8px)] w-px bg-[#DDD7CA]" />
-                                                )}
-                                                <span className="absolute left-0 top-1.5 flex h-7 w-7 items-center justify-center rounded-full border border-[#D8D2C6] bg-[var(--surface)] text-xs text-[#666666] dark:text-[#bcc5d3]">
-                                                    {index + 1}
+                                {(contentPerf.excluded_questions || []).length > 0 && (
+                                    <div className="mt-3 rounded-xl border border-[#F0D7D2] bg-[#FFF6F4] p-3">
+                                        <p className="text-sm text-[#8A3B3B]">
+                                            已从内容能力画像中排除 {contentPerf.excluded_sample_count || (contentPerf.excluded_questions || []).length} 个样本，
+                                            其中 {contentPerf.fallback_sample_count || 0} 个来自评分回退。
+                                        </p>
+                                        <div className="mt-2 flex flex-wrap gap-1.5">
+                                            {(contentPerf.excluded_questions || []).slice(0, 4).flatMap((item) => item.exclude_reasons || []).map((reason, index) => (
+                                                <span key={`ready-excluded-reason-${reason}-${index}`} className="rounded-full bg-white px-2 py-0.5 text-xs text-[#8A3B3B]">
+                                                    {excludedReasonLabel(reason)}
                                                 </span>
-                                                <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
-                                                    <div className="flex flex-wrap items-center justify-between gap-2">
-                                                        <span className="rounded-full bg-[var(--surface)] px-2.5 py-1 text-xs text-[#666666] dark:text-[#bcc5d3]">{item.round_type || 'unknown'}</span>
-                                                        <span className="rounded-full bg-[#FDECEC] px-2.5 py-1 text-xs text-[#8A3B3B]">单题分 {formatNum(item.overall_score)}</span>
-                                                    </div>
-                                                    <p className="mt-2 text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">Q：{item.question_excerpt || '暂无题干'}</p>
-                                                    <p className="mt-1 text-sm text-[#666666] dark:text-[#bcc5d3]">A：{item.answer_excerpt || '暂无回答文本'}</p>
-                                                    {(item.reason_tags || []).length > 0 && (
-                                                        <div className="mt-2 flex flex-wrap gap-1.5">
-                                                            {(item.reason_tags || []).map((tag) => (
-                                                                <span key={`${item.turn_id}-${tag}`} className={`rounded-full px-2 py-0.5 text-xs ${reasonTagTone(tag)}`}>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+
+                                <div className="mt-5 grid gap-5 lg:grid-cols-[280px_minmax(0,1fr)]">
+                                    <aside className="rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-3">
+                                        <div className="flex items-center justify-between gap-2 px-1">
+                                            <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">单题复盘</p>
+                                            <span className="text-xs text-[#888888] dark:text-[#8e98aa]">{questionProgress}</span>
+                                        </div>
+                                        <div className="mt-3 space-y-2">
+                                            {(contentPerf.question_evidence || []).slice(0, 12).map((item, index) => {
+                                                const turnId = String(item.turn_id || '').trim()
+                                                const active = turnId ? turnId === activeTurnId : activeQuestionIndex === index
+                                                const disabled = !turnId && !item.question_excerpt
+                                                return (
+                                                    <button
+                                                        key={`question-review-${turnId || index}`}
+                                                        type="button"
+                                                        disabled={disabled}
+                                                        onClick={() => {
+                                                            if (disabled) return
+                                                            if (turnId) setActiveTurnId(turnId)
+                                                        }}
+                                                        className={`w-full rounded-2xl p-4 text-left transition ${active
+                                                            ? 'bg-[#111111] text-white'
+                                                            : 'border border-[#E5E5E5] dark:border-[#2d3542] bg-[var(--surface)] text-[#111111] dark:text-[#f4f7fb] hover:bg-[#F5F3EE] dark:hover:bg-[#1f2530]'
+                                                            } ${disabled ? 'cursor-not-allowed opacity-50' : ''}`}
+                                                    >
+                                                        <div className={`text-xs ${active ? 'text-white/70' : 'text-[#888888] dark:text-[#8e98aa]'}`}>第 {index + 1} 题</div>
+                                                        <div className="mt-1 line-clamp-2 text-sm">{item.question_excerpt || '暂无题干'}</div>
+                                                        <div className="mt-3 flex items-center justify-between gap-2">
+                                                            <span className="text-lg font-semibold">{formatNum(item.overall_score)}</span>
+                                                            <span className={`rounded-full px-2 py-0.5 text-xs ${active ? 'bg-white/15 text-white' : 'bg-white text-[#666666] dark:bg-[#181c24] dark:text-[#bcc5d3]'}`}>分</span>
+                                                        </div>
+                                                    </button>
+                                                )
+                                            })}
+                                        </div>
+                                    </aside>
+
+                                    <main className="rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4 sm:p-6">
+                                        <div className="flex flex-wrap items-center justify-between gap-3">
+                                            <div>
+                                                <p className="text-xs text-[#888888] dark:text-[#8e98aa]">当前查看：第 {activeQuestionIndex >= 0 ? activeQuestionIndex + 1 : 1} 题</p>
+                                                <h3 className="mt-1 text-lg font-semibold text-[#111111] dark:text-[#f4f7fb]">题目复盘与改进建议</h3>
+                                            </div>
+                                            <div className="flex items-center gap-2">
+                                                <span className="rounded-full bg-[#FDECEC] px-3 py-1 text-xs text-[#8A3B3B]">
+                                                    单题分 {formatNum(activeTurnOverallScore)}
+                                                </span>
+                                                {/* P0-2 优化: 单题复盘支持跳转到视频回放页的对应题目 */}
+                                                {!!activeTurnId && (
+                                                    <Link
+                                                        href={`${replayUrl}&turnId=${encodeURIComponent(activeTurnId)}`}
+                                                        className="rounded-lg border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-3 py-1.5 text-xs font-medium text-[#111111] dark:text-[#f4f7fb] transition hover:bg-[#F5F2EA] dark:hover:bg-[#1f2530]"
+                                                        title="进入视频回放查看当前题目"
+                                                    >
+                                                        查看视频
+                                                    </Link>
+                                                )}
+                                                {!!activeTurnId && (
+                                                    <button
+                                                        type="button"
+                                                        onClick={refreshActiveTurnAudit}
+                                                        className="rounded-lg border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-2.5 py-1 text-xs text-[#666666] dark:text-[#bcc5d3] hover:bg-[#F5F2EA]"
+                                                    >
+                                                        刷新证据
+                                                    </button>
+                                                )}
+                                            </div>
+                                        </div>
+
+                                        {activeQuestionEvidence ? (
+                                            <div className="mt-4 space-y-4">
+                                                <div className="rounded-2xl bg-[var(--surface)] p-4">
+                                                    <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">Q：{activeQuestionEvidence.question_excerpt || '暂无题干'}</p>
+                                                    <p className="mt-2 line-clamp-4 text-sm leading-6 text-[#666666] dark:text-[#bcc5d3]">A：{activeQuestionEvidence.answer_excerpt || '暂无回答文本'}</p>
+                                                    {(activeQuestionEvidence.reason_tags || []).length > 0 && (
+                                                        <div className="mt-3 flex flex-wrap gap-1.5">
+                                                            {(activeQuestionEvidence.reason_tags || []).map((tag) => (
+                                                                <span key={`question-review-tag-${tag}`} className={`rounded-full px-2 py-0.5 text-xs ${reasonTagTone(tag)}`}>
                                                                     {tag}
                                                                 </span>
                                                             ))}
                                                         </div>
                                                     )}
-                                                    <div className="mt-2 flex flex-wrap gap-2">
-                                                        {(item.weak_dimensions || []).map((dim) => (
-                                                            <span key={`${item.turn_id}-${dim.key}`} className="rounded-full border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-2.5 py-1 text-xs text-[#666666] dark:text-[#bcc5d3]">
-                                                                {dim.label} {formatNum(dim.score)}
+                                                </div>
+
+                                                <div className="grid gap-3 md:grid-cols-2">
+                                                    <div className="rounded-2xl border border-[#EEE9DD] bg-[#FAF8F2] px-4 py-3 dark:border-[#2d3542] dark:bg-[#12151c]">
+                                                        <p className="text-xs text-[#888888] dark:text-[#8e98aa]">扣分重点</p>
+                                                        <p className="mt-1 text-base font-medium text-[#111111] dark:text-[#f4f7fb]">{weakestDimensionLabel}</p>
+                                                    </div>
+                                                    <div className="rounded-2xl border border-[#EEE9DD] bg-[#FAF8F2] px-4 py-3 dark:border-[#2d3542] dark:bg-[#12151c]">
+                                                        <p className="text-xs text-[#888888] dark:text-[#8e98aa]">改进建议</p>
+                                                        <p className="mt-1 text-sm leading-6 text-[#444444] dark:text-[#bcc5d3]">{primaryImprovementAdvice}</p>
+                                                    </div>
+                                                </div>
+
+                                                {activeQuestionSummary.length > 0 && (
+                                                    <div className="rounded-2xl border border-[#EDEBE4] bg-white p-4 dark:border-[#2d3542] dark:bg-[#181c24]">
+                                                        <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">本题结论</p>
+                                                        <div className="mt-2 space-y-1.5 text-sm leading-6 text-[#666666] dark:text-[#bcc5d3]">
+                                                            {activeQuestionSummary.slice(0, 3).map((line, index) => (
+                                                                <p key={`question-review-summary-${index}`}>{line}</p>
+                                                            ))}
+                                                        </div>
+                                                    </div>
+                                                )}
+
+                                                {scorecardLoading ? (
+                                                    <p className="rounded-xl border border-dashed border-[#D8D4CA] bg-[var(--surface)] p-4 text-sm text-[#666666] dark:text-[#bcc5d3]">单题证据链加载中...</p>
+                                                ) : scorecardError ? (
+                                                    <div className="rounded-xl border border-[#F0D7D2] bg-[#FFF6F4] p-4 text-sm text-[#8A3B3B]">
+                                                        <p>{scorecardError}</p>
+                                                        {!!activeTurnId && (
+                                                            <button
+                                                                type="button"
+                                                                onClick={refreshActiveTurnAudit}
+                                                                className="mt-2 rounded-lg border border-[#E5B8B1] bg-white px-3 py-1 text-xs text-[#8A3B3B] hover:bg-[#FFF0ED]"
+                                                            >
+                                                                重试获取证据链
+                                                            </button>
+                                                        )}
+                                                    </div>
+                                                ) : activeScorecard?.evaluation ? (
+                                                    <div className="space-y-3">
+                                                        <details className="rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
+                                                            <summary className="cursor-pointer text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">
+                                                                查看扣分维度详情
+                                                            </summary>
+                                                            {readableDimensionCards.length > 0 ? (
+                                                                <div className="mt-4 grid gap-3 md:grid-cols-2">
+                                                                    {readableDimensionCards.map((dimValue) => (
+                                                                        <div key={`review-dim-evidence-${dimValue.key}`} className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-[var(--surface)] p-3">
+                                                                            <div className="flex items-center justify-between gap-2">
+                                                                                <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">{dimValue.label}</p>
+                                                                                <span className={`rounded-full px-2 py-1 text-xs ${confidenceTone(dimValue.confidence)}`}>{formatConfidencePercent(dimValue.confidence)}</span>
+                                                                            </div>
+                                                                            <progress
+                                                                                className="mt-2 h-2 w-full overflow-hidden rounded-full [appearance:none] [&::-webkit-progress-bar]:bg-[#ECE9E1] [&::-webkit-progress-value]:bg-[#4C6A8A] [&::-moz-progress-bar]:bg-[#4C6A8A]"
+                                                                                value={dimValue.scoreValue}
+                                                                                max={100}
+                                                                            />
+                                                                            <div className="mt-2 space-y-1.5 text-xs leading-6 text-[#666666] dark:text-[#bcc5d3]">
+                                                                                <p>{dimValue.overview}</p>
+                                                                                <p className="text-[#3E7657]">{dimValue.highlightText}</p>
+                                                                                <p className="text-[#8A3B3B]">{dimValue.gapText}</p>
+                                                                                <p>{dimValue.evidenceText}</p>
+                                                                            </div>
+                                                                        </div>
+                                                                    ))}
+                                                                </div>
+                                                            ) : (
+                                                                <p className="mt-3 rounded-xl border border-dashed border-[#D8D4CA] bg-[var(--surface)] p-4 text-sm text-[#666666] dark:text-[#bcc5d3]">当前题目暂无维度级解释数据。</p>
+                                                            )}
+                                                        </details>
+
+                                                        <details className="rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
+                                                            <summary className="cursor-pointer text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">
+                                                                查看评分证据
+                                                            </summary>
+                                                            <div className="mt-4 space-y-4">
+                                                                {(activePointStatusData.length > 0 || activeDimensionChartData.length > 0 || activeRuleAlerts.length > 0) && (
+                                                                    <div className="grid gap-4 xl:grid-cols-[minmax(0,1.25fr)_minmax(260px,0.85fr)]">
+                                                                        <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-[var(--surface)] p-4">
+                                                                            <div className="flex flex-wrap items-center justify-between gap-2">
+                                                                                <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">评分依据图谱</p>
+                                                                                <span className={`rounded-full px-2.5 py-1 text-xs ${confidenceTone(activeRubricScoring?.confidence ?? null)}`}>
+                                                                                    规则可信度 {formatConfidencePercent(activeRubricScoring?.confidence)}
+                                                                                </span>
+                                                                            </div>
+                                                                            {activeDimensionChartData.length > 0 ? (
+                                                                                <div className="mt-3 h-[220px]">
+                                                                                    <ResponsiveContainer width="100%" height="100%">
+                                                                                        <BarChart data={activeDimensionChartData} layout="vertical" margin={{ top: 8, right: 18, left: 8, bottom: 8 }}>
+                                                                                            <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke={UI.grid} />
+                                                                                            <XAxis type="number" domain={[0, 100]} tick={{ fontSize: 11, fill: UI.tickSecondary }} />
+                                                                                            <YAxis type="category" dataKey="label" width={76} tickFormatter={chartTickFormatter} tick={{ fontSize: 12, fill: UI.tickPrimary }} />
+                                                                                            <Tooltip formatter={(value) => [formatNum(value), '维度表现']} />
+                                                                                            <Bar dataKey="score" fill={UI.content} radius={[0, 8, 8, 0]} />
+                                                                                        </BarChart>
+                                                                                    </ResponsiveContainer>
+                                                                                </div>
+                                                                            ) : (
+                                                                                <p className="mt-3 rounded-lg border border-dashed border-[#D8D4CA] bg-white p-3 text-sm text-[#666666] dark:bg-[#181c24] dark:text-[#bcc5d3]">暂无维度图表数据。</p>
+                                                                            )}
+                                                                        </div>
+
+                                                                        <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-[var(--surface)] p-4">
+                                                                            <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">原子评分点</p>
+                                                                            {activePointStatusData.length > 0 ? (
+                                                                                <>
+                                                                                    <div className="mt-3 h-[150px]">
+                                                                                        <ResponsiveContainer width="100%" height="100%">
+                                                                                            <BarChart data={activePointStatusData} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+                                                                                                <XAxis dataKey="label" tick={{ fontSize: 11, fill: UI.tickPrimary }} />
+                                                                                                <YAxis allowDecimals={false} tick={{ fontSize: 11, fill: UI.tickSecondary }} />
+                                                                                                <Tooltip formatter={(value) => [String(value), '评分点']} />
+                                                                                                <Bar dataKey="count" radius={[8, 8, 0, 0]}>
+                                                                                                    {activePointStatusData.map((entry) => (
+                                                                                                        <Cell key={`review-point-status-${entry.key}`} fill={entry.color} />
+                                                                                                    ))}
+                                                                                                </Bar>
+                                                                                            </BarChart>
+                                                                                        </ResponsiveContainer>
+                                                                                    </div>
+                                                                                    <div className="mt-2 flex flex-wrap gap-1.5">
+                                                                                        {activePointJudgements.slice(0, 8).map((item, index) => (
+                                                                                            <span key={`review-point-judgement-${item.point_id || index}`} className={`rounded-full px-2 py-0.5 text-xs ${pointStatusTone(item.status)}`}>
+                                                                                                {pointStatusLabel(item.status)} · {item.level || 'rubric'}
+                                                                                            </span>
+                                                                                        ))}
+                                                                                    </div>
+                                                                                </>
+                                                                            ) : (
+                                                                                <p className="mt-3 rounded-lg border border-dashed border-[#D8D4CA] bg-white p-3 text-sm text-[#666666] dark:bg-[#181c24] dark:text-[#bcc5d3]">历史评分没有逐点评判数据。</p>
+                                                                            )}
+                                                                        </div>
+                                                                    </div>
+                                                                )}
+
+                                                                {activeRuleAlerts.length > 0 && (
+                                                                    <div className="space-y-2">
+                                                                        {activeRuleAlerts.map((item, index) => (
+                                                                            <p key={`review-rule-alert-${index}`} className="rounded-lg border border-[#EDEBE4] bg-[var(--surface)] px-3 py-2 text-xs leading-5 text-[#666666] dark:text-[#bcc5d3]">
+                                                                                {item}
+                                                                            </p>
+                                                                        ))}
+                                                                    </div>
+                                                                )}
+
+                                                                <div className="overflow-hidden rounded-xl border border-[#E5E5E5] dark:border-[#2d3542]">
+                                                                    <div className="border-b border-[#E5E5E5] dark:border-[#2d3542] bg-[var(--surface)] px-3 py-2">
+                                                                        <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">证据回答轴</p>
+                                                                        <p className="mt-0.5 text-xs text-[#888888] dark:text-[#8e98aa]">按文本、语音、镜头三类证据展开查看。</p>
+                                                                    </div>
+                                                                    <div className="divide-y divide-[#E5E5E5] dark:divide-[#2d3542]">
+                                                                        {activeEvidencePanels.map((panel) => {
+                                                                            const service = panel.service
+                                                                            const opened = openEvidencePanel === panel.key
+                                                                            const sourceLabel = evidenceSourceLabel(service?.source || panel.key)
+                                                                            const panelBodyId = `review-evidence-panel-body-${panel.key}`
+                                                                            const panelButtonId = `review-evidence-panel-button-${panel.key}`
+                                                                            const featureEntries = Object.entries(service?.features || {}).slice(0, 5)
+                                                                            const quotes = (service?.quotes || []).filter(Boolean).slice(0, 2)
+                                                                            const signals = (service?.signals || []).slice(0, 4)
+                                                                            const gateReasons = service?.quality_gate?.reasons || []
+                                                                            return (
+                                                                                <div key={`review-active-evidence-panel-${panel.key}`} className="bg-white dark:bg-[#181c24]">
+                                                                                    <button
+                                                                                        id={panelButtonId}
+                                                                                        type="button"
+                                                                                        aria-expanded={opened}
+                                                                                        aria-controls={panelBodyId}
+                                                                                        onClick={() => setOpenEvidencePanel(opened ? '' : panel.key)}
+                                                                                        className="flex w-full items-center justify-between gap-3 px-3 py-3 text-left transition hover:bg-[#F8F6F1] dark:hover:bg-[#1f2530]"
+                                                                                    >
+                                                                                        <span className="min-w-0">
+                                                                                            <span className="block text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">{sourceLabel}</span>
+                                                                                            <span className="mt-0.5 block text-xs leading-5 text-[#666666] dark:text-[#bcc5d3]">{panel.description}</span>
+                                                                                        </span>
+                                                                                        <span className="flex shrink-0 items-center gap-2">
+                                                                                            {service ? (
+                                                                                                <span className={`rounded-full px-2.5 py-1 text-xs ${confidenceTone(service.confidence)}`}>
+                                                                                                    {formatConfidencePercent(service.confidence)}
+                                                                                                </span>
+                                                                                            ) : (
+                                                                                                <span className="rounded-full bg-[#F2F2F0] px-2.5 py-1 text-xs text-[#666666] dark:text-[#bcc5d3]">暂无</span>
+                                                                                            )}
+                                                                                            <ArrowRight className={`h-4 w-4 text-[#888888] transition-transform ${opened ? 'rotate-90' : ''}`} />
+                                                                                        </span>
+                                                                                    </button>
+                                                                                    <div id={panelBodyId} role="region" aria-labelledby={panelButtonId} hidden={!opened} className="px-3 pb-4">
+                                                                                        {service ? (
+                                                                                            <div className="rounded-lg bg-[var(--surface)] p-3">
+                                                                                                <div className="flex flex-wrap items-center gap-2">
+                                                                                                    <span className="rounded-full bg-white dark:bg-[#181c24] px-2.5 py-1 text-xs text-[#666666] dark:text-[#bcc5d3]">
+                                                                                                        {service.status === 'ready' ? '证据已就绪' : `状态：${service.status || 'unknown'}`}
+                                                                                                    </span>
+                                                                                                    {service.quality_gate && (
+                                                                                                        <span className={`rounded-full px-2.5 py-1 text-xs ${service.quality_gate.passed ? 'bg-[#E7F3EA] text-[#2E6A45]' : 'bg-[#FDECEC] text-[#8A3B3B]'}`}>
+                                                                                                            质量门控：{service.quality_gate.passed ? '通过' : '未通过'}
+                                                                                                        </span>
+                                                                                                    )}
+                                                                                                </div>
+                                                                                                {gateReasons.length > 0 && <p className="mt-2 text-xs leading-5 text-[#666666] dark:text-[#bcc5d3]">门控原因：{gateReasons.join('、')}</p>}
+                                                                                                {featureEntries.length > 0 && (
+                                                                                                    <div className="mt-3 flex flex-wrap gap-2">
+                                                                                                        {featureEntries.map(([key, value]) => (
+                                                                                                            <span key={`review-${panel.key}-feature-${key}`} className="rounded-full border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-2.5 py-1 text-xs text-[#666666] dark:text-[#bcc5d3]">
+                                                                                                                {evidenceFeatureLabel(key)} {formatEvidenceFeatureValue(key, value)}
+                                                                                                            </span>
+                                                                                                        ))}
+                                                                                                    </div>
+                                                                                                )}
+                                                                                                {signals.length > 0 && (
+                                                                                                    <div className="mt-3 flex flex-wrap gap-1.5">
+                                                                                                        {signals.map((signal, signalIndex) => (
+                                                                                                            <span key={`review-${panel.key}-signal-${signalIndex}`} className={`rounded-full px-2 py-0.5 text-xs ${evidenceSeverityTone(signal.severity)}`}>
+                                                                                                                {signal.label || signal.code || 'signal'}
+                                                                                                            </span>
+                                                                                                        ))}
+                                                                                                    </div>
+                                                                                                )}
+                                                                                                {quotes.length > 0 && (
+                                                                                                    <div className="mt-3 space-y-2">
+                                                                                                        {quotes.map((quote, quoteIndex) => (
+                                                                                                            <p key={`review-${panel.key}-quote-${quoteIndex}`} className="text-xs leading-5 text-[#666666] dark:text-[#bcc5d3]">摘录：{quote}</p>
+                                                                                                        ))}
+                                                                                                    </div>
+                                                                                                )}
+                                                                                            </div>
+                                                                                        ) : (
+                                                                                            <div className="rounded-lg border border-dashed border-[#D8D4CA] bg-[var(--surface)] p-3">
+                                                                                                <p className="text-xs leading-5 text-[#666666] dark:text-[#bcc5d3]">当前题目还没有生成{panel.label}。</p>
+                                                                                            </div>
+                                                                                        )}
+                                                                                    </div>
+                                                                                </div>
+                                                                            )
+                                                                        })}
+                                                                    </div>
+                                                                    <p className="border-t border-[#E5E5E5] dark:border-[#2d3542] bg-[var(--surface)] px-3 py-2 text-xs text-[#888888] dark:text-[#8e98aa]">
+                                                                        来源：{activeQuestionEvidence.trace_source || 'interview_evaluations'}
+                                                                    </p>
+                                                                </div>
+                                                            </div>
+                                                        </details>
+                                                    </div>
+                                                ) : (
+                                                    <p className="rounded-xl border border-dashed border-[#D8D4CA] bg-[var(--surface)] p-4 text-sm text-[#666666] dark:text-[#bcc5d3]">当前单题暂无可展示的证据链数据。</p>
+                                                )}
+                                            </div>
+                                        ) : (
+                                            <p className="mt-4 rounded-xl border border-dashed border-[#D8D4CA] bg-[var(--surface)] p-4 text-sm text-[#666666] dark:text-[#bcc5d3]">当前没有可展示的单题证据摘要。</p>
+                                        )}
+                                    </main>
+                                </div>
+                            </>
+                        ) : contentPerf?.status === 'no_effective_answer' ? (
+                            <div className="mt-4 rounded-xl border border-dashed border-[#D8D4CA] bg-[var(--surface)] p-4">
+                                <p className="text-sm text-[#666666] dark:text-[#bcc5d3]">
+                                    本场已经有评分记录，但没有足够有效的题目回答用于生成内容能力画像。系统不会把误收环境音、题干复述或未作答样本画成全 0 雷达。
+                                </p>
+                                {(contentPerf.excluded_questions || []).length > 0 && (
+                                    <div className="mt-3 space-y-2">
+                                        {(contentPerf.excluded_questions || []).slice(0, 4).map((item, index) => (
+                                            <div key={`excluded-content-${item.turn_id || index}`} className="rounded-lg border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-3">
+                                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                                    <span className="rounded-full bg-[var(--surface)] px-2 py-0.5 text-xs text-[#666666] dark:text-[#bcc5d3]">
+                                                        题目 {index + 1} · {item.round_type || 'unknown'}
+                                                    </span>
+                                                    <span className="text-xs text-[#888888] dark:text-[#8e98aa]">
+                                                        {(item.exclude_reasons || []).includes('fallback_scoring')
+                                                            ? (item.error_code || '评分回退')
+                                                            : `Token ${item.token_count ?? 0} · 覆盖率 ${formatConfidencePercent(item.coverage_ratio ?? 0)}`}
+                                                    </span>
+                                                </div>
+                                                <p className="mt-2 text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">Q：{item.question_excerpt || '暂无题干'}</p>
+                                                <p className="mt-1 text-sm text-[#666666] dark:text-[#bcc5d3]">A：{item.answer_excerpt || '暂无回答文本'}</p>
+                                                {(item.exclude_reasons || []).length > 0 && (
+                                                    <div className="mt-2 flex flex-wrap gap-1.5">
+                                                        {(item.exclude_reasons || []).map((reason) => (
+                                                            <span key={`${item.turn_id}-${reason}`} className="rounded-full bg-[#ECEBE8] px-2 py-0.5 text-xs text-[#565451]">
+                                                                {excludedReasonLabel(reason)}
                                                             </span>
                                                         ))}
                                                     </div>
-                                                    {(item.evidence_tags || []).length > 0 && (
-                                                        <div className="mt-2 flex flex-wrap gap-2">
-                                                            {(item.evidence_tags || []).map((tag, tagIndex) => (
-                                                                <span key={`${item.turn_id}-tag-${tagIndex}`} className="rounded-full bg-[#EFEDE8] px-2 py-1 text-xs text-[#666666] dark:text-[#bcc5d3]">
-                                                                    {tag}
-                                                                </span>
-                                                            ))}
-                                                        </div>
-                                                    )}
-                                                    <p className="mt-2 text-xs text-[#888888] dark:text-[#8e98aa]">来源：{item.trace_source || 'interview_evaluations'}</p>
-                                                </div>
+                                                )}
+                                                {!!item.error_message && (
+                                                    <p className="mt-2 text-xs text-[#8A3B3B]">回退原因：{item.error_message}</p>
+                                                )}
                                             </div>
                                         ))}
                                     </div>
-                                    <p className="mt-2 text-xs text-[#888888] dark:text-[#8e98aa]">按题目切换查看证据摘要，下面的单题表现解读会同步联动。</p>
-                                    <div className="mt-3 flex flex-wrap gap-2">
-                                        {(contentPerf.question_evidence || []).slice(0, 8).map((item, index) => {
-                                            const turnId = String(item.turn_id || '').trim()
-                                            const active = turnId ? turnId === activeTurnId : activeQuestionIndex === index
-                                            const disabled = !turnId && !item.question_excerpt
-                                            return (
-                                                <button
-                                                    key={`evidence-turn-${turnId || index}`}
-                                                    type="button"
-                                                    disabled={disabled}
-                                                    onClick={() => {
-                                                        if (disabled) return
-                                                        if (turnId) setActiveTurnId(turnId)
-                                                    }}
-                                                    className={`rounded-full border px-3 py-1 text-xs transition ${active
-                                                        ? 'border-[#9AA7BC] bg-[#EAF0F8] text-[#2F4566]'
-                                                        : 'border-[#E0DBCF] bg-[var(--surface)] text-[#666666] dark:text-[#bcc5d3] hover:bg-[#F5F2EA]'
-                                                        } ${disabled ? 'cursor-not-allowed opacity-50 hover:bg-[var(--surface)]' : ''}`}
-                                                >
-                                                    题目 {index + 1} · {formatNum(item.overall_score)}
-                                                </button>
-                                            )
-                                        })}
-                                    </div>
-                                    {activeQuestionEvidence ? (
-                                        <div className="mt-3 rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
-                                            <div className="flex flex-wrap items-center justify-between gap-2">
-                                                <div className="flex flex-wrap items-center gap-2">
-                                                    <span className="rounded-full bg-[var(--surface)] px-2.5 py-1 text-xs text-[#666666] dark:text-[#bcc5d3]">
-                                                        当前查看：题目 {activeQuestionIndex >= 0 ? activeQuestionIndex + 1 : 1}
-                                                    </span>
-                                                    <span className="rounded-full bg-[var(--surface)] px-2.5 py-1 text-xs text-[#666666] dark:text-[#bcc5d3]">
-                                                        {activeQuestionEvidence.round_type || 'unknown'}
-                                                    </span>
-                                                </div>
-                                                <span className="rounded-full bg-[#FDECEC] px-2.5 py-1 text-xs text-[#8A3B3B]">
-                                                    单题分 {formatNum(activeTurnOverallScore)}
-                                                </span>
-                                            </div>
-                                            <p className="mt-2 text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">Q：{activeQuestionEvidence.question_excerpt || '暂无题干'}</p>
-                                            <p className="mt-1 text-sm text-[#666666] dark:text-[#bcc5d3]">A：{activeQuestionEvidence.answer_excerpt || '暂无回答文本'}</p>
-                                            {activeEvidenceServices.length > 0 ? (
-                                                <div className="mt-3 grid gap-3 xl:grid-cols-3">
-                                                    {activeEvidenceServices.map((service, index) => {
-                                                        const featureEntries = Object.entries(service.features || {}).slice(0, 5)
-                                                        const quotes = (service.quotes || []).filter(Boolean).slice(0, 1)
-                                                        const signals = (service.signals || []).slice(0, 4)
-                                                        const gateReasons = service.quality_gate?.reasons || []
-                                                        return (
-                                                            <div
-                                                                key={`active-evidence-service-${service.source || index}`}
-                                                                className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-3"
-                                                            >
-                                                                <div className="flex items-start justify-between gap-2">
-                                                                    <div>
-                                                                        <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">
-                                                                            {evidenceSourceLabel(service.source)}
-                                                                        </p>
-                                                                        <p className="mt-1 text-xs text-[#888888] dark:text-[#8e98aa]">
-                                                                            {service.status === 'ready' ? '证据已就绪' : `状态：${service.status || 'unknown'}`}
-                                                                        </p>
-                                                                    </div>
-                                                                    <span className={`rounded-full px-2.5 py-1 text-xs ${confidenceTone(service.confidence)}`}>
-                                                                        可信度 {formatConfidencePercent(service.confidence)}
-                                                                    </span>
-                                                                </div>
-                                                                {service.quality_gate && (
-                                                                    <p className="mt-2 text-xs text-[#666666] dark:text-[#bcc5d3]">
-                                                                        质量门控：{service.quality_gate.passed ? '通过' : '未通过'}
-                                                                        {gateReasons.length > 0 ? `（${gateReasons.join('、')}）` : ''}
-                                                                    </p>
-                                                                )}
-                                                                {featureEntries.length > 0 && (
-                                                                    <div className="mt-2 flex flex-wrap gap-2">
-                                                                        {featureEntries.map(([key, value]) => (
-                                                                            <span
-                                                                                key={`${service.source}-${key}`}
-                                                                                className="rounded-full border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-2.5 py-1 text-xs text-[#666666] dark:text-[#bcc5d3]"
-                                                                            >
-                                                                                {evidenceFeatureLabel(key)} {formatEvidenceFeatureValue(key, value)}
-                                                                            </span>
-                                                                        ))}
-                                                                    </div>
-                                                                )}
-                                                                {signals.length > 0 && (
-                                                                    <div className="mt-2 flex flex-wrap gap-1.5">
-                                                                        {signals.map((signal, signalIndex) => (
-                                                                            <span
-                                                                                key={`${service.source}-signal-${signalIndex}`}
-                                                                                className={`rounded-full px-2 py-0.5 text-xs ${evidenceSeverityTone(signal.severity)}`}
-                                                                            >
-                                                                                {signal.label || signal.code || 'signal'}
-                                                                            </span>
-                                                                        ))}
-                                                                    </div>
-                                                                )}
-                                                                {quotes.length > 0 && (
-                                                                    <p className="mt-2 text-xs leading-5 text-[#666666] dark:text-[#bcc5d3]">
-                                                                        摘录：{quotes[0]}
-                                                                    </p>
-                                                                )}
-                                                            </div>
-                                                        )
-                                                    })}
-                                                </div>
-                                            ) : (
-                                                <>
-                                                    {(activeQuestionEvidence.reason_tags || []).length > 0 && (
-                                                        <div className="mt-2 flex flex-wrap gap-1.5">
-                                                            {(activeQuestionEvidence.reason_tags || []).map((tag) => (
-                                                                <span key={`active-evidence-tag-${tag}`} className={`rounded-full px-2 py-0.5 text-xs ${reasonTagTone(tag)}`}>
-                                                                    {tag}
-                                                                </span>
-                                                            ))}
-                                                        </div>
-                                                    )}
-                                                    <div className="mt-2 flex flex-wrap gap-2">
-                                                        {(activeQuestionEvidence.weak_dimensions || []).map((dim) => (
-                                                            <span key={`active-weak-${dim.key}`} className="rounded-full border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-2.5 py-1 text-xs text-[#666666] dark:text-[#bcc5d3]">
-                                                                {dim.label} {formatNum(dim.score)}
-                                                            </span>
-                                                        ))}
-                                                    </div>
-                                                    {(activeQuestionEvidence.evidence_tags || []).length > 0 && (
-                                                        <div className="mt-2 flex flex-wrap gap-2">
-                                                            {(activeQuestionEvidence.evidence_tags || []).map((tag, tagIndex) => (
-                                                                <span key={`active-evidence-summary-tag-${tagIndex}`} className="rounded-full bg-[#EFEDE8] px-2 py-1 text-xs text-[#666666] dark:text-[#bcc5d3]">
-                                                                    {tag}
-                                                                </span>
-                                                            ))}
-                                                        </div>
-                                                    )}
-                                                    <p className="mt-2 text-xs text-[#888888] dark:text-[#8e98aa]">来源：{activeQuestionEvidence.trace_source || 'interview_evaluations'}</p>
-                                                </>
-                                            )}
-                                        </div>
-                                    ) : (
-                                        <p className="mt-3 rounded-xl border border-dashed border-[#D8D4CA] bg-[var(--surface)] p-4 text-sm text-[#666666] dark:text-[#bcc5d3]">
-                                            当前没有可展示的单题证据摘要。
-                                        </p>
-                                    )}
-                                </div>
-
-                                <div className="mt-5 rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
-                                    <div className="flex items-center justify-between gap-2">
-                                        <div className="flex items-center gap-2">
-                                            <ShieldCheck className="h-4 w-4 text-[#666666] dark:text-[#bcc5d3]" />
-                                            <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">单题表现解读</p>
-                                        </div>
-                                        {!!activeTurnId && (
-                                            <button
-                                                type="button"
-                                                onClick={refreshActiveTurnAudit}
-                                                className="rounded-lg border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] px-2.5 py-1 text-xs text-[#666666] dark:text-[#bcc5d3] hover:bg-[#F5F2EA]"
-                                            >
-                                                刷新本题
-                                            </button>
-                                        )}
-                                    </div>
-                                    <p className="mt-2 text-xs text-[#888888] dark:text-[#8e98aa]">选择题目后，可查看“为什么扣分”以及“下一步怎么改”。</p>
-
-                                    <div className="mt-3 hidden flex flex-wrap gap-2">
-                                        {(contentPerf.question_evidence || []).slice(0, 6).map((item, index) => {
-                                            const turnId = String(item.turn_id || '').trim()
-                                            const active = turnId === activeTurnId
-                                            const disabled = !turnId
-                                            return (
-                                                <button
-                                                    key={`audit-turn-${turnId || index}`}
-                                                    type="button"
-                                                    disabled={disabled}
-                                                    onClick={() => {
-                                                        if (disabled) return
-                                                        if (active) {
-                                                            refreshActiveTurnAudit()
-                                                            return
-                                                        }
-                                                        setActiveTurnId(turnId)
-                                                    }}
-                                                    className={`rounded-full border px-3 py-1 text-xs transition ${active
-                                                        ? 'border-[#9AA7BC] bg-[#EAF0F8] text-[#2F4566]'
-                                                        : 'border-[#E0DBCF] bg-[var(--surface)] text-[#666666] dark:text-[#bcc5d3] hover:bg-[#F5F2EA]'
-                                                        } ${disabled ? 'cursor-not-allowed opacity-50 hover:bg-[var(--surface)]' : ''}`}
-                                                >
-                                                    题目 {index + 1} · {formatNum(item.overall_score)}{disabled ? '（缺少 turn_id）' : ''}
-                                                </button>
-                                            )
-                                        })}
-                                    </div>
-
-                                    {scorecardLoading ? (
-                                        <p className="mt-3 rounded-xl border border-dashed border-[#D8D4CA] bg-[var(--surface)] p-4 text-sm text-[#666666] dark:text-[#bcc5d3]">单题证据链加载中...</p>
-                                    ) : scorecardError ? (
-                                        <div className="mt-3 rounded-xl border border-[#F0D7D2] bg-[#FFF6F4] p-4 text-sm text-[#8A3B3B]">
-                                            <p>{scorecardError}</p>
-                                            {!!activeTurnId && (
-                                                <button
-                                                    type="button"
-                                                    onClick={refreshActiveTurnAudit}
-                                                    className="mt-2 rounded-lg border border-[#E5B8B1] bg-[var(--surface)] px-3 py-1 text-xs text-[#8A3B3B] hover:bg-[#FFF0ED]"
-                                                >
-                                                    重试获取证据链
-                                                </button>
-                                            )}
-                                        </div>
-                                    ) : activeScorecard?.evaluation ? (
-                                        <>
-                                            <div className="mt-3 rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
-                                                <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">本题结论</p>
-                                                <p className="mt-2 text-sm text-[#666666] dark:text-[#bcc5d3]">{activeQuestionEvidence?.question_excerpt || '暂无题干信息'}</p>
-
-                                                <div className="mt-3 grid gap-2 sm:grid-cols-3">
-                                                    <div className="rounded-lg border border-[#EEE9DD] bg-[#FAF8F2] px-3 py-2">
-                                                        <p className="text-xs text-[#888888] dark:text-[#8e98aa]">本题得分</p>
-                                                        <p className="mt-1 text-base font-semibold text-[#111111] dark:text-[#f4f7fb]">
-                                                            {formatNum(activeTurnOverallScore)}
-                                                        </p>
-                                                    </div>
-                                                    <div className="rounded-lg border border-[#EEE9DD] bg-[#FAF8F2] px-3 py-2">
-                                                        <p className="text-xs text-[#888888] dark:text-[#8e98aa]">优先改进维度</p>
-                                                        <p className="mt-1 text-base font-semibold text-[#111111] dark:text-[#f4f7fb]">{weakestDimensionLabel}</p>
-                                                    </div>
-                                                    <div className="rounded-lg border border-[#EEE9DD] bg-[#FAF8F2] px-3 py-2">
-                                                        <p className="text-xs text-[#888888] dark:text-[#8e98aa]">改进建议</p>
-                                                        <p className="mt-1 text-xs leading-5 text-[#444444] dark:text-[#bcc5d3]">{primaryImprovementAdvice}</p>
-                                                    </div>
-                                                </div>
-
-                                                {(activeQuestionEvidence?.reason_tags || []).length > 0 && (
-                                                    <div className="mt-3 flex flex-wrap gap-1.5">
-                                                        {(activeQuestionEvidence?.reason_tags || []).map((tag) => (
-                                                            <span key={`active-reason-tag-${tag}`} className={`rounded-full px-2 py-0.5 text-xs ${reasonTagTone(tag)}`}>
-                                                                {tag}
-                                                            </span>
-                                                        ))}
-                                                    </div>
-                                                )}
-
-                                                {!!activeQuestionEvidence?.answer_excerpt && (
-                                                    <div className="mt-3 rounded-lg border border-[#EDEBE4] bg-[var(--surface)] p-3">
-                                                        <p className="text-xs text-[#888888] dark:text-[#8e98aa]">回答摘录</p>
-                                                        <p className="mt-1 text-sm text-[#666666] dark:text-[#bcc5d3]">{activeQuestionEvidence.answer_excerpt}</p>
-                                                    </div>
-                                                )}
-
-                                                {activeQuestionSummary.length > 0 && (
-                                                    <div className="mt-3 rounded-lg border border-[#EDEBE4] bg-[var(--surface)] p-3">
-                                                        <p className="text-xs text-[#888888] dark:text-[#8e98aa]">本题总评</p>
-                                                        <div className="mt-1 space-y-1.5 text-sm leading-6 text-[#666666] dark:text-[#bcc5d3]">
-                                                            {activeQuestionSummary.map((line, index) => (
-                                                                <p key={`active-summary-${index}`}>{line}</p>
-                                                            ))}
-                                                        </div>
-                                                    </div>
-                                                )}
-                                            </div>
-
-                                            {readableDimensionCards.length > 0 ? (
-                                                <div className="mt-3 grid gap-3 md:grid-cols-2">
-                                                    {readableDimensionCards.map((dimValue) => (
-                                                        <div key={`dim-evidence-${dimValue.key}`} className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-3">
-                                                            <div className="flex items-center justify-between gap-2">
-                                                                <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">{dimValue.label}</p>
-                                                                <span className="rounded-full bg-[#F1EEE7] px-2 py-1 text-xs text-[#666666] dark:text-[#bcc5d3]">{formatNum(dimValue.score)}</span>
-                                                            </div>
-                                                            <progress
-                                                                className="mt-2 h-2 w-full overflow-hidden rounded-full [appearance:none] [&::-webkit-progress-bar]:bg-[#ECE9E1] [&::-webkit-progress-value]:bg-[#4C6A8A] [&::-moz-progress-bar]:bg-[#4C6A8A]"
-                                                                value={dimValue.scoreValue}
-                                                                max={100}
-                                                            />
-                                                            <div className="mt-2 space-y-1.5 text-xs leading-6 text-[#666666] dark:text-[#bcc5d3]">
-                                                                <p>{dimValue.overview}</p>
-                                                                <p className="text-[#3E7657]">{dimValue.highlightText}</p>
-                                                                <p className="text-[#8A3B3B]">{dimValue.gapText}</p>
-                                                                <p className="text-[#666666] dark:text-[#bcc5d3]">{dimValue.evidenceText}</p>
-                                                            </div>
-                                                        </div>
-                                                    ))}
-                                                </div>
-                                            ) : (
-                                                <p className="mt-3 rounded-xl border border-dashed border-[#D8D4CA] bg-[var(--surface)] p-4 text-sm text-[#666666] dark:text-[#bcc5d3]">当前题目暂无维度级解释数据。</p>
-                                            )}
-                                        </>
-                                    ) : (
-                                        <p className="mt-3 rounded-xl border border-dashed border-[#D8D4CA] bg-[var(--surface)] p-4 text-sm text-[#666666] dark:text-[#bcc5d3]">当前单题暂无可展示的证据链数据。</p>
-                                    )}
-                                </div>
-                            </>
+                                )}
+                            </div>
                         ) : (
                             <p className="mt-4 rounded-xl border border-dashed border-[#D8D4CA] bg-[var(--surface)] p-4 text-sm text-[#666666] dark:text-[#bcc5d3]">内容表现证据暂不可用。</p>
                         )}
@@ -1979,83 +2602,6 @@ function ReportPageContent() {
                             <InsightMetric title="平均心率" value={avgHeartRateText} icon={<HeartPulse className="h-4 w-4" />} />
                         </div>
 
-                        {(cameraInsights && Number(cameraInsights.sample_count || 0) > 0) && (
-                            <div className="mt-4 space-y-4">
-                                <div className="grid gap-3 lg:grid-cols-2">
-                                    <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
-                                        <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">1. 478 个 三维人脸关键点</p>
-                                        <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-[#666666] dark:text-[#bcc5d3]">
-                                            <DataPill label="平均关键点数" value={formatNum(cameraLandmarks?.avg_landmark_count, 1)} />
-                                            <DataPill label="最大关键点数" value={formatNum(cameraLandmarks?.max_landmark_count, 0)} />
-                                            <DataPill label="嘴部开合比" value={formatNum(cameraLandmarks?.avg_mouth_open_ratio, 4)} />
-                                            <DataPill label="微动方差" value={formatNum(cameraLandmarks?.avg_micro_movement_variance, 6)} />
-                                            <DataPill label="距离Z均值" value={formatNum(cameraLandmarks?.avg_face_distance_z, 4)} />
-                                            <DataPill label="过近/过远" value={`${formatNum(cameraLandmarks?.close_ratio)}% / ${formatNum(cameraLandmarks?.far_ratio)}%`} />
-                                        </div>
-                                    </div>
-
-                                    <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
-                                        <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">2. 52 个表情系数</p>
-                                        <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-[#666666] dark:text-[#bcc5d3]">
-                                            <DataPill label="跟踪系数数" value={formatNum(cameraBlendshape?.tracked_count_max, 0)} />
-                                            <DataPill label="眨眼频率" value={`${formatNum(cameraBlendshape?.avg_blink_rate_per_min, 1)} 次/分钟`} />
-                                            <DataPill label="browInnerUp" value={formatNum(cameraBlendshape?.avg_brow_inner_up, 4)} />
-                                            <DataPill label="微笑均值" value={formatNum(cameraBlendshape?.avg_smile, 4)} />
-                                            <DataPill label="jawOpen" value={formatNum(cameraBlendshape?.avg_jaw_open, 4)} />
-                                            <DataPill label="言语表现力" value={formatNum(cameraBlendshape?.avg_speech_expressiveness, 2)} />
-                                        </div>
-                                    </div>
-
-                                    <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
-                                        <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">3. 头部姿态（俯仰 / 偏航 / 翻滚）</p>
-                                        <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-[#666666] dark:text-[#bcc5d3]">
-                                            <DataPill label="平均 |Pitch|" value={`${formatNum(cameraHeadPose?.avg_abs_pitch, 2)}°`} />
-                                            <DataPill label="平均 |Yaw|" value={`${formatNum(cameraHeadPose?.avg_abs_yaw, 2)}°`} />
-                                            <DataPill label="平均 |Roll|" value={`${formatNum(cameraHeadPose?.avg_abs_roll, 2)}°`} />
-                                            <DataPill label="姿态异常帧占比" value={`${formatNum(cameraHeadPose?.high_pose_ratio, 2)}%`} />
-                                        </div>
-                                    </div>
-
-                                    <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
-                                        <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">4. 虹膜追踪</p>
-                                        <div className="mt-3 grid grid-cols-2 gap-2 text-xs text-[#666666] dark:text-[#bcc5d3]">
-                                            <DataPill label="平均注视偏移" value={formatNum(cameraIris?.avg_gaze_offset_magnitude, 4)} />
-                                            <DataPill label="平均聚焦分" value={formatNum(cameraIris?.avg_gaze_focus_score, 2)} />
-                                            <DataPill label="最大漂移计数" value={formatNum(cameraIris?.max_drift_count, 0)} />
-                                            <DataPill label="漂移跃迁次数" value={formatNum(cameraIris?.drift_jumps, 0)} />
-                                        </div>
-                                    </div>
-                                </div>
-
-                                {topBlendshapeAverages.length > 0 && (
-                                    <div className="rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
-                                        <p className="text-sm font-medium text-[#111111] dark:text-[#f4f7fb]">表情系数活跃度 前 8 项（柱状）</p>
-                                        <div className="mt-3 space-y-2">
-                                            {topBlendshapeAverages.map(([name, value]) => (
-                                                <div key={name} className="grid grid-cols-[120px,1fr,52px] items-center gap-2 text-xs">
-                                                    <span className="truncate text-[#666666] dark:text-[#bcc5d3]">{name}</span>
-                                                    <progress
-                                                        className="h-2 w-full overflow-hidden rounded-full [appearance:none] [&::-webkit-progress-bar]:bg-[#ECE9E1] [&::-webkit-progress-value]:bg-[#4C6A8A] [&::-moz-progress-bar]:bg-[#4C6A8A]"
-                                                        value={Math.max(0, Math.min(1, Number(value || 0)))}
-                                                        max={1}
-                                                    />
-                                                    <span className="text-right text-[#666666] dark:text-[#bcc5d3]">{formatNum(value, 4)}</span>
-                                                </div>
-                                            ))}
-                                        </div>
-                                    </div>
-                                )}
-                            </div>
-                        )}
-
-                        {(cameraPerf?.notes || []).length > 0 && (
-                            <div className="mt-4 rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4 text-sm text-[#666666] dark:text-[#bcc5d3]">
-                                {(cameraPerf?.notes || []).map((note, index) => (
-                                    <p key={`camera-note-${index}`} className={index === 0 ? '' : 'mt-1'}>{note}</p>
-                                ))}
-                            </div>
-                        )}
-
                         {gazeTrendData.length > 1 && (
                             <div className="mt-4 rounded-xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
                                 <div className="flex flex-wrap items-center justify-between gap-2">
@@ -2069,10 +2615,10 @@ function ReportPageContent() {
                                 <div className="mt-3 h-72 w-full">
                                     <ResponsiveContainer width="100%" height="100%">
                                         <LineChart data={gazeTrendData} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
-                                            <CartesianGrid stroke="#E7E3D8" strokeDasharray="3 3" />
-                                            <ReferenceArea y1={0} y2={60} fill="#FCEBE9" fillOpacity={0.35} />
-                                            <XAxis dataKey="second" tick={{ fontSize: 11, fill: '#666666' }} tickFormatter={formatSecondsLabel} />
-                                            <YAxis domain={[0, 100]} tick={{ fontSize: 11, fill: '#666666' }} />
+                                            <CartesianGrid stroke={UI.grid} strokeDasharray="3 3" />
+                                            <ReferenceArea y1={0} y2={60} fill={UI.dangerBg} fillOpacity={0.35} />
+                                            <XAxis dataKey="second" tick={{ fontSize: 11, fill: UI.muted }} tickFormatter={formatSecondsLabel} />
+                                            <YAxis domain={[0, 100]} tick={{ fontSize: 11, fill: UI.muted }} />
                                             <Tooltip
                                                 formatter={(value: unknown, name: string) => {
                                                     const num = Number(value)
@@ -2084,9 +2630,9 @@ function ReportPageContent() {
                                                 labelFormatter={(label) => `时间 ${formatSecondsLabel(label)}`}
                                                 contentStyle={{ borderRadius: 10, borderColor: '#E5E5E5' }}
                                             />
-                                            <Line type="monotone" dataKey="focus" name="focus" stroke="#3E7657" strokeWidth={2.2} dot={false} />
-                                            <Line type="monotone" dataKey="offscreen" name="offscreen" stroke="#C17C2D" strokeDasharray="4 4" strokeWidth={1.6} dot={false} />
-                                            <Line type="monotone" dataKey="risk" name="risk" stroke="#9D3A2E" strokeOpacity={0.65} strokeWidth={1.4} dot={false} />
+                                            <Line type="monotone" dataKey="focus" name="focus" stroke={UI.successAlt} strokeWidth={2.2} dot={false} />
+                                            <Line type="monotone" dataKey="offscreen" name="offscreen" stroke={UI.caution} strokeDasharray="4 4" strokeWidth={1.6} dot={false} />
+                                            <Line type="monotone" dataKey="risk" name="risk" stroke={UI.danger} strokeOpacity={0.65} strokeWidth={1.4} dot={false} />
                                         </LineChart>
                                     </ResponsiveContainer>
                                 </div>
@@ -2124,6 +2670,11 @@ function ReportPageContent() {
                             </Link>
                         </div>
                     </section>
+                </div>
+                <div className="fixed bottom-0 left-0 right-0 z-30 border-t border-[#E5E5E5] bg-white/95 p-3 shadow-[0_-8px_24px_rgba(17,17,17,0.08)] backdrop-blur dark:border-[#2d3542] dark:bg-[#181c24]/95 lg:hidden">
+                    <Link href={replayUrl} className="flex h-11 items-center justify-center rounded-xl bg-[#111111] text-sm font-medium text-white">
+                        查看面试复盘
+                    </Link>
                 </div>
             </main>
         </div>
@@ -2185,11 +2736,12 @@ function InlineInfoHint({ text }: { text: string }) {
     )
 }
 
-function MetricCard({ title, value, icon }: { title: string; value: string; icon?: ReactNode }) {
+function MetricCard({ title, value, description, icon }: { title: string; value: string; description?: string; icon?: ReactNode }) {
     return (
         <div className="rounded-2xl border border-[#E5E5E5] dark:border-[#2d3542] bg-white dark:bg-[#181c24] p-4">
             <p className="text-xs uppercase tracking-[0.12em] text-[#888888] dark:text-[#8e98aa]">{title}</p>
             <p className="mt-2 flex items-center gap-1 text-2xl font-semibold text-[#111111] dark:text-[#f4f7fb]">{value}{icon}</p>
+            {description ? <p className="mt-2 text-xs leading-5 text-[#666666] dark:text-[#bcc5d3]">{description}</p> : null}
         </div>
     )
 }
@@ -2274,14 +2826,14 @@ function RadarSnapshot({
                     className="h-[240px] w-[240px] shrink-0"
                 >
                     {levelPolygons.map((item) => (
-                        <polygon key={`grid-${item.ratio}`} points={item.points} fill="none" stroke="#DDD7CA" strokeWidth="1" />
+                        <polygon key={`grid-${item.ratio}`} points={item.points} fill="none" stroke={UI.grid} strokeWidth="1" />
                     ))}
                     {axisPoints.map((item) => (
-                        <line key={`axis-${item.key}`} x1={center} y1={center} x2={item.outerPoint.x} y2={item.outerPoint.y} stroke="#E6E1D7" strokeWidth="1" />
+                        <line key={`axis-${item.key}`} x1={center} y1={center} x2={item.outerPoint.x} y2={item.outerPoint.y} stroke={UI.grid} strokeWidth="1" />
                     ))}
-                    <polygon points={polygonPoints} fill="rgba(76, 106, 138, 0.18)" stroke="#4C6A8A" strokeWidth="2" />
+                    <polygon points={polygonPoints} fill={UI.content + '2E'} stroke={UI.content} strokeWidth="2" />
                     {axisPoints.map((item) => (
-                        <circle key={`point-${item.key}`} cx={item.valuePoint.x} cy={item.valuePoint.y} r="3" fill="#4C6A8A" />
+                        <circle key={`point-${item.key}`} cx={item.valuePoint.x} cy={item.valuePoint.y} r="3" fill={UI.content} />
                     ))}
                     {axisPoints.map((item) => (
                         <text
@@ -2291,7 +2843,7 @@ function RadarSnapshot({
                             textAnchor={item.labelPoint.x < center - 8 ? 'end' : item.labelPoint.x > center + 8 ? 'start' : 'middle'}
                             dominantBaseline="middle"
                             fontSize="11"
-                            fill="#555555"
+                            fill={UI.tickPrimary}
                         >
                             {item.label.length > 8 ? `${item.label.slice(0, 8)}…` : item.label}
                         </text>
@@ -2310,4 +2862,3 @@ function RadarSnapshot({
         </div>
     )
 }
-

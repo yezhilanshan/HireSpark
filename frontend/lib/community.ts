@@ -173,7 +173,7 @@ function getDefaultGroups(): StudyGroup[] {
             tags: ['Java', '后端', '春招'],
             memberCount: 128,
             maxMembers: 200,
-            createdBy: 'PanelMind 官方',
+            createdBy: '职跃星辰 官方',
             createdAt: Date.now() - 1000 * 60 * 60 * 24 * 30,
             members: [],
         },
@@ -184,7 +184,7 @@ function getDefaultGroups(): StudyGroup[] {
             tags: ['前端', 'React', 'Vue'],
             memberCount: 86,
             maxMembers: 150,
-            createdBy: 'PanelMind 官方',
+            createdBy: '职跃星辰 官方',
             createdAt: Date.now() - 1000 * 60 * 60 * 24 * 20,
             members: [],
         },
@@ -195,7 +195,7 @@ function getDefaultGroups(): StudyGroup[] {
             tags: ['算法', 'LeetCode', '数据结构'],
             memberCount: 256,
             maxMembers: 300,
-            createdBy: 'PanelMind 官方',
+            createdBy: '职跃星辰 官方',
             createdAt: Date.now() - 1000 * 60 * 60 * 24 * 45,
             members: [],
         },
@@ -264,7 +264,7 @@ export function seedDemoPosts() {
     if (posts.length > 0) return
 
     addPost(
-        'PanelMind 官方',
+        '职跃星辰 官方',
         '',
         '面试复盘：如何优雅地回答"你的缺点是什么"？',
         '这个问题几乎是每场 HR 面的必考题。很多候选人会直接说"我工作太拼了"这种假缺点，反而让面试官觉得不真诚。\n\n建议的回答框架：\n1. 选择一个真实的、但不会影响岗位核心能力的缺点\n2. 说明你已经在如何改进\n3. 展示改进后的成果\n\n例如："我过去在公开演讲时会比较紧张，为了改善这一点，我主动报名了公司的技术分享会，现在已经能从容地在 50 人面前做技术分享了。"',
