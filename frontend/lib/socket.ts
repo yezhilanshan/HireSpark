@@ -84,11 +84,10 @@ class SocketClient {
                     path: socketTarget.path,
                     transports,
                     upgrade: true,
-                    reconnection: true,
-                    reconnectionAttempts: 5,
-                    reconnectionDelay: 1000,
-                    reconnectionDelayMax: 5000,
-                    timeout: 10000,
+                    // Initial connection is controlled by this Promise. Let the page show a
+                    // clear backend-unavailable error instead of Socket.IO retrying forever.
+                    reconnection: false,
+                    timeout: 4000,
                 });
 
                 this.socket.once('connect', () => {
